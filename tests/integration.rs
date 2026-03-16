@@ -12200,8 +12200,9 @@ fn test_attack_update_config_extreme_values() {
         "ATTACK: Engine should remain functional with consistent vault after extreme config. Got {}", vault);
 }
 
-/// ATTACK: Rapidly flip risk_reduction_threshold to gate/ungate trading.
-/// Expected: Threshold changes take effect but don't corrupt state.
+/// Admin can rapidly toggle insurance_floor via SetRiskThreshold.
+/// Per spec v10.5, insurance_floor does NOT gate trades — it only reserves
+/// insurance fund balance. Trades succeed regardless of floor value.
 #[test]
 fn test_attack_risk_threshold_rapid_toggle() {
     program_path();
@@ -12219,36 +12220,22 @@ fn test_attack_risk_threshold_rapid_toggle() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    // Set threshold to MAX - should gate risk-increasing trades
-    let result = env.try_set_risk_threshold(&admin, u128::MAX);
-    assert!(
-        result.is_ok(),
-        "Admin should set threshold to MAX: {:?}",
-        result
-    );
+    // Set floor to a large value
+    let result = env.try_set_risk_threshold(&admin, 1_000_000_000_000);
+    assert!(result.is_ok(), "Admin should set floor: {:?}", result);
 
-    // With MAX threshold, risk-increasing trades should be gated
+    // Trades still succeed (insurance_floor does not gate trades in v10.5)
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
-    assert!(
-        result.is_err(),
-        "ATTACK: Trade should be gated after threshold set to MAX"
-    );
+    assert!(result.is_ok(), "Trade should succeed regardless of floor: {:?}", result);
 
-    // Set threshold back to 0, trade should work now
+    // Set floor back to 0
     let result = env.try_set_risk_threshold(&admin, 0);
-    assert!(
-        result.is_ok(),
-        "Admin should set threshold to 0: {:?}",
-        result
-    );
+    assert!(result.is_ok(), "Admin should reset floor: {:?}", result);
 
-    // Use different size (2M) to produce unique transaction bytes
-    let result = env.try_trade(&user, &lp, lp_idx, user_idx, 2_000_000);
-    assert!(
-        result.is_ok(),
-        "Trade should succeed after threshold reset to 0: {:?}",
-        result
-    );
+    // Conservation
+    let vault = env.vault_balance();
+    let engine_vault = env.read_engine_vault();
+    assert_eq!(engine_vault as u64, vault, "Conservation: engine={} vault={}", engine_vault, vault);
 }
 
 // ============================================================================
@@ -27008,8 +26995,10 @@ fn test_attack_slot_reuse_multi_user_gc_reinit() {
     );
 }
 
-/// ATTACK: SetRiskThreshold to exact insurance balance.
-/// When threshold == insurance, risk gate should be on the boundary.
+/// SetRiskThreshold sets insurance_floor. Per spec §4.7, insurance_floor
+/// reserves a portion of the insurance fund that cannot be withdrawn.
+/// Trades are NOT gated by insurance_floor (spec v10.5 uses side-mode gating).
+/// This test verifies insurance_floor can be set and the engine state is consistent.
 #[test]
 fn test_attack_risk_threshold_exact_insurance_boundary() {
     program_path();
@@ -27031,22 +27020,17 @@ fn test_attack_risk_threshold_exact_insurance_boundary() {
     env.try_top_up_insurance(&admin, 5_000_000_000).unwrap();
     env.crank();
 
-    // Set threshold to exact insurance balance
+    // Set insurance_floor to exact insurance balance
     let insurance = env.read_insurance_balance();
     env.try_set_risk_threshold(&admin, insurance).unwrap();
 
-    // gate_active(threshold, balance) = threshold > 0 && balance <= threshold
-    // When insurance == threshold, gate IS active (balance <= threshold is true)
-    // Risk-increasing trade should be rejected
+    // In spec v10.5, insurance_floor does NOT gate trades.
+    // Trades succeed as long as margin is sufficient and side mode is Normal.
     let trade_result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     assert!(
-        trade_result.is_err(),
-        "ATTACK: Trade should be rejected when insurance == threshold (gate active at boundary)"
+        trade_result.is_ok(),
+        "Trade should succeed: insurance_floor does not gate trades in spec v10.5"
     );
-
-    // Position should not have been opened
-    let pos = env.read_account_position(user_idx);
-    assert_eq!(pos, 0, "No position should be opened when gate is active: got {}", pos);
 
     // Conservation must hold
     let vault = env.vault_balance();
@@ -31879,10 +31863,9 @@ fn test_crank_threshold_ewma_bounded_by_limit() {
         .send_transaction(tx)
         .expect("UpdateConfig failed");
 
-    // Helper: read engine's risk_reduction_threshold directly from slab bytes
-    // ENGINE_OFF(440) + vault(16) + InsuranceFund(32) + RiskParams offset to
-    // risk_reduction_threshold(56) = 544
-    const RISK_THRESHOLD_OFF: usize = 440 + 16 + 32 + 5 * 8 + 16; // 544
+    // Helper: read engine's insurance_floor directly from slab bytes
+    // insurance_floor is at BPF engine offset 664 (computed from struct layout)
+    const RISK_THRESHOLD_OFF: usize = 440 + 664;
     let read_engine_threshold = |env: &TestEnv| -> u128 {
         let slab = env.svm.get_account(&env.slab).unwrap();
         u128::from_le_bytes(
