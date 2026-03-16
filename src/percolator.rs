@@ -4686,20 +4686,15 @@ pub mod processor {
                 // For resolved markets, directly settle capital and free the account.
                 // Cannot use engine.close_account() because its touch_account_full
                 // may overflow with frozen ADL state on resolved markets.
+                // set_capital(idx, 0) handles c_tot decrement internally.
                 let amt_units = engine.accounts[user_idx as usize].capital.get();
-                if amt_units > 0 {
-                    engine.set_capital(user_idx as usize, 0);
-                    let new_vault = engine.vault.get().saturating_sub(amt_units);
-                    engine.vault = percolator::U128::new(new_vault);
-                }
+                engine.set_capital(user_idx as usize, 0);
+                let new_vault = engine.vault.get().saturating_sub(amt_units);
+                engine.vault = percolator::U128::new(new_vault);
 
-                // Clear position basis (should already be zero from force-close)
+                // Clear position basis and PnL (should already be zero from force-close)
                 engine.set_pnl(user_idx as usize, percolator::wide_math::I256::ZERO);
                 engine.accounts[user_idx as usize].position_basis_q = percolator::wide_math::I256::ZERO;
-
-                // Decrement c_tot
-                let new_c_tot = engine.c_tot.get().saturating_sub(amt_units);
-                engine.c_tot = percolator::U128::new(new_c_tot);
 
                 // Mark slot as unused (equivalent to free_slot)
                 let idx_usize = user_idx as usize;
