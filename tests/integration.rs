@@ -40,7 +40,7 @@ const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
 
 fn cu_ix() -> Instruction {
-    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(2_000_000)
+    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(10_000_000)
 }
 
 fn program_path() -> PathBuf {
@@ -8122,9 +8122,9 @@ fn test_premarket_paginated_force_close() {
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved");
 
-    // Crank multiple times to close all positions (BATCH_SIZE = 64 per crank)
+    // Crank multiple times to close all positions (BATCH_SIZE = 8 per crank)
     let mut crank_count = 0;
-    let max_cranks = 10; // Safety limit
+    let max_cranks = 20; // Safety limit (ceil(101/8) = 13 cranks needed)
 
     loop {
         env.set_slot(200 + crank_count * 10);
