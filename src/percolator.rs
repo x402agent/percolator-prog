@@ -3866,8 +3866,7 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // For resolved markets, directly close without touch_account_full
-                    // which may overflow with frozen ADL state.
+                    // For resolved markets, directly free — close_account overflow risk.
                     let cap = engine.accounts[user_idx as usize].capital.get();
                     engine.set_capital(user_idx as usize, 0);
                     engine.set_pnl(user_idx as usize, 0i128);
@@ -3875,11 +3874,7 @@ pub mod processor {
                     engine.accounts[user_idx as usize].position_basis_q = 0i128;
                     let new_vault = engine.vault.get().saturating_sub(cap);
                     engine.vault = percolator::U128::new(new_vault);
-                    let idx_usize = user_idx as usize;
-                    let word = idx_usize / 64;
-                    let bit = idx_usize % 64;
-                    engine.used[word] &= !(1u64 << bit);
-                    engine.num_used_accounts = engine.num_used_accounts.saturating_sub(1);
+                    engine.free_slot(user_idx);
                     cap
                 } else {
                     engine
@@ -4689,25 +4684,16 @@ pub mod processor {
                 // Forgive fee debt
                 engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
 
-                // For resolved markets, directly settle capital and free the account.
-                // Cannot use engine.close_account() because its touch_account_full
-                // may overflow with frozen ADL state on resolved markets.
-                // set_capital(idx, 0) handles c_tot decrement internally.
+                // For resolved markets, directly settle and free the account.
+                // close_account() can overflow in touch_account_full with frozen ADL.
                 let amt_units = engine.accounts[user_idx as usize].capital.get();
                 engine.set_capital(user_idx as usize, 0);
+                engine.set_pnl(user_idx as usize, 0i128);
+                engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
+                engine.accounts[user_idx as usize].position_basis_q = 0i128;
                 let new_vault = engine.vault.get().saturating_sub(amt_units);
                 engine.vault = percolator::U128::new(new_vault);
-
-                // Clear position basis and PnL (should already be zero from force-close)
-                engine.set_pnl(user_idx as usize, 0i128);
-                engine.accounts[user_idx as usize].position_basis_q = 0i128;
-
-                // Mark slot as unused (equivalent to free_slot)
-                let idx_usize = user_idx as usize;
-                let word = idx_usize / 64;
-                let bit = idx_usize % 64;
-                engine.used[word] &= !(1u64 << bit);
-                engine.num_used_accounts = engine.num_used_accounts.saturating_sub(1);
+                engine.free_slot(user_idx);
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
