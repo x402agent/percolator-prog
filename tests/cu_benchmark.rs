@@ -177,11 +177,11 @@ fn encode_deposit(user_idx: u16, amount: u64) -> Vec<u8> {
 }
 
 fn encode_crank_permissionless(panic: u8) -> Vec<u8> {
-    // Two-phase crank: pass all account indices as candidates
+    // Two-phase crank: pass first 128 account indices as candidates
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes());
     data.push(panic);
-    for i in 0..MAX_ACCOUNTS as u16 {
+    for i in 0..128u16 {
         data.extend_from_slice(&i.to_le_bytes());
     }
     data
