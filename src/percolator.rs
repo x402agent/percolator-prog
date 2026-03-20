@@ -3154,7 +3154,7 @@ pub mod processor {
                 let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
 
                 engine
-                    .withdraw(user_idx, units_requested as u128, clock.slot, price)
+                    .withdraw(user_idx, units_requested as u128, price, clock.slot)
                     .map_err(map_risk_error)?;
 
                 // Convert units back to base tokens for payout (checked to prevent silent overflow)
