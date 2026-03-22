@@ -3225,17 +3225,35 @@ pub mod processor {
                     let start = engine.crank_cursor;
                     let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
 
-                    // Update market mark to settlement price
-                    let _ = engine.accrue_market_to(clock.slot, settlement_price);
+                    // Update market mark to settlement price (propagate errors)
+                    engine.accrue_market_to(clock.slot, settlement_price)
+                        .map_err(map_risk_error)?;
 
                     for idx in start..end {
                         if engine.is_used(idx as usize) {
-                            // Touch account to settle all pending PnL at settlement price
-                            let _ = engine.touch_account_full(idx as usize, settlement_price, clock.slot);
+                            // Touch account to settle all pending PnL at settlement price.
+                            // Propagate errors — silent discard would lose unsettled PnL.
+                            engine.touch_account_full(idx as usize, settlement_price, clock.slot)
+                                .map_err(map_risk_error)?;
                             let eff = engine.effective_pos_q(idx as usize);
                             if eff != 0 {
-                                // Zero the position
-                                engine.attach_effective_position(idx as usize, 0i128);
+                                // Determine OI side before zeroing position
+                                let abs_eff = eff.unsigned_abs();
+                                let is_long = eff > 0;
+
+                                // Zero the position via set_position_basis_q
+                                // (not direct write — decrements stored_pos_count)
+                                engine.set_position_basis_q(idx as usize, 0i128);
+                                // Reset ADL snapshots to canonical zero-position defaults
+                                engine.accounts[idx as usize].adl_a_basis = percolator::ADL_ONE;
+                                engine.accounts[idx as usize].adl_k_snap = 0i128;
+
+                                // Decrement OI for the closed side
+                                if is_long {
+                                    engine.oi_eff_long_q = engine.oi_eff_long_q.saturating_sub(abs_eff);
+                                } else {
+                                    engine.oi_eff_short_q = engine.oi_eff_short_q.saturating_sub(abs_eff);
+                                }
                             }
                         }
                     }
@@ -3879,14 +3897,49 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // For resolved markets, directly free — close_account overflow risk.
+                    // For resolved markets, settle PnL then free.
+                    // Set market timestamps current to prevent overflow in touch.
+                    engine.last_market_slot = clock.slot;
+                    engine.last_crank_slot = clock.slot;
+                    engine.current_slot = clock.slot;
+                    engine.last_oracle_price = price;
+                    engine.funding_price_sample_last = price;
+
+                    // Touch to settle any unsettled A/K PnL at settlement price.
+                    // If touch fails (e.g., corrupt state), fall back to raw capital.
+                    let _ = engine.touch_account_full(user_idx as usize, price, clock.slot);
+
+                    // Forgive fee debt and clear position via proper helpers
+                    engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
+                    if engine.accounts[user_idx as usize].position_basis_q != 0 {
+                        let old_eff = engine.effective_pos_q(user_idx as usize);
+                        engine.set_position_basis_q(user_idx as usize, 0i128);
+                        engine.accounts[user_idx as usize].adl_a_basis = percolator::ADL_ONE;
+                        engine.accounts[user_idx as usize].adl_k_snap = 0i128;
+                        // Decrement OI
+                        if old_eff > 0 {
+                            engine.oi_eff_long_q = engine.oi_eff_long_q.saturating_sub(old_eff.unsigned_abs());
+                        } else if old_eff < 0 {
+                            engine.oi_eff_short_q = engine.oi_eff_short_q.saturating_sub(old_eff.unsigned_abs());
+                        }
+                    }
+
+                    // Settle any remaining positive PnL to capital
+                    let pnl = engine.accounts[user_idx as usize].pnl;
+                    if pnl > 0 {
+                        let haircutted = engine.effective_matured_pnl(user_idx as usize);
+                        let cap = engine.accounts[user_idx as usize].capital.get();
+                        engine.set_capital(user_idx as usize, cap.saturating_add(haircutted));
+                    }
+                    engine.set_pnl(user_idx as usize, 0i128);
+
+                    // Read final capital and free
                     let cap = engine.accounts[user_idx as usize].capital.get();
                     engine.set_capital(user_idx as usize, 0);
-                    engine.set_pnl(user_idx as usize, 0i128);
-                    engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
-                    engine.accounts[user_idx as usize].position_basis_q = 0i128;
-                    let new_vault = engine.vault.get().saturating_sub(cap);
-                    engine.vault = percolator::U128::new(new_vault);
+                    let vault = engine.vault.get();
+                    engine.vault = percolator::U128::new(
+                        vault.checked_sub(cap).unwrap_or(0)  // checked, not saturating
+                    );
                     engine.free_slot(user_idx);
                     cap
                 } else {
@@ -4681,11 +4734,20 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Force-settle PnL so close_account's pnl==0 check passes
+                // For resolved markets, settle ALL positive PnL to capital
+                // (including reserved/unwarmed PnL — warmup has effectively stopped).
                 let pnl = engine.accounts[user_idx as usize].pnl;
                 let capital = engine.accounts[user_idx as usize].capital.get();
                 if pnl > 0 {
-                    let haircutted = engine.effective_matured_pnl(user_idx as usize);
+                    // Use total positive PnL with haircut, not just matured portion.
+                    // In resolved context, warmup clock stopped — all PnL should be claimable.
+                    let (h_num, h_den) = engine.haircut_ratio();
+                    let pos_pnl = pnl as u128;
+                    let haircutted = if h_den == 0 {
+                        pos_pnl
+                    } else {
+                        pos_pnl.checked_mul(h_num).unwrap_or(u128::MAX) / h_den
+                    };
                     engine.set_capital(user_idx as usize, capital.saturating_add(haircutted));
                     engine.set_pnl(user_idx as usize, 0i128);
                 } else if pnl < 0 {
@@ -4697,15 +4759,20 @@ pub mod processor {
                 // Forgive fee debt
                 engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
 
-                // For resolved markets, directly settle and free the account.
-                // close_account() can overflow in touch_account_full with frozen ADL.
+                // Clear position via proper helper (decrements stored_pos_count)
+                if engine.accounts[user_idx as usize].position_basis_q != 0 {
+                    engine.set_position_basis_q(user_idx as usize, 0i128);
+                    engine.accounts[user_idx as usize].adl_a_basis = percolator::ADL_ONE;
+                    engine.accounts[user_idx as usize].adl_k_snap = 0i128;
+                }
+
+                // Free account: capital → vault decrement + free_slot
                 let amt_units = engine.accounts[user_idx as usize].capital.get();
                 engine.set_capital(user_idx as usize, 0);
-                engine.set_pnl(user_idx as usize, 0i128);
-                engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
-                engine.accounts[user_idx as usize].position_basis_q = 0i128;
-                let new_vault = engine.vault.get().saturating_sub(amt_units);
-                engine.vault = percolator::U128::new(new_vault);
+                let vault = engine.vault.get();
+                engine.vault = percolator::U128::new(
+                    vault.checked_sub(amt_units).unwrap_or(0)
+                );
                 engine.free_slot(user_idx);
                 let amt_units_u64: u64 = amt_units
                     .try_into()

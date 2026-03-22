@@ -13164,13 +13164,12 @@ fn test_attack_lp_immune_to_gc() {
     env.set_slot(200);
     env.crank();
 
-    // LP should still be valid (not GC'd)
-    // Verify by depositing to the LP
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-    let capital = env.read_account_capital(lp_idx);
+    // Per engine fix (LP GC bypass removed): LPs with zero capital
+    // are GC'd just like users. Deposit to a GC'd slot should fail.
+    let result = env.try_deposit(&lp, lp_idx, 10_000_000_000);
     assert!(
-        capital > 0,
-        "LP should not be GC'd - capital should be credited"
+        result.is_err(),
+        "Zero-capital LP should be GC'd — deposit to freed slot must fail"
     );
 }
 
