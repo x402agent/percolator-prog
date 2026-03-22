@@ -3906,8 +3906,9 @@ pub mod processor {
                     engine.funding_price_sample_last = price;
 
                     // Touch to settle any unsettled A/K PnL at settlement price.
-                    // If touch fails (e.g., corrupt state), fall back to raw capital.
-                    let _ = engine.touch_account_full(user_idx as usize, price, clock.slot);
+                    // Propagate error — silent discard would lose unsettled PnL.
+                    engine.touch_account_full(user_idx as usize, price, clock.slot)
+                        .map_err(map_risk_error)?;
 
                     // Forgive fee debt and clear position via proper helpers
                     engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
@@ -3924,10 +3925,18 @@ pub mod processor {
                         }
                     }
 
-                    // Settle any remaining positive PnL to capital
+                    // Settle ALL positive PnL with haircut (not just matured).
+                    // In resolved context, warmup has stopped — all PnL should be
+                    // claimable. Consistent with AdminForceCloseAccount path.
                     let pnl = engine.accounts[user_idx as usize].pnl;
                     if pnl > 0 {
-                        let haircutted = engine.effective_matured_pnl(user_idx as usize);
+                        let (h_num, h_den) = engine.haircut_ratio();
+                        let pos_pnl = pnl as u128;
+                        let haircutted = if h_den == 0 {
+                            pos_pnl
+                        } else {
+                            pos_pnl.checked_mul(h_num).unwrap_or(u128::MAX) / h_den
+                        };
                         let cap = engine.accounts[user_idx as usize].capital.get();
                         engine.set_capital(user_idx as usize, cap.saturating_add(haircutted));
                     }
@@ -3938,7 +3947,8 @@ pub mod processor {
                     engine.set_capital(user_idx as usize, 0);
                     let vault = engine.vault.get();
                     engine.vault = percolator::U128::new(
-                        vault.checked_sub(cap).unwrap_or(0)  // checked, not saturating
+                        vault.checked_sub(cap)
+                            .ok_or(PercolatorError::EngineOverflow)?
                     );
                     engine.free_slot(user_idx);
                     cap
@@ -4771,7 +4781,8 @@ pub mod processor {
                 engine.set_capital(user_idx as usize, 0);
                 let vault = engine.vault.get();
                 engine.vault = percolator::U128::new(
-                    vault.checked_sub(amt_units).unwrap_or(0)
+                    vault.checked_sub(amt_units)
+                        .ok_or(PercolatorError::EngineOverflow)?
                 );
                 engine.free_slot(user_idx);
                 let amt_units_u64: u64 = amt_units
