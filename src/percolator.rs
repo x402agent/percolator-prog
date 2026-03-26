@@ -1455,23 +1455,14 @@ pub mod ix {
         let liquidation_fee_cap = U128::new(read_u128(input)?);
         let liquidation_buffer_bps = read_u64(input)?;
         let min_liquidation_abs = U128::new(read_u128(input)?);
-        // These three params are decoded from instruction data (not hardcoded).
-        // Backward compat: if data is short, use safe defaults.
-        let min_initial_deposit = if input.len() >= 16 {
-            U128::new(read_u128(input)?)
-        } else {
-            U128::new(100)
-        };
-        let min_nonzero_mm_req = if input.len() >= 16 {
-            read_u128(input)?
-        } else {
-            1u128
-        };
-        let min_nonzero_im_req = if input.len() >= 16 {
-            read_u128(input)?
-        } else {
-            2u128
-        };
+        // These three params must be explicitly provided — truncated payloads
+        // are rejected to prevent silent creation with tiny fallback floors.
+        if input.len() < 48 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let min_initial_deposit = U128::new(read_u128(input)?);
+        let min_nonzero_mm_req = read_u128(input)?;
+        let min_nonzero_im_req = read_u128(input)?;
         let params = RiskParams {
             warmup_period_slots,
             maintenance_margin_bps,
@@ -2835,8 +2826,8 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
 
-                let _ = zc::engine_mut(&mut data)?;
-
+                // Check magic BEFORE any unsafe cast — raw bytes may contain
+                // invalid enum discriminants that would be UB if cast to RiskEngine.
                 let header = state::read_header(&data);
                 if header.magic == MAGIC {
                     return Err(PercolatorError::AlreadyInitialized.into());
@@ -2844,6 +2835,16 @@ pub mod processor {
 
                 let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
+
+                // Require vault starts empty — prevents accounting divergence
+                // from pre-existing or unsolicited token transfers.
+                {
+                    let vd = a_vault.try_borrow_data()?;
+                    let vt = spl_token::state::Account::unpack(&vd)?;
+                    if vt.amount != 0 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                }
 
                 for b in data.iter_mut() {
                     *b = 0;
@@ -3263,9 +3264,12 @@ pub mod processor {
 
                     for idx in start..end {
                         if engine.is_used(idx as usize) {
-                            let _ = engine.touch_account_full(
+                            // Propagate errors — touch mutates state before it can
+                            // fail, so swallowing errors commits partial state.
+                            // On error the tx rolls back atomically.
+                            engine.touch_account_full(
                                 idx as usize, settlement_price, clock.slot,
-                            );
+                            ).map_err(map_risk_error)?;
                         }
                     }
 
@@ -3277,16 +3281,20 @@ pub mod processor {
                     };
                     engine.current_slot = clock.slot;
 
-                    // Sweep dust to insurance (same logic as unresolved crank)
+                    // Sweep dust to insurance fund.
+                    // On resolved markets, also forgive sub-scale remainder
+                    // (worth < 1 engine unit, no engine accounting entry).
                     if unit_scale > 0 {
                         let scale = unit_scale as u64;
                         if dust_before >= scale {
                             let units_to_sweep = dust_before / scale;
-                            let _ = engine.top_up_insurance_fund(
+                            engine.top_up_insurance_fund(
                                 units_to_sweep as u128, clock.slot,
-                            );
-                            state::write_dust_base(&mut data, dust_before % scale);
+                            ).map_err(map_risk_error)?;
                         }
+                        // Forgive any sub-scale remainder — on resolved markets
+                        // no new dust can accumulate, so this is terminal cleanup.
+                        state::write_dust_base(&mut data, 0);
                     }
 
                     return Ok(());
@@ -3901,13 +3909,12 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Best-effort settlement at settlement price before closing.
-                    // touch_account_full may overflow if ADL state is frozen, so
-                    // we ignore errors and fall through to close_account_resolved
-                    // which handles that case.
-                    let _ = engine.touch_account_full(
+                    // Settle pending lazy effects at settlement price before closing.
+                    // Must propagate errors — touch mutates state before it can
+                    // fail, so swallowing commits partial state.
+                    engine.touch_account_full(
                         user_idx as usize, price, clock.slot,
-                    );
+                    ).map_err(map_risk_error)?;
                     engine.close_account_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -4674,10 +4681,10 @@ pub mod processor {
                 {
                     let engine = zc::engine_mut(&mut data)?;
                     if resolved {
-                        for i in 0..percolator::MAX_ACCOUNTS {
-                            if engine.is_used(i) && !(engine.effective_pos_q(i) == 0) {
-                                return Err(ProgramError::InvalidAccountData);
-                            }
+                        // Require all accounts fully closed, not just effective_pos_q==0
+                        // (which returns 0 for epoch-mismatched stale positions).
+                        if engine.num_used_accounts != 0 {
+                            return Err(ProgramError::InvalidAccountData);
                         }
                     }
 
@@ -4815,13 +4822,12 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Best-effort settlement at settlement price before closing.
-                // touch_account_full may overflow if ADL state is frozen, so
-                // we ignore errors and fall through to close_account_resolved
-                // which handles that case.
-                let _ = engine.touch_account_full(
+                // Settle pending lazy effects at settlement price before closing.
+                // Must propagate errors — touch mutates state before it can
+                // fail, so swallowing commits partial state.
+                engine.touch_account_full(
                     user_idx as usize, price, clock.slot,
-                );
+                ).map_err(map_risk_error)?;
                 let amt_units = engine.close_account_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
