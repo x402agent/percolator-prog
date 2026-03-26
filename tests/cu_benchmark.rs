@@ -130,9 +130,9 @@ fn encode_init_market_with_params(
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
-    // Per-market admin limits (uncapped defaults for tests)
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    // Per-market admin limits (within engine bounds)
+    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot
+    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());

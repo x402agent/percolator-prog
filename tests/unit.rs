@@ -240,8 +240,8 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u32(0, &mut data); // unit_scale (0 = no scaling)
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (uncapped defaults for tests)
-    encode_u128(u128::MAX, &mut data); // max_maintenance_fee_per_slot
-    encode_u128(u128::MAX, &mut data); // max_risk_threshold
+    encode_u128(100_000_000_000_000_000_000u128, &mut data); // max_maintenance_fee_per_slot
+    encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
     encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);   // warmup_period_slots
@@ -276,8 +276,8 @@ fn encode_init_market_invert(
     encode_u32(unit_scale, &mut data);
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (uncapped defaults for tests)
-    encode_u128(u128::MAX, &mut data); // max_maintenance_fee_per_slot
-    encode_u128(u128::MAX, &mut data); // max_risk_threshold
+    encode_u128(100_000_000_000_000_000_000u128, &mut data); // max_maintenance_fee_per_slot
+    encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
     encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
     encode_u64(0, &mut data);    // warmup_period_slots

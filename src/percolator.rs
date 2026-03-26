@@ -1280,11 +1280,15 @@ pub mod ix {
                     // KeeperCrank — two-phase: candidates computed off-chain
                     let caller_idx = read_u16(&mut rest)?;
                     let allow_panic = read_u8(&mut rest)?;
-                    // Parse candidate list: remaining bytes are u16 account indices
-                    // Each candidate maps to (u16, None) — None defaults to FullClose
+                    // Parse candidate list: remaining bytes are u16 account indices.
+                    // Each candidate gets FullClose policy — the keeper shortlists
+                    // only accounts that need liquidation.
                     let mut candidates = alloc::vec::Vec::new();
                     while rest.len() >= 2 {
-                        candidates.push((read_u16(&mut rest)?, None));
+                        candidates.push((
+                            read_u16(&mut rest)?,
+                            Some(percolator::LiquidationPolicy::FullClose),
+                        ));
                     }
                     Ok(Instruction::KeeperCrank {
                         caller_idx,
@@ -2851,11 +2855,17 @@ pub mod processor {
                     initial_mark_price_e6
                 };
 
-                // Validate per-market admin limits (must be set at init time)
-                if max_maintenance_fee_per_slot == 0 {
+                // Validate per-market admin limits (must be set at init time).
+                // Bounds-check against engine-level constants to prevent admin
+                // from setting values that violate engine invariants.
+                if max_maintenance_fee_per_slot == 0
+                    || max_maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                if max_insurance_floor == 0 {
+                if max_insurance_floor == 0
+                    || max_insurance_floor > percolator::MAX_VAULT_TVL
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Validate initial insurance_floor against per-market limit

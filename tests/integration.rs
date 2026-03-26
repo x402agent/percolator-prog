@@ -131,8 +131,8 @@ fn encode_init_market_full_v2(
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&initial_mark_price_e6.to_le_bytes()); // initial_mark_price_e6
     // Per-market admin limits (uncapped defaults for tests)
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
+    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // warmup_period_slots
@@ -909,8 +909,8 @@ fn encode_init_market_full(
     data.extend_from_slice(&unit_scale.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
     // Per-market admin limits (uncapped defaults for tests)
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
+    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
@@ -947,8 +947,8 @@ fn encode_init_market_with_warmup(
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale = 0 (no scaling)
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
     // Per-market admin limits (uncapped defaults for tests)
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
+    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // warmup_period_slots
@@ -11286,8 +11286,8 @@ impl TestEnv {
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         // Per-market admin limits (uncapped defaults for tests)
-        data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
-        data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+        data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
+        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
         data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
         // RiskParams
         data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
@@ -12191,7 +12191,7 @@ fn test_attack_update_config_extreme_values() {
             10000,
             10000,
             0u128,
-            u128::MAX, // thresh_max (extreme)
+            10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
             0u128,
         ),
     };
@@ -13284,10 +13284,19 @@ fn test_attack_maintenance_fee_u128_max() {
     env.init_market_with_warmup(0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // u128::MAX exceeds the per-market cap (MAX_PROTOCOL_FEE_ABS = 1e20), so it is rejected.
     let result = env.try_set_maintenance_fee(&admin, u128::MAX);
     assert!(
+        result.is_err(),
+        "u128::MAX maintenance fee must be rejected by per-market cap check"
+    );
+
+    // The maximum allowed fee (= MAX_PROTOCOL_FEE_ABS = 1e20) is accepted.
+    const MAX_PROTOCOL_FEE_ABS: u128 = 100_000_000_000_000_000_000u128;
+    let result = env.try_set_maintenance_fee(&admin, MAX_PROTOCOL_FEE_ABS);
+    assert!(
         result.is_ok(),
-        "Admin should set max maintenance fee: {:?}",
+        "Admin should set max maintenance fee (MAX_PROTOCOL_FEE_ABS): {:?}",
         result
     );
 
@@ -13297,14 +13306,13 @@ fn test_attack_maintenance_fee_u128_max() {
     env.deposit(&user, user_idx, 10_000_000_000);
 
     // Advance time and crank - fees are ENABLED (spec §8.2).
-    // u128::MAX * dt overflows checked_mul, so fee is clamped to MAX_PROTOCOL_FEE_ABS.
-    // This is >> capital, so capital drains to zero. Crank must still succeed (no error).
+    // MAX_PROTOCOL_FEE_ABS >> capital, so capital drains to zero. Crank must still succeed.
     let capital_before = env.read_account_capital(user_idx);
     env.set_slot(200);
     let result = env.try_crank();
     assert!(
         result.is_ok(),
-        "Crank must succeed even with u128::MAX fee (overflow clamped to MAX_PROTOCOL_FEE_ABS): {:?}",
+        "Crank must succeed even with MAX_PROTOCOL_FEE_ABS fee: {:?}",
         result
     );
     let capital_after = env.read_account_capital(user_idx);
@@ -15952,11 +15960,19 @@ fn test_attack_extreme_maintenance_fee() {
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 100_000_000_000);
 
-    // Set extreme maintenance fee and verify it is accepted.
+    // u128::MAX exceeds the per-market cap (MAX_PROTOCOL_FEE_ABS = 1e20) and is rejected.
     let result = env.try_set_maintenance_fee(&admin, u128::MAX);
     assert!(
+        result.is_err(),
+        "u128::MAX maintenance fee must be rejected by per-market cap check"
+    );
+
+    // Set fee to the maximum allowed value (MAX_PROTOCOL_FEE_ABS = 1e20).
+    const MAX_PROTOCOL_FEE_ABS: u128 = 100_000_000_000_000_000_000u128;
+    let result = env.try_set_maintenance_fee(&admin, MAX_PROTOCOL_FEE_ABS);
+    assert!(
         result.is_ok(),
-        "Extreme maintenance fee update should be accepted: {:?}",
+        "Extreme maintenance fee (MAX_PROTOCOL_FEE_ABS) update should be accepted: {:?}",
         result
     );
 
@@ -15969,15 +15985,12 @@ fn test_attack_extreme_maintenance_fee() {
         vault
     );
 
-    // Advance time and crank - system must not panic (but may return overflow error)
-    // With u128::MAX fee per slot, arithmetic overflows during fee accrual.
-    // The engine returns EngineOverflow gracefully instead of panicking.
+    // Advance time and crank - system must not panic.
+    // MAX_PROTOCOL_FEE_ABS >> any realistic capital, so fee accrual drains capital to zero.
     env.set_slot_and_price(100, 100_000_000);
     let crank_result = env.try_crank();
-    // The crank may fail with EngineOverflow (graceful error, no panic/corruption)
-    // This is the correct behavior for extreme fees that cause arithmetic overflow.
-    // We accept both success and overflow error.
-    let _ = crank_result; // EngineOverflow is acceptable
+    // The crank may fail or succeed gracefully; no panic or state corruption is acceptable.
+    let _ = crank_result;
 
     // After attempted crank, vault tokens still preserved (no SPL tokens moved)
     let vault_after = env.vault_balance();
@@ -17456,11 +17469,11 @@ fn test_attack_updateconfig_preserves_conservation() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let result = env.try_update_config_with_params(
         &admin,
-        7200,                  // funding_horizon_slots
-        2_000_000_000_000u128, // funding_inv_scale
-        2000,                  // alpha_bps
+        7200,                       // funding_horizon_slots
+        2_000_000_000_000u128,      // funding_inv_scale
+        2000,                       // alpha_bps
         0,
-        u128::MAX, // min/max
+        10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
     );
     assert!(
         result.is_ok(),
@@ -19541,11 +19554,11 @@ fn test_attack_config_extreme_funding_max_bps() {
     // The engine should either accept (with clamping) or reject this
     let result = env.try_update_config_with_params(
         &admin,
-        100,               // funding_horizon_slots
-        1_000_000_000_000, // funding_inv_scale
-        1000,              // thresh_alpha_bps
-        0,                 // thresh_min
-        u128::MAX / 2,     // thresh_max (huge)
+        100,                        // funding_horizon_slots
+        1_000_000_000_000,          // funding_inv_scale
+        1000,                       // thresh_alpha_bps
+        0,                          // thresh_min
+        10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
     );
     assert!(
         result.is_ok(),
@@ -20628,19 +20641,19 @@ fn test_attack_funding_extreme_k_bps_capped() {
             AccountMeta::new(env.slab, false),
         ],
         data: encode_update_config(
-            100,               // funding_horizon_slots
-            u64::MAX / 2,      // funding_k_bps (extreme!)
-            1_000_000_000_000, // funding_inv_scale
-            100,               // funding_max_premium_bps
-            10,                // funding_max_bps_per_slot
-            0u128,             // thresh_floor
-            100,               // thresh_risk_bps
-            100,               // thresh_update_interval_slots
-            100,               // thresh_step_bps
-            1000,              // thresh_alpha_bps
-            0u128,             // thresh_min
-            u128::MAX / 2,     // thresh_max
-            1u128,             // thresh_min_step
+            100,                        // funding_horizon_slots
+            u64::MAX / 2,               // funding_k_bps (extreme!)
+            1_000_000_000_000,          // funding_inv_scale
+            100,                        // funding_max_premium_bps
+            10,                         // funding_max_bps_per_slot
+            0u128,                      // thresh_floor
+            100,                        // thresh_risk_bps
+            100,                        // thresh_update_interval_slots
+            100,                        // thresh_step_bps
+            1000,                       // thresh_alpha_bps
+            0u128,                      // thresh_min
+            10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
+            1u128,                      // thresh_min_step
         ),
     };
     let tx = Transaction::new_signed_with_payer(
@@ -20710,18 +20723,18 @@ fn test_attack_funding_extreme_max_premium_capped() {
             AccountMeta::new(env.slab, false),
         ],
         data: encode_update_config(
-            100,               // funding_horizon_slots
-            100,               // funding_k_bps
-            1_000_000_000_000, // funding_inv_scale
-            i64::MAX,          // funding_max_premium_bps (extreme!)
-            10,                // funding_max_bps_per_slot
-            0u128,             // thresh_floor
-            100,               // thresh_risk_bps
-            100,               // thresh_update_interval_slots
-            100,               // thresh_step_bps
-            1000,              // thresh_alpha_bps
-            0u128,             // thresh_min
-            u128::MAX / 2,     // thresh_max
+            100,                        // funding_horizon_slots
+            100,                        // funding_k_bps
+            1_000_000_000_000,          // funding_inv_scale
+            i64::MAX,                   // funding_max_premium_bps (extreme!)
+            10,                         // funding_max_bps_per_slot
+            0u128,                      // thresh_floor
+            100,                        // thresh_risk_bps
+            100,                        // thresh_update_interval_slots
+            100,                        // thresh_step_bps
+            1000,                       // thresh_alpha_bps
+            0u128,                      // thresh_min
+            10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
             1u128,             // thresh_min_step
         ),
     };
@@ -20792,19 +20805,19 @@ fn test_attack_funding_extreme_max_bps_per_slot() {
             AccountMeta::new(env.slab, false),
         ],
         data: encode_update_config(
-            100,               // funding_horizon_slots
-            100,               // funding_k_bps
-            1_000_000_000_000, // funding_inv_scale
-            100,               // funding_max_premium_bps
-            i64::MAX,          // funding_max_bps_per_slot (extreme!)
-            0u128,             // thresh_floor
-            100,               // thresh_risk_bps
-            100,               // thresh_update_interval_slots
-            100,               // thresh_step_bps
-            1000,              // thresh_alpha_bps
-            0u128,             // thresh_min
-            u128::MAX / 2,     // thresh_max
-            1u128,             // thresh_min_step
+            100,                        // funding_horizon_slots
+            100,                        // funding_k_bps
+            1_000_000_000_000,          // funding_inv_scale
+            100,                        // funding_max_premium_bps
+            i64::MAX,                   // funding_max_bps_per_slot (extreme!)
+            0u128,                      // thresh_floor
+            100,                        // thresh_risk_bps
+            100,                        // thresh_update_interval_slots
+            100,                        // thresh_step_bps
+            1000,                       // thresh_alpha_bps
+            0u128,                      // thresh_min
+            10_000_000_000_000_000u128, // thresh_max (= max_insurance_floor cap = MAX_VAULT_TVL)
+            1u128,                      // thresh_min_step
         ),
     };
     let tx = Transaction::new_signed_with_payer(
@@ -31749,7 +31762,7 @@ fn test_update_config_thresh_max_bounded_by_limit() {
             &admin.pubkey(),
             &env.mint,
             &TEST_FEED_ID,
-            u128::MAX, // max_maintenance_fee (uncapped)
+            100_000_000_000_000_000_000u128, // max_maintenance_fee
             50_000,    // max_risk_threshold
             0,         // min_oracle_price_cap_e2bps (no floor)
         ),
@@ -31853,7 +31866,7 @@ fn test_crank_threshold_ewma_bounded_by_limit() {
             &admin.pubkey(),
             &env.mint,
             &TEST_FEED_ID,
-            u128::MAX, // max_maintenance_fee (uncapped)
+            100_000_000_000_000_000_000u128, // max_maintenance_fee
             50_000,    // max_risk_threshold
             0,         // min_oracle_price_cap_e2bps
         ),
@@ -31993,7 +32006,7 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     // Per-market admin limits
-    data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_maintenance_fee_per_slot
+    data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maintenance_fee_per_slot (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&50_000u128.to_le_bytes()); // max_risk_threshold = 50_000
     data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams with risk_reduction_threshold EXCEEDING the limit
@@ -32066,7 +32079,7 @@ fn test_init_market_risk_params_exceed_limits_rejected() {
     data2.extend_from_slice(&0u64.to_le_bytes());
     // Per-market admin limits
     data2.extend_from_slice(&1000u128.to_le_bytes()); // max_maintenance_fee = 1000
-    data2.extend_from_slice(&u128::MAX.to_le_bytes()); // max_risk_threshold
+    data2.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
     data2.extend_from_slice(&0u64.to_le_bytes());
     // RiskParams with maintenance_fee_per_slot EXCEEDING the limit
     data2.extend_from_slice(&0u64.to_le_bytes());
