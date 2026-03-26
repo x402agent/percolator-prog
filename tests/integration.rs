@@ -1307,13 +1307,19 @@ impl TestEnv {
     /// Try to close slab, returns Ok or error
     fn try_close_slab(&mut self) -> Result<(), String> {
         let admin = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let admin_ata = self.create_ata(&admin.pubkey(), 0);
 
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(self.vault, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new(admin_ata, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
             ],
             data: encode_close_slab(),
         };
@@ -1480,17 +1486,10 @@ fn test_bug3_close_slab_with_dust_should_fail() {
     // Vault should have dust remaining (500 base tokens)
     assert!(vault_after > 0, "Vault should have dust remaining");
 
-    // Try to close slab - should fail because dust_base > 0
+    // CloseSlab now drains stranded vault tokens (including sub-scale dust)
+    // to admin's ATA and forgives dust_base. This is the terminal cleanup path.
     let result = env.try_close_slab();
-
-    println!("Bug #3 test: CloseSlab with dust result = {:?}", result);
-    println!(
-        "Bug #3: Vault still has {} tokens - CloseSlab correctly rejects",
-        vault_after
-    );
-
-    // FIXED: CloseSlab now returns error when dust_base > 0
-    assert!(result.is_err(), "CloseSlab should fail when dust_base > 0");
+    assert!(result.is_ok(), "CloseSlab should drain dust and succeed: {:?}", result);
 }
 
 // ============================================================================
@@ -4171,12 +4170,18 @@ fn test_critical_close_slab_authorization() {
     env.deposit(&user, user_idx, 1_000_000_000);
 
     // Attacker tries to close slab - should fail (not admin)
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+    let attacker_ata = env.create_ata(&attacker.pubkey(), 0);
     let attacker_ix = Instruction {
         program_id: env.program_id,
         accounts: vec![
             AccountMeta::new(attacker.pubkey(), true),
             AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.vault, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new(attacker_ata, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
         ],
         data: encode_close_slab(),
     };
@@ -5276,12 +5281,18 @@ impl TradeCpiTestEnv {
 
     fn try_close_slab(&mut self) -> Result<(), String> {
         let admin = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
+        let (vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let admin_ata = self.create_ata(&admin.pubkey(), 0);
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(self.vault, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new(admin_ata, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
             ],
             data: encode_close_slab(),
         };

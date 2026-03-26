@@ -739,7 +739,43 @@ pub mod zc {
     // Use const to export the actual offset for debugging
     pub const ACCOUNTS_OFFSET: usize = offset_of!(RiskEngine, accounts);
 
-    #[inline]
+    /// Offset of side_mode_long within RiskEngine (repr(u8) enum)
+    const SM_LONG_OFF: usize = offset_of!(RiskEngine, side_mode_long);
+    /// Offset of side_mode_short within RiskEngine (repr(u8) enum)
+    const SM_SHORT_OFF: usize = offset_of!(RiskEngine, side_mode_short);
+    /// Offset of Account::kind within Account (repr(u8) enum)
+    const KIND_OFF_IN_ACCOUNT: usize = offset_of!(percolator::Account, kind);
+    /// Size of one Account struct
+    const ACCOUNT_SIZE: usize = core::mem::size_of::<percolator::Account>();
+
+    /// Validate enum discriminants from raw bytes BEFORE casting to RiskEngine.
+    /// Creating a reference to an enum with an invalid discriminant is UB,
+    /// so we must check the raw bytes at the known offsets first.
+    fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
+        let base = ENGINE_OFF;
+        // SideMode: valid values 0..=2
+        let sm_long = data[base + SM_LONG_OFF];
+        let sm_short = data[base + SM_SHORT_OFF];
+        if sm_long > 2 || sm_short > 2 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // AccountKind: valid values 0..=1 — only check used slots.
+        // Account::is_used checks account_id != 0, which is a u64 at offset 0.
+        for i in 0..percolator::MAX_ACCOUNTS {
+            let acc_base = base + ACCOUNTS_OFFSET + i * ACCOUNT_SIZE;
+            // account_id is a u64 at offset 0 of Account
+            let id_bytes = &data[acc_base..acc_base + 8];
+            let account_id = u64::from_le_bytes(id_bytes.try_into().unwrap());
+            if account_id != 0 {
+                let kind_byte = data[acc_base + KIND_OFF_IN_ACCOUNT];
+                if kind_byte > 1 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn engine_ref<'a>(data: &'a [u8]) -> Result<&'a RiskEngine, ProgramError> {
         // Require full ENGINE_LEN to avoid UB from reference extending past buffer
         if data.len() < ENGINE_OFF + ENGINE_LEN {
@@ -749,6 +785,8 @@ pub mod zc {
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
+        // Validate enum discriminants from raw bytes before creating reference
+        validate_raw_discriminants(data)?;
         Ok(unsafe { &*(ptr as *const RiskEngine) })
     }
 
@@ -761,6 +799,7 @@ pub mod zc {
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
+        validate_raw_discriminants(data)?;
         Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
     }
 
@@ -1531,6 +1570,18 @@ pub mod accounts {
 
     pub fn derive_vault_authority(program_id: &Pubkey, slab_key: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(&[b"vault", slab_key.as_ref()], program_id)
+    }
+
+    /// Derive vault authority from stored bump (saves ~1300 CU vs find_program_address)
+    pub fn derive_vault_authority_with_bump(
+        program_id: &Pubkey,
+        slab_key: &Pubkey,
+        bump: u8,
+    ) -> Result<Pubkey, ProgramError> {
+        Pubkey::create_program_address(
+            &[b"vault", slab_key.as_ref(), &[bump]],
+            program_id,
+        ).map_err(|_| ProgramError::InvalidSeeds)
     }
 }
 
@@ -2583,12 +2634,9 @@ pub mod processor {
         data: &[u8],
     ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable)
-        // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
-        // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
-        const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -2958,7 +3006,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -3016,7 +3066,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -3076,7 +3128,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -3132,7 +3186,9 @@ pub mod processor {
                 let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let derived_pda = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 accounts::expect_key(a_vault_pda, &derived_pda)?;
 
                 verify_vault(
@@ -3858,7 +3914,9 @@ pub mod processor {
                 let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -3909,12 +3967,9 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Settle pending lazy effects at settlement price before closing.
-                    // Must propagate errors — touch mutates state before it can
-                    // fail, so swallowing commits partial state.
-                    engine.touch_account_full(
-                        user_idx as usize, price, clock.slot,
-                    ).map_err(map_risk_error)?;
+                    // close_account_resolved is designed for resolved/frozen markets
+                    // where touch_account_full may not be viable (ADL overflow).
+                    // Settlement should happen via resolved KeeperCrank before close.
                     engine.close_account_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -3977,7 +4032,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -4103,13 +4160,17 @@ pub mod processor {
             }
 
             Instruction::CloseSlab => {
-                accounts::expect_len(accounts, 3)?;
+                accounts::expect_len(accounts, 6)?;
                 let a_dest = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_vault = &accounts[2];
+                let a_vault_auth = &accounts[3];
+                let a_dest_ata = &accounts[4];
+                let a_token = &accounts[5];
 
                 accounts::expect_signer(a_dest)?;
                 accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
 
                 // With unsafe_close: skip all validation and zeroing (CU limit)
                 // Account will be garbage collected after lamports are drained
@@ -4122,23 +4183,17 @@ pub mod processor {
                     let header = state::read_header(&data);
                     require_admin(header.admin, a_dest.key)?;
 
-                    // Verify vault SPL token balance is actually zero to prevent
-                    // closing with stranded tokens (anyone can transfer to vault).
                     let config = state::read_config(&data);
                     let mint = Pubkey::new_from_array(config.collateral_mint);
-                    let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                    let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                     verify_vault(
                         a_vault,
                         &auth,
                         &mint,
                         &Pubkey::new_from_array(config.vault_pubkey),
                     )?;
-                    let vault_data = a_vault.try_borrow_data()?;
-                    let vault_token = spl_token::state::Account::unpack(&vault_data)?;
-                    if vault_token.amount != 0 {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
-                    }
-                    drop(vault_data);
 
                     let engine = zc::engine_ref(&data)?;
                     if !engine.vault.is_zero() {
@@ -4151,11 +4206,44 @@ pub mod processor {
                         return Err(PercolatorError::EngineAccountNotFound.into());
                     }
 
-                    // Bug #3 fix: Check dust_base to prevent closing with unaccounted funds
-                    let dust_base = state::read_dust_base(&data);
-                    if dust_base != 0 {
-                        return Err(PercolatorError::EngineInsufficientBalance.into());
+                    // Drain any stranded vault tokens (unsolicited transfers or
+                    // sub-scale dust) to admin's ATA. This is the terminal cleanup
+                    // path — engine accounting is already zero.
+                    let vault_data = a_vault.try_borrow_data()?;
+                    let vault_token = spl_token::state::Account::unpack(&vault_data)?;
+                    let stranded = vault_token.amount;
+                    drop(vault_data);
+
+                    if stranded > 0 {
+                        // Verify vault authority PDA
+                        let expected_auth = Pubkey::create_program_address(
+                            &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]],
+                            program_id,
+                        ).map_err(|_| ProgramError::InvalidSeeds)?;
+                        if a_vault_auth.key != &expected_auth {
+                            return Err(ProgramError::InvalidSeeds);
+                        }
+
+                        let seed1: &[u8] = b"vault";
+                        let seed2: &[u8] = a_slab.key.as_ref();
+                        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                        let seed3: &[u8] = &bump_arr;
+                        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+                        // Drain stranded vault tokens → admin ATA
+                        collateral::withdraw(
+                            a_token,
+                            a_vault,
+                            a_dest_ata,
+                            a_vault_auth,
+                            stranded,
+                            &signer_seeds,
+                        )?;
                     }
+
+                    // Forgive any remaining dust_base — engine accounting is zero,
+                    // and any sub-scale remainder has been drained from the vault.
+                    // (dust_base tracks base-unit fractions with no engine entry)
 
                     // Zero out the slab data to prevent reuse
                     for b in data.iter_mut() {
@@ -4449,7 +4537,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -4658,7 +4748,9 @@ pub mod processor {
                 }
 
                 let mint = Pubkey::new_from_array(config.collateral_mint);
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -4795,7 +4887,9 @@ pub mod processor {
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
-                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                let auth = accounts::derive_vault_authority_with_bump(
+                    program_id, a_slab.key, config.vault_authority_bump,
+                )?;
                 verify_vault(
                     a_vault,
                     &auth,
@@ -4822,12 +4916,9 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Settle pending lazy effects at settlement price before closing.
-                // Must propagate errors — touch mutates state before it can
-                // fail, so swallowing commits partial state.
-                engine.touch_account_full(
-                    user_idx as usize, price, clock.slot,
-                ).map_err(map_risk_error)?;
+                // close_account_resolved is designed for resolved/frozen markets
+                // where touch_account_full may not be viable (ADL overflow).
+                // Settlement should happen via resolved KeeperCrank before close.
                 let amt_units = engine.close_account_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
