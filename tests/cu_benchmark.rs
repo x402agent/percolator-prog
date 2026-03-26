@@ -32,7 +32,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 19592; // MAX_ACCOUNTS=64 - native 128-bit fields
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1156720; // MAX_ACCOUNTS=4096 - native 128-bit fields + insurance limits
+const SLAB_LEN: usize = 1156736; // MAX_ACCOUNTS=4096 - native 128-bit fields + insurance limits
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;

@@ -1729,6 +1729,11 @@ pub mod state {
         pub _ifc_padding: u64,
         /// Insurance floor value at last change (for computing delta).
         pub last_insurance_floor_value: u128,
+        /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
+        /// Uses a dedicated field to avoid overwriting oracle config fields.
+        pub last_insurance_withdraw_slot: u64,
+        /// Padding for alignment.
+        pub _liw_padding: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -2964,6 +2969,8 @@ pub mod processor {
                     last_insurance_floor_change_slot: clock.slot,
                     _ifc_padding: 0,
                     last_insurance_floor_value: insurance_floor,
+                    last_insurance_withdraw_slot: 0,
+                    _liw_padding: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -4636,6 +4643,9 @@ pub mod processor {
                 };
                 let last_withdraw_slot = if configured {
                     stored_last_slot
+                } else if !resolved && config.last_insurance_withdraw_slot > 0 {
+                    // Live market: use dedicated config field
+                    config.last_insurance_withdraw_slot
                 } else {
                     crate::INS_WITHDRAW_LAST_SLOT_NONE
                 };
@@ -4733,13 +4743,20 @@ pub mod processor {
                     engine.vault = engine.vault - req;
                 }
 
-                // Persist policy + new cooldown slot.
-                let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
-                    .ok_or(PercolatorError::EngineOverflow)?;
-                config.oracle_authority = policy_authority;
-                config.last_effective_price_e6 = policy_min_base;
-                config.oracle_price_cap_e2bps = policy_cooldown;
-                config.authority_timestamp = packed;
+                // Persist cooldown slot. On resolved markets, use oracle-field
+                // overloading (legacy). On live markets, use dedicated config field
+                // to avoid corrupting the oracle state.
+                if resolved {
+                    let packed = pack_ins_withdraw_meta(policy_max_bps, clock.slot)
+                        .ok_or(PercolatorError::EngineOverflow)?;
+                    config.oracle_authority = policy_authority;
+                    config.last_effective_price_e6 = policy_min_base;
+                    config.oracle_price_cap_e2bps = policy_cooldown;
+                    config.authority_timestamp = packed;
+                } else {
+                    // Only update the cooldown slot — do NOT touch oracle fields
+                    config.last_insurance_withdraw_slot = clock.slot;
+                }
                 state::write_config(&mut data, &config);
 
                 let seed1: &[u8] = b"vault";
