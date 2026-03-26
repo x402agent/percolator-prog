@@ -455,6 +455,7 @@ impl TestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(matcher, false),
                 AccountMeta::new_readonly(ctx, false),
             ],
@@ -1312,6 +1313,7 @@ impl TestEnv {
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.vault, false),
             ],
             data: encode_close_slab(),
         };
@@ -4174,6 +4176,7 @@ fn test_critical_close_slab_authorization() {
         accounts: vec![
             AccountMeta::new(attacker.pubkey(), true),
             AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.vault, false),
         ],
         data: encode_close_slab(),
     };
@@ -4622,6 +4625,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(*matcher_prog, false),
                 AccountMeta::new_readonly(ctx, false),
             ],
@@ -4659,6 +4663,7 @@ impl TradeCpiTestEnv {
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(*matcher_prog, false),
                 AccountMeta::new_readonly(*matcher_ctx, false),
             ],
@@ -5276,6 +5281,7 @@ impl TradeCpiTestEnv {
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.vault, false),
             ],
             data: encode_close_slab(),
         };
@@ -20285,6 +20291,7 @@ fn test_attack_new_account_fee_goes_to_insurance() {
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(matcher, false),
             AccountMeta::new_readonly(ctx, false),
         ],
@@ -32727,4 +32734,163 @@ fn test_insurance_withdraw_resolved_requires_positions_closed() {
 
     let r = env.try_withdraw_insurance(&admin);
     assert!(r.is_err(), "Resolved withdrawal must fail with open positions");
+}
+
+/// Regression test: resolved close must settle ADL/mark effects before closing.
+/// Before the fix, close_account_resolved skipped touch_account_full, so accounts
+/// with stale ADL state could receive wrong payouts.
+#[test]
+fn test_resolved_close_settles_before_closing() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create LP and user with positions
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(50);
+    env.crank();
+
+    // Open a position
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000, &mp, &matcher_ctx).unwrap();
+    assert_ne!(env.read_account_position(user_idx), 0);
+
+    // Move price significantly before resolution
+    env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
+    env.set_slot(200);
+    env.crank();
+
+    // Resolve market at 2x price
+    env.try_resolve_market(&admin).unwrap();
+
+    // Close account WITHOUT cranking the resolved market first.
+    // Before the fix, this skipped touch_account_full, meaning ADL/mark
+    // settlement at the resolution price was not applied.
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "Resolved close should succeed: {:?}", result);
+
+    // Admin force-close the LP account too (also exercises the fix)
+    let result = env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey());
+    assert!(result.is_ok(), "Admin force-close should succeed: {:?}", result);
+}
+
+/// Regression test: TradeCpi with zero-fill matcher response must succeed.
+/// Before the fix, exec_size=0 with FLAG_PARTIAL_OK passed ABI validation
+/// but caused engine.execute_trade to reject with Overflow.
+#[test]
+fn test_tradecpi_zero_fill_succeeds() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create LP with max_fill_abs=0 to force zero-fill responses
+    let lp = Keypair::new();
+    let lp_idx = {
+        let idx = env.account_count;
+        env.svm.airdrop(&lp.pubkey(), 1_000_000_000).unwrap();
+        let ata = env.create_ata(&lp.pubkey(), 0);
+
+        let lp_bytes = idx.to_le_bytes();
+        let (lp_pda, _) =
+            Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
+
+        let ctx = Pubkey::new_unique();
+        env.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 10_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: mp,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        // Initialize matcher with max_fill_abs=0 => always zero-fill
+        let init_ix = Instruction {
+            program_id: mp,
+            accounts: vec![
+                AccountMeta::new_readonly(lp_pda, false),
+                AccountMeta::new(ctx, false),
+            ],
+            data: encode_init_vamm(
+                MatcherMode::Passive,
+                5,    // trading_fee_bps
+                10,   // base_spread_bps
+                200,  // max_total_bps
+                0,    // impact_k_bps
+                0,    // liquidity_notional_e6
+                0,    // max_fill_abs = 0 => zero fill
+                0,    // max_inventory_abs
+            ),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), init_ix],
+            Some(&lp.pubkey()),
+            &[&lp],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("init matcher context failed");
+
+        // Init LP in percolator
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new_readonly(ctx, false),
+            ],
+            data: encode_init_lp(&mp, &ctx, 0),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&lp.pubkey()),
+            &[&lp],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("init_lp failed");
+        env.account_count += 1;
+        (idx, ctx)
+    };
+
+    env.deposit(&lp, lp_idx.0, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(50);
+    env.crank();
+
+    // TradeCpi with zero-fill matcher: before the fix this would fail with Overflow
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx.0, user_idx, 100_000, &mp, &lp_idx.1,
+    );
+    assert!(result.is_ok(), "Zero-fill TradeCpi should succeed as no-op: {:?}", result);
+
+    // Position should remain zero (no fill occurred)
+    assert_eq!(env.read_account_position(user_idx), 0, "No fill means no position change");
 }

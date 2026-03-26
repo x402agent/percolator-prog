@@ -2934,12 +2934,13 @@ pub mod processor {
                 state::write_market_start_slot(&mut data, clock.slot);
             }
             Instruction::InitUser { fee_payment } => {
-                accounts::expect_len(accounts, 5)?;
+                accounts::expect_len(accounts, 6)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
                 let a_token = &accounts[4];
+                let a_clock = &accounts[5];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -2965,6 +2966,8 @@ pub mod processor {
                 )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                let clock = Clock::from_account_info(a_clock)?;
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
@@ -2976,6 +2979,8 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
+                // Update current_slot so add_user stamps warmup_started_at_slot correctly
+                engine.current_slot = clock.slot;
                 let idx = engine.add_user(units as u128).map_err(map_risk_error)?;
                 engine
                     .set_owner(idx, a_user.key.to_bytes())
@@ -2986,12 +2991,13 @@ pub mod processor {
                 matcher_context,
                 fee_payment,
             } => {
-                accounts::expect_len(accounts, 5)?;
+                accounts::expect_len(accounts, 6)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
                 let a_token = &accounts[4];
+                let a_clock = &accounts[5];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -3018,6 +3024,8 @@ pub mod processor {
                 )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                let clock = Clock::from_account_info(a_clock)?;
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
@@ -3029,6 +3037,8 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
+                // Update current_slot so add_lp stamps warmup_started_at_slot correctly
+                engine.current_slot = clock.slot;
                 let idx = engine
                     .add_lp(
                         matcher_program.to_bytes(),
@@ -3226,7 +3236,7 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                // Check if market is resolved - if so, force-close positions instead of normal crank
+                // Check if market is resolved - if so, settle accounts and sweep dust
                 if state::is_resolved(&data) {
                     let config = state::read_config(&data);
                     let settlement_price = config.authority_price_e6;
@@ -3235,6 +3245,12 @@ pub mod processor {
                     }
 
                     let clock = Clock::from_account_info(a_clock)?;
+
+                    // Dust sweep: resolved crank must also sweep dust so
+                    // CloseSlab's dust_base == 0 check can eventually pass.
+                    let dust_before = state::read_dust_base(&data);
+                    let unit_scale = config.unit_scale;
+
                     let engine = zc::engine_mut(&mut data)?;
 
                     // Settle PnL for accounts in a paginated manner.
@@ -3260,6 +3276,18 @@ pub mod processor {
                         end
                     };
                     engine.current_slot = clock.slot;
+
+                    // Sweep dust to insurance (same logic as unresolved crank)
+                    if unit_scale > 0 {
+                        let scale = unit_scale as u64;
+                        if dust_before >= scale {
+                            let units_to_sweep = dust_before / scale;
+                            let _ = engine.top_up_insurance_fund(
+                                units_to_sweep as u128, clock.slot,
+                            );
+                            state::write_dust_base(&mut data, dust_before % scale);
+                        }
+                    }
 
                     return Ok(());
                 }
@@ -3685,6 +3713,15 @@ pub mod processor {
                 }
                 drop(ctx_data);
 
+                // Zero-fill: ABI-valid no-op when matcher returns exec_size == 0
+                // with FLAG_PARTIAL_OK. Skip engine call which rejects size_q == 0.
+                if ret.exec_size == 0 {
+                    let mut data = state::slab_data_mut(a_slab)?;
+                    state::write_config(&mut data, &config);
+                    state::write_req_nonce(&mut data, req_id);
+                    return Ok(());
+                }
+
                 let exec_price = ret.exec_price_e6;
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
@@ -3740,19 +3777,17 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Block liquidations after market resolution — resolved markets
+                // are in withdraw-only settlement phase.
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 let mut config = state::read_config(&data);
 
                 let clock = Clock::from_account_info(&accounts[2])?;
-                let resolved = state::is_resolved(&data);
-                // Resolved markets use fixed settlement price.
-                // Unresolved markets use normal oracle/index paths.
-                let price = if resolved {
-                    let settlement = config.authority_price_e6;
-                    if settlement == 0 {
-                        return Err(ProgramError::InvalidAccountData);
-                    }
-                    settlement
-                } else {
+                let price = {
                     let is_hyperp = oracle::is_hyperp_mode(&config);
                     if is_hyperp {
                         let idx = config.last_effective_price_e6;
@@ -3866,9 +3901,13 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Resolved market: use close_account_resolved which handles
-                    // position zeroing, PnL settlement with haircut, warmup bypass,
-                    // vault decrement, and slot freeing in one call.
+                    // Best-effort settlement at settlement price before closing.
+                    // touch_account_full may overflow if ADL state is frozen, so
+                    // we ignore errors and fall through to close_account_resolved
+                    // which handles that case.
+                    let _ = engine.touch_account_full(
+                        user_idx as usize, price, clock.slot,
+                    );
                     engine.close_account_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -4057,9 +4096,10 @@ pub mod processor {
             }
 
             Instruction::CloseSlab => {
-                accounts::expect_len(accounts, 2)?;
+                accounts::expect_len(accounts, 3)?;
                 let a_dest = &accounts[0];
                 let a_slab = &accounts[1];
+                let a_vault = &accounts[2];
 
                 accounts::expect_signer(a_dest)?;
                 accounts::expect_writable(a_slab)?;
@@ -4074,6 +4114,24 @@ pub mod processor {
 
                     let header = state::read_header(&data);
                     require_admin(header.admin, a_dest.key)?;
+
+                    // Verify vault SPL token balance is actually zero to prevent
+                    // closing with stranded tokens (anyone can transfer to vault).
+                    let config = state::read_config(&data);
+                    let mint = Pubkey::new_from_array(config.collateral_mint);
+                    let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                    verify_vault(
+                        a_vault,
+                        &auth,
+                        &mint,
+                        &Pubkey::new_from_array(config.vault_pubkey),
+                    )?;
+                    let vault_data = a_vault.try_borrow_data()?;
+                    let vault_token = spl_token::state::Account::unpack(&vault_data)?;
+                    if vault_token.amount != 0 {
+                        return Err(PercolatorError::EngineInsufficientBalance.into());
+                    }
+                    drop(vault_data);
 
                     let engine = zc::engine_ref(&data)?;
                     if !engine.vault.is_zero() {
@@ -4396,19 +4454,10 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
 
-                // Require all positions to be closed (force-closed by crank)
-                // Check that no account has effective position != 0
-                let mut has_open_positions = false;
-                for i in 0..percolator::MAX_ACCOUNTS {
-                    if engine.is_used(i) {
-                        let eff = engine.effective_pos_q(i);
-                        if eff != 0 {
-                            has_open_positions = true;
-                            break;
-                        }
-                    }
-                }
-                if has_open_positions {
+                // Require all accounts to be fully closed (not just effective_pos_q==0,
+                // which returns 0 for epoch-mismatched stale positions).
+                // Any used account means unsettled state may remain.
+                if engine.num_used_accounts != 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -4766,9 +4815,13 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Use close_account_resolved: zeros position, settles PnL with
-                // haircut (bypasses warmup), converts to capital, decrements
-                // vault, and frees the slot.
+                // Best-effort settlement at settlement price before closing.
+                // touch_account_full may overflow if ADL state is frozen, so
+                // we ignore errors and fall through to close_account_resolved
+                // which handles that case.
+                let _ = engine.touch_account_full(
+                    user_idx as usize, price, clock.slot,
+                );
                 let amt_units = engine.close_account_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
