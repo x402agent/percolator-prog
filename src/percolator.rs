@@ -3843,18 +3843,20 @@ pub mod processor {
 
                     // Hyperp mode: update mark price with execution price.
                     // Normalize to engine-space then clamp against index.
+                    // Skip mark update if normalization fails (price too small for scale).
                     if is_hyperp {
                         let mut config = state::read_config(&data);
-                        let normalized_exec = crate::verify::to_engine_price(
+                        if let Some(normalized_exec) = crate::verify::to_engine_price(
                             ret.exec_price_e6, config.invert, config.unit_scale,
-                        ).unwrap_or(ret.exec_price_e6);
-                        let clamped_mark = oracle::clamp_oracle_price(
-                            config.last_effective_price_e6,
-                            normalized_exec,
-                            config.oracle_price_cap_e2bps,
-                        );
-                        config.authority_price_e6 = clamped_mark;
-                        state::write_config(&mut data, &config);
+                        ) {
+                            let clamped_mark = oracle::clamp_oracle_price(
+                                config.last_effective_price_e6,
+                                normalized_exec,
+                                config.oracle_price_cap_e2bps,
+                            );
+                            config.authority_price_e6 = clamped_mark;
+                            state::write_config(&mut data, &config);
+                        }
                     }
                 }
             }
