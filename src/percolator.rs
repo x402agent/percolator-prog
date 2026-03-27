@@ -1059,21 +1059,15 @@ pub mod ix {
         /// Close the market slab and recover SOL to admin.
         /// Requires: no active accounts, no vault funds, no insurance funds.
         CloseSlab,
-        /// Update configurable parameters (funding + threshold). Admin only.
+        /// Update configurable funding parameters. Admin only.
+        /// Threshold fields are decoded for wire compatibility but ignored
+        /// (insurance_floor is immutable per spec §2.2.1).
         UpdateConfig {
             funding_horizon_slots: u64,
             funding_k_bps: u64,
             funding_inv_scale_notional_e6: u128,
             funding_max_premium_bps: i64,
             funding_max_bps_per_slot: i64,
-            thresh_floor: u128,
-            thresh_risk_bps: u64,
-            thresh_update_interval_slots: u64,
-            thresh_step_bps: u64,
-            thresh_alpha_bps: u64,
-            thresh_min: u128,
-            thresh_max: u128,
-            thresh_min_step: u128,
         },
         /// Set the oracle price authority (admin only).
         /// Authority can push prices instead of requiring Pyth/Chainlink.
@@ -1287,7 +1281,7 @@ pub mod ix {
                     })
                 }
                 11 => {
-                    let _ = read_u128(&mut rest)?;
+                    // SetRiskThreshold removed (I_floor immutable §2.2.1)
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 12 => {
@@ -1300,38 +1294,31 @@ pub mod ix {
                     Ok(Instruction::CloseSlab)
                 }
                 14 => {
-                    // UpdateConfig
+                    // UpdateConfig — funding params only
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
                     let funding_inv_scale_notional_e6 = read_u128(&mut rest)?;
                     let funding_max_premium_bps = read_i64(&mut rest)?;
                     let funding_max_bps_per_slot = read_i64(&mut rest)?;
-                    let thresh_floor = read_u128(&mut rest)?;
-                    let thresh_risk_bps = read_u64(&mut rest)?;
-                    let thresh_update_interval_slots = read_u64(&mut rest)?;
-                    let thresh_step_bps = read_u64(&mut rest)?;
-                    let thresh_alpha_bps = read_u64(&mut rest)?;
-                    let thresh_min = read_u128(&mut rest)?;
-                    let thresh_max = read_u128(&mut rest)?;
-                    let thresh_min_step = read_u128(&mut rest)?;
+                    // Threshold fields: decoded for wire compat, discarded
+                    let _ = read_u128(&mut rest)?; // thresh_floor
+                    let _ = read_u64(&mut rest)?;  // thresh_risk_bps
+                    let _ = read_u64(&mut rest)?;  // thresh_update_interval_slots
+                    let _ = read_u64(&mut rest)?;  // thresh_step_bps
+                    let _ = read_u64(&mut rest)?;  // thresh_alpha_bps
+                    let _ = read_u128(&mut rest)?; // thresh_min
+                    let _ = read_u128(&mut rest)?; // thresh_max
+                    let _ = read_u128(&mut rest)?; // thresh_min_step
                     Ok(Instruction::UpdateConfig {
                         funding_horizon_slots,
                         funding_k_bps,
                         funding_inv_scale_notional_e6,
                         funding_max_premium_bps,
                         funding_max_bps_per_slot,
-                        thresh_floor,
-                        thresh_risk_bps,
-                        thresh_update_interval_slots,
-                        thresh_step_bps,
-                        thresh_alpha_bps,
-                        thresh_min,
-                        thresh_max,
-                        thresh_min_step,
                     })
                 }
                 15 => {
-                    let _ = read_u128(&mut rest)?;
+                    // SetMaintenanceFee removed (§8.2)
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 16 => {
@@ -2902,6 +2889,12 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
+                // max_staleness_secs: reject 0 (would brick oracle reads —
+                // any non-zero age > 0 fails the staleness check).
+                if max_staleness_secs == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
                 // Hyperp mode validation: if index_feed_id is all zeros, require initial_mark_price_e6
                 let is_hyperp = index_feed_id == [0u8; 32];
                 if is_hyperp && initial_mark_price_e6 == 0 {
@@ -4243,14 +4236,6 @@ pub mod processor {
                 funding_inv_scale_notional_e6,
                 funding_max_premium_bps,
                 funding_max_bps_per_slot,
-                thresh_floor: _,
-                thresh_risk_bps: _,
-                thresh_update_interval_slots: _,
-                thresh_step_bps: _,
-                thresh_alpha_bps: _,
-                thresh_min: _,
-                thresh_max: _,
-                thresh_min_step: _,
             } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
