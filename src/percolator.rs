@@ -2909,6 +2909,10 @@ pub mod processor {
                     let _ = Mint::unpack(&mint_data)?;
                 }
 
+                // invert must be 0 or 1 (boolean stored as u8)
+                if invert > 1 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
                 // Validate unit_scale: reject huge values that make most deposits credit 0 units
                 if !crate::verify::init_market_scale_ok(unit_scale) {
                     return Err(ProgramError::InvalidInstructionData);
@@ -3322,6 +3326,14 @@ pub mod processor {
                 let owner = engine.accounts[user_idx as usize].owner;
                 if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
                     return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // On resolved markets, settle lazy effects at settlement price
+                // before withdrawal (same pattern as CloseAccount resolved path).
+                if resolved {
+                    engine.touch_account_full(
+                        user_idx as usize, price, clock.slot,
+                    ).map_err(map_risk_error)?;
                 }
 
                 // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
@@ -3856,6 +3868,11 @@ pub mod processor {
                 }
 
                 let exec_price = ret.exec_price_e6;
+                // Reject extreme exec prices that would corrupt engine state
+                // or produce absurd PnL. Must check BEFORE engine call.
+                if is_hyperp && exec_price > percolator::MAX_ORACLE_PRICE {
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
@@ -3881,9 +3898,8 @@ pub mod processor {
                     state::write_req_nonce(&mut data, req_id);
 
                     // Hyperp: update mark with exec price (already engine-space).
-                    // Validate against MAX_ORACLE_PRICE to prevent config corruption
-                    // from a malicious matcher returning extreme values.
-                    if is_hyperp && ret.exec_price_e6 <= percolator::MAX_ORACLE_PRICE {
+                    // exec_price validated <= MAX_ORACLE_PRICE before engine call.
+                    if is_hyperp {
                         let clamped_mark = oracle::clamp_oracle_price(
                             config.authority_price_e6,
                             ret.exec_price_e6,
@@ -4317,6 +4333,11 @@ pub mod processor {
                 if thresh_max > config.max_insurance_floor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                // funding_k_bps: 100 = 1.00x multiplier. Cap at 100_000 (1000x)
+                // to prevent saturating_mul from always hitting i128 ceiling.
+                if funding_k_bps > 100_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
                 config.funding_horizon_slots = funding_horizon_slots;
                 config.funding_k_bps = funding_k_bps;
                 config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
@@ -4381,10 +4402,14 @@ pub mod processor {
 
                 // Update oracle authority in config
                 let mut config = state::read_config(&data);
+                // Hyperp: reject zero-address — it would permanently freeze
+                // price discovery (no authority can push, no external oracle).
+                if oracle::is_hyperp_mode(&config) && new_authority == Pubkey::default() {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
                 config.oracle_authority = new_authority.to_bytes();
                 // Clear stored price when authority changes — except on Hyperp
-                // where authority_price_e6 is the mark price. Zeroing it would
-                // brick the market (OracleInvalid on every subsequent call).
+                // where authority_price_e6 is the mark price.
                 if !oracle::is_hyperp_mode(&config) {
                     config.authority_price_e6 = 0;
                     config.authority_timestamp = 0;
@@ -4533,17 +4558,18 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 // Non-Hyperp: settlement price must be within circuit-breaker
-                // bounds of the last external oracle baseline. Prevents admin
-                // from settling at an arbitrary price far from the market.
+                // bounds of the last external oracle baseline. Uses the
+                // immutable min_oracle_price_cap_e2bps (not the mutable cap)
+                // so admin can't bypass by setting cap to 0 first.
                 // Hyperp: admin IS the price source, no external baseline.
                 if !oracle::is_hyperp_mode(&config)
                     && config.last_effective_price_e6 != 0
-                    && config.oracle_price_cap_e2bps != 0
+                    && config.min_oracle_price_cap_e2bps != 0
                 {
                     let clamped = oracle::clamp_oracle_price(
                         config.last_effective_price_e6,
                         config.authority_price_e6,
-                        config.oracle_price_cap_e2bps,
+                        config.min_oracle_price_cap_e2bps,
                     );
                     if clamped != config.authority_price_e6 {
                         return Err(PercolatorError::OracleInvalid.into());

@@ -19248,7 +19248,7 @@ fn test_attack_funding_extreme_k_bps_capped() {
         ],
         data: encode_update_config(
             100,                        // funding_horizon_slots
-            u64::MAX / 2,               // funding_k_bps (extreme!)
+            100_000,                    // funding_k_bps (max allowed = 1000x)
             1_000_000_000_000,          // funding_inv_scale
             100,                        // funding_max_premium_bps
             10,                         // funding_max_bps_per_slot
@@ -20944,10 +20944,16 @@ fn test_attack_set_oracle_authority_to_zero_disables_push() {
         .unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
-    // Clear oracle authority (set to zero)
+    // Attempt to clear oracle authority (set to zero) — Hyperp rejects this
+    // because it would permanently freeze price discovery.
     let zero = Pubkey::new_from_array([0u8; 32]);
     env.set_slot(2);
-    env.try_set_oracle_authority(&admin, &zero).unwrap();
+    let zero_result = env.try_set_oracle_authority(&admin, &zero);
+    assert!(zero_result.is_err(), "Hyperp must reject zero oracle authority");
+
+    // Set to a different non-zero authority instead
+    let new_auth = Keypair::new();
+    env.try_set_oracle_authority(&admin, &new_auth.pubkey()).unwrap();
     const AUTH_PRICE_OFF: usize = 360;
     const AUTH_TS_OFF: usize = 368;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
