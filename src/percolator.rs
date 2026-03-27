@@ -564,7 +564,9 @@ pub mod verify {
         }
     }
 
-    /// Decision for admin operations (SetRiskThreshold, UpdateAdmin).
+    /// Decision for admin operations (UpdateAdmin, UpdateConfig, SetOracleAuthority, etc.).
+    /// SetRiskThreshold/SetMaintenanceFee are rejected at the decoder — this helper
+    /// is not used for those dead instructions.
     #[inline]
     pub fn decide_admin_op(admin: [u8; 32], signer: [u8; 32]) -> SimpleDecision {
         if admin_ok(admin, signer) {
@@ -3842,19 +3844,17 @@ pub mod processor {
                     }
                     state::write_req_nonce(&mut data, req_id);
 
-                    // Hyperp: update mark price with normalized exec price.
-                    // Reuse config from pre-CPI phase (single round-trip).
+                    // Hyperp: update mark price with exec price from matcher.
+                    // exec_price_e6 is already engine-space (matcher received
+                    // oracle_price_e6 in engine-space and returns in the same
+                    // space). No normalization needed — clamp directly.
                     if is_hyperp {
-                        if let Some(normalized_exec) = crate::verify::to_engine_price(
-                            ret.exec_price_e6, config.invert, config.unit_scale,
-                        ) {
-                            let clamped_mark = oracle::clamp_oracle_price(
-                                config.last_effective_price_e6,
-                                normalized_exec,
-                                config.oracle_price_cap_e2bps,
-                            );
-                            config.authority_price_e6 = clamped_mark;
-                        }
+                        let clamped_mark = oracle::clamp_oracle_price(
+                            config.last_effective_price_e6,
+                            ret.exec_price_e6,
+                            config.oracle_price_cap_e2bps,
+                        );
+                        config.authority_price_e6 = clamped_mark;
                     }
                     // Single config write (covers oracle price update from pre-CPI
                     // phase + Hyperp mark update)
@@ -4386,15 +4386,13 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
-                // Normalize to engine-space for Hyperp markets (invert + scale).
-                // Non-Hyperp authority prices are raw (normalization happens in
-                // read_engine_price_e6 at consumption time).
-                let normalized_price = if is_hyperp {
-                    crate::verify::to_engine_price(price_e6, config.invert, config.unit_scale)
-                        .ok_or(PercolatorError::OracleInvalid)?
-                } else {
-                    price_e6
-                };
+                // Normalize to engine-space (invert + scale) for ALL markets.
+                // Authority prices must be in the same price space as
+                // Pyth/Chainlink-derived prices (which go through
+                // read_engine_price_e6 → invert → scale).
+                let normalized_price = crate::verify::to_engine_price(
+                    price_e6, config.invert, config.unit_scale,
+                ).ok_or(PercolatorError::OracleInvalid)?;
 
                 // For non-Hyperp markets, require monotonic authority timestamps.
                 if !is_hyperp
@@ -4959,6 +4957,9 @@ pub mod processor {
 
                 let engine = zc::engine_ref(&data)?;
                 check_idx(engine, lp_idx)?;
+                if !engine.accounts[lp_idx as usize].is_lp() {
+                    return Err(PercolatorError::EngineNotAnLPAccount.into());
+                }
 
                 let fees = engine.accounts[lp_idx as usize].fees_earned_total.get();
                 solana_program::program::set_return_data(&fees.to_le_bytes());
