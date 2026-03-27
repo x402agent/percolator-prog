@@ -3807,16 +3807,14 @@ pub mod processor {
 
                 // Zero-fill: ABI-valid no-op when matcher returns exec_size == 0
                 // with FLAG_PARTIAL_OK. Skip engine call which rejects size_q == 0.
-                // Do NOT persist Hyperp index update — zero-fill doesn't advance
-                // engine.current_slot, so repeated zero-fills would ratchet the
-                // index toward mark using stale dt.
+                // Zero-fill: no trade occurred, so do not persist oracle side effects.
+                // Revert last_effective_price_e6 for ALL markets — prevents repeated
+                // zero-fills from walking the circuit-breaker baseline toward the raw
+                // oracle price (Hyperp: index ratchet, non-Hyperp: baseline walk).
                 if ret.exec_size == 0 {
                     let mut data = state::slab_data_mut(a_slab)?;
-                    // Revert any Hyperp index change by re-reading pristine config
-                    if is_hyperp {
-                        let pristine = state::read_config(&data);
-                        config.last_effective_price_e6 = pristine.last_effective_price_e6;
-                    }
+                    let pristine = state::read_config(&data);
+                    config.last_effective_price_e6 = pristine.last_effective_price_e6;
                     state::write_config(&mut data, &config);
                     state::write_req_nonce(&mut data, req_id);
                     return Ok(());
