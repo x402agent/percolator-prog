@@ -1859,19 +1859,7 @@ fn benchmark_all_instructions() {
         println!("UpdateConfig:          {:>8} CU", cu);
     }
 
-    // --- SetMaintenanceFee (Tag 15) ---
-    {
-        let ix = Instruction {
-            program_id: env.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(env.slab, false),
-            ],
-            data: encode_set_maintenance_fee(0),
-        };
-        let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
-        println!("SetMaintenanceFee:     {:>8} CU", cu);
-    }
+    // SetMaintenanceFee (Tag 15) — removed per spec §8.2. Decoder rejects.
 
     // --- SetOracleAuthority (Tag 16) ---
     {

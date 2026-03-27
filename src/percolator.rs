@@ -1150,6 +1150,10 @@ pub mod ix {
         QueryLpFees {
             lp_idx: u16,
         },
+        /// Permissionless reclamation of empty/dust accounts (§2.6, §10.7).
+        ReclaimEmptyAccount {
+            user_idx: u16,
+        },
     }
 
     impl Instruction {
@@ -1388,6 +1392,10 @@ pub mod ix {
                 24 => {
                     let lp_idx = read_u16(&mut rest)?;
                     Ok(Instruction::QueryLpFees { lp_idx })
+                }
+                25 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::ReclaimEmptyAccount { user_idx })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -3389,7 +3397,7 @@ pub mod processor {
                     // Sweep dust to insurance fund.
                     // On resolved markets, also forgive sub-scale remainder
                     // (worth < 1 engine unit, no engine accounting entry).
-                    if unit_scale > 0 {
+                    let forgive_dust = if unit_scale > 0 {
                         let scale = unit_scale as u64;
                         if dust_before >= scale {
                             let units_to_sweep = dust_before / scale;
@@ -3397,6 +3405,20 @@ pub mod processor {
                                 units_to_sweep as u128, clock.slot,
                             ).map_err(map_risk_error)?;
                         }
+                        true
+                    } else {
+                        false
+                    };
+
+                    // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
+                    // Best-effort on resolved markets — side-reset finalization may
+                    // encounter CorruptState if ADL state is frozen post-resolution.
+                    let _ = engine.run_end_of_instruction_lifecycle();
+
+                    // engine borrow ends here (last use above).
+                    // Write dust_base AFTER dropping the engine borrow to avoid
+                    // aliasing conflict with state::write_dust_base.
+                    if forgive_dust {
                         // Forgive any sub-scale remainder — on resolved markets
                         // no new dust can accumulate, so this is terminal cleanup.
                         state::write_dust_base(&mut data, 0);
@@ -4151,6 +4173,8 @@ pub mod processor {
                     drop(vault_data);
 
                     if stranded > 0 {
+                        // Validate admin's token account before drain
+                        verify_token_account(a_dest_ata, a_dest.key, &mint)?;
                         // Verify vault authority PDA
                         let expected_auth = Pubkey::create_program_address(
                             &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]],
@@ -4918,6 +4942,24 @@ pub mod processor {
 
                 let fees = engine.accounts[lp_idx as usize].fees_earned_total.get();
                 solana_program::program::set_return_data(&fees.to_le_bytes());
+            }
+
+            Instruction::ReclaimEmptyAccount { user_idx } => {
+                // Permissionless account reclamation (spec §2.6, §10.7).
+                // Recycles flat/dust accounts without touching side state.
+                accounts::expect_len(accounts, 2)?;
+                let a_slab = &accounts[0];
+                let _a_clock = &accounts[1];
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let engine = zc::engine_mut(&mut data)?;
+                engine.reclaim_empty_account(user_idx)
+                    .map_err(map_risk_error)?;
+                // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
             }
         }
         Ok(())
