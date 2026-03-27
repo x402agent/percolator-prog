@@ -133,7 +133,7 @@ pub mod verify {
     }
 
     /// Admin authorization: admin must be non-zero (not burned) and match signer.
-    /// Used by: SetRiskThreshold, UpdateAdmin
+    /// Used by: UpdateAdmin, UpdateConfig, SetOracleAuthority
     #[inline]
     pub fn admin_ok(admin: [u8; 32], signer: [u8; 32]) -> bool {
         admin != [0u8; 32] && admin == signer
@@ -174,15 +174,6 @@ pub mod verify {
     #[inline]
     pub fn ctx_len_sufficient(len: usize) -> bool {
         len >= MATCHER_CONTEXT_LEN
-    }
-
-    /// HISTORICAL: gate_active models the old LP-risk gate which was removed
-    /// in spec v10.5 (replaced by engine-internal side-mode gating).
-    /// The processor does NOT enforce this gate at runtime.
-    /// Retained for Kani proof coverage of the verify module's decision logic.
-    #[inline]
-    pub fn gate_active(threshold: u128, balance: u128) -> bool {
-        threshold > 0 && balance <= threshold
     }
 
     /// Nonce update on success: advances by 1.
@@ -315,8 +306,6 @@ pub mod verify {
     ///   LP authorization is delegated to the matcher program at registration
     ///   time — the CPI identity binding (matcher_identity_ok) is the actual
     ///   LP-side authorization gate. This parameter models key-equality only.
-    /// * `gate_active` - Whether the risk-reduction gate is active
-    /// * `risk_increase` - Whether this trade would increase system risk
     /// * `exec_size` - The exec_size from matcher return
     #[inline]
     pub fn decide_trade_cpi(
@@ -327,8 +316,6 @@ pub mod verify {
         abi_ok: bool,
         user_auth_ok: bool,
         lp_key_ok: bool,
-        gate_active: bool,
-        risk_increase: bool,
         exec_size: i128,
     ) -> TradeCpiDecision {
         // Check in order of actual program execution:
@@ -350,10 +337,6 @@ pub mod verify {
         }
         // 5. ABI validation (after CPI returns)
         if !abi_ok {
-            return TradeCpiDecision::Reject;
-        }
-        // 6. Risk gate check
-        if gate_active && risk_increase {
             return TradeCpiDecision::Reject;
         }
         // All checks passed - accept the trade
@@ -440,8 +423,6 @@ pub mod verify {
     /// * `user_auth_ok` - Whether user signer matches user owner
     /// * `lp_key_ok` - Whether provided LP owner key matches stored LP owner
     ///   (key-equality only, not signer — see decide_trade_cpi docs)
-    /// * `gate_is_active` - Whether the risk-reduction gate is active
-    /// * `risk_increase` - Whether this trade would increase system risk
     /// * `ret` - The matcher return fields (from CPI)
     /// * `lp_account_id` - Expected LP account ID from request
     /// * `oracle_price_e6` - Expected oracle price from request
@@ -454,8 +435,6 @@ pub mod verify {
         pda_ok: bool,
         user_auth_ok: bool,
         lp_key_ok: bool,
-        gate_is_active: bool,
-        risk_increase: bool,
         ret: MatcherReturnFields,
         lp_account_id: u64,
         oracle_price_e6: u64,
@@ -483,10 +462,6 @@ pub mod verify {
         if !abi_ok(ret, lp_account_id, oracle_price_e6, req_size, req_id) {
             return TradeCpiDecision::Reject;
         }
-        // 6. Risk gate check
-        if gate_is_active && risk_increase {
-            return TradeCpiDecision::Reject;
-        }
         // All checks passed - accept the trade
         TradeCpiDecision::Accept {
             new_nonce: req_id,
@@ -512,13 +487,8 @@ pub mod verify {
     pub fn decide_trade_nocpi(
         user_auth_ok: bool,
         lp_auth_ok: bool,
-        gate_active: bool,
-        risk_increase: bool,
     ) -> TradeNoCpiDecision {
         if !user_auth_ok || !lp_auth_ok {
-            return TradeNoCpiDecision::Reject;
-        }
-        if gate_active && risk_increase {
             return TradeNoCpiDecision::Reject;
         }
         TradeNoCpiDecision::Accept
@@ -565,8 +535,6 @@ pub mod verify {
     }
 
     /// Decision for admin operations (UpdateAdmin, UpdateConfig, SetOracleAuthority, etc.).
-    /// SetRiskThreshold/SetMaintenanceFee are rejected at the decoder — this helper
-    /// is not used for those dead instructions.
     #[inline]
     pub fn decide_admin_op(admin: [u8; 32], signer: [u8; 32]) -> SimpleDecision {
         if admin_ok(admin, signer) {
@@ -581,8 +549,7 @@ pub mod verify {
     // =========================================================================
 
     /// Decision for KeeperCrank authorization.
-    /// allow_panic is read-and-discarded at runtime for wire compatibility,
-    /// so the model ignores it too. Permissionless: always accept.
+    /// Permissionless: always accept.
     /// Self-crank: requires idx exists and owner match.
     #[inline]
     pub fn decide_keeper_crank(
@@ -1065,7 +1032,6 @@ pub mod ix {
         },
         KeeperCrank {
             caller_idx: u16,
-            allow_panic: u8,
             candidates: alloc::vec::Vec<(u16, Option<percolator::LiquidationPolicy>)>,
         },
         TradeNoCpi {
@@ -1086,9 +1052,6 @@ pub mod ix {
             lp_idx: u16,
             user_idx: u16,
             size: i128,
-        },
-        SetRiskThreshold {
-            new_threshold: u128,
         },
         UpdateAdmin {
             new_admin: Pubkey,
@@ -1111,10 +1074,6 @@ pub mod ix {
             thresh_min: u128,
             thresh_max: u128,
             thresh_min_step: u128,
-        },
-        /// Set maintenance fee per slot (admin only)
-        SetMaintenanceFee {
-            new_fee: u128,
         },
         /// Set the oracle price authority (admin only).
         /// Authority can push prices instead of requiring Pyth/Chainlink.
@@ -1253,20 +1212,40 @@ pub mod ix {
                 5 => {
                     // KeeperCrank — two-phase: candidates computed off-chain
                     let caller_idx = read_u16(&mut rest)?;
-                    let allow_panic = read_u8(&mut rest)?;
-                    // Parse candidate list: remaining bytes are u16 account indices.
-                    // Each candidate gets FullClose policy — the keeper shortlists
-                    // only accounts that need liquidation.
+                    let format_version = read_u8(&mut rest)?;
+                    // format_version 0: legacy (bare u16 indices, all FullClose)
+                    // format_version 1: extended (u16 idx + u8 policy_tag per candidate)
+                    //   policy tag 0 = FullClose, 1 = ExactPartial(u128), 0xFF = touch-only
                     let mut candidates = alloc::vec::Vec::new();
-                    while rest.len() >= 2 {
-                        candidates.push((
-                            read_u16(&mut rest)?,
-                            Some(percolator::LiquidationPolicy::FullClose),
-                        ));
+                    if format_version == 0 {
+                        // Legacy: remaining bytes are bare u16 account indices
+                        while rest.len() >= 2 {
+                            candidates.push((
+                                read_u16(&mut rest)?,
+                                Some(percolator::LiquidationPolicy::FullClose),
+                            ));
+                        }
+                    } else if format_version == 1 {
+                        // Extended: u16 idx + u8 policy tag per candidate
+                        while rest.len() >= 3 {
+                            let idx = read_u16(&mut rest)?;
+                            let tag = read_u8(&mut rest)?;
+                            let policy = match tag {
+                                0 => Some(percolator::LiquidationPolicy::FullClose),
+                                1 => {
+                                    let q = read_u128(&mut rest)?;
+                                    Some(percolator::LiquidationPolicy::ExactPartial(q))
+                                }
+                                0xFF => None,
+                                _ => return Err(ProgramError::InvalidInstructionData),
+                            };
+                            candidates.push((idx, policy));
+                        }
+                    } else {
+                        return Err(ProgramError::InvalidInstructionData);
                     }
                     Ok(Instruction::KeeperCrank {
                         caller_idx,
-                        allow_panic,
                         candidates,
                     })
                 }
@@ -1308,9 +1287,8 @@ pub mod ix {
                     })
                 }
                 11 => {
-                    // SetRiskThreshold
-                    let new_threshold = read_u128(&mut rest)?;
-                    Ok(Instruction::SetRiskThreshold { new_threshold })
+                    let _ = read_u128(&mut rest)?;
+                    return Err(ProgramError::InvalidInstructionData);
                 }
                 12 => {
                     // UpdateAdmin
@@ -1353,9 +1331,8 @@ pub mod ix {
                     })
                 }
                 15 => {
-                    // SetMaintenanceFee
-                    let new_fee = read_u128(&mut rest)?;
-                    Ok(Instruction::SetMaintenanceFee { new_fee })
+                    let _ = read_u128(&mut rest)?;
+                    return Err(ProgramError::InvalidInstructionData);
                 }
                 16 => {
                     // SetOracleAuthority
@@ -1767,20 +1744,6 @@ pub mod state {
         #[cfg(debug_assertions)]
         debug_assert!(HEADER_LEN >= RESERVED_OFF + 16);
         data[RESERVED_OFF..RESERVED_OFF + 8].copy_from_slice(&nonce.to_le_bytes());
-    }
-
-    /// Read the last threshold update slot from _reserved[8..16].
-    pub fn read_last_thr_update_slot(data: &[u8]) -> u64 {
-        u64::from_le_bytes(
-            data[RESERVED_OFF + 8..RESERVED_OFF + 16]
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    /// Write the last threshold update slot to _reserved[8..16].
-    pub fn write_last_thr_update_slot(data: &mut [u8], slot: u64) {
-        data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
     }
 
     /// Write market_start_slot into _reserved[8..16] at InitMarket time.
@@ -3384,7 +3347,6 @@ pub mod processor {
             }
             Instruction::KeeperCrank {
                 caller_idx,
-                allow_panic,
                 candidates,
             } => {
                 use crate::constants::CRANK_NO_CALLER;
@@ -3503,10 +3465,6 @@ pub mod processor {
 
                 let mut config = state::read_config(&data);
 
-                // allow_panic: read and discarded for wire compatibility.
-                // No runtime behavior — global settlement is not implemented.
-                let _ = allow_panic;
-
                 // Read dust before borrowing engine (for dust sweep later)
                 let dust_before = state::read_dust_base(&data);
                 let unit_scale = config.unit_scale;
@@ -3534,23 +3492,6 @@ pub mod processor {
                     oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
                 };
 
-                // Hyperp mode: compute and store funding rate for next crank.
-                // The rate is not consumed by keeper_crank (engine uses zero-rate
-                // core profile). When funding is wired into the engine, restore
-                // prev_rate and pass to keeper_crank.
-                if is_hyperp {
-                    let mark_e6 = config.authority_price_e6;
-                    let index_e6 = config.last_effective_price_e6;
-                    let new_rate = oracle::compute_premium_funding_bps_per_slot(
-                        mark_e6,
-                        index_e6,
-                        config.funding_horizon_slots,
-                        config.funding_k_bps,
-                        config.funding_max_premium_bps,
-                        config.funding_max_bps_per_slot,
-                    );
-                    config.authority_timestamp = new_rate;
-                }
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -4165,12 +4106,6 @@ pub mod processor {
                     .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
-            Instruction::SetRiskThreshold { new_threshold: _ } => {
-                // Spec §2.2.1: I_floor is immutable after InitMarket.
-                // Instruction rejected; retained for wire compatibility.
-                return Err(PercolatorError::InvalidConfigParam.into());
-            }
-
             Instruction::UpdateAdmin { new_admin } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
@@ -4308,14 +4243,14 @@ pub mod processor {
                 funding_inv_scale_notional_e6,
                 funding_max_premium_bps,
                 funding_max_bps_per_slot,
-                thresh_floor,
-                thresh_risk_bps,
-                thresh_update_interval_slots,
-                thresh_step_bps,
-                thresh_alpha_bps,
-                thresh_min,
-                thresh_max,
-                thresh_min_step,
+                thresh_floor: _,
+                thresh_risk_bps: _,
+                thresh_update_interval_slots: _,
+                thresh_step_bps: _,
+                thresh_alpha_bps: _,
+                thresh_min: _,
+                thresh_max: _,
+                thresh_min_step: _,
             } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
@@ -4345,23 +4280,10 @@ pub mod processor {
                 if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                if thresh_alpha_bps > 10_000 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                if thresh_update_interval_slots == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                if thresh_min > thresh_max {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
 
                 // Read existing config and update
                 let mut config = state::read_config(&data);
 
-                // Enforce per-market admin limit on thresh_max
-                if thresh_max > config.max_insurance_floor {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
                 // funding_k_bps: 100 = 1.00x multiplier. Cap at 100_000 (1000x)
                 // to prevent saturating_mul from always hitting i128 ceiling.
                 if funding_k_bps > 100_000 {
@@ -4372,43 +4294,7 @@ pub mod processor {
                 config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
-                config.thresh_floor = thresh_floor;
-                config.thresh_risk_bps = thresh_risk_bps;
-                config.thresh_update_interval_slots = thresh_update_interval_slots;
-                config.thresh_step_bps = thresh_step_bps;
-                config.thresh_alpha_bps = thresh_alpha_bps;
-                config.thresh_min = thresh_min;
-                config.thresh_max = thresh_max;
-                config.thresh_min_step = thresh_min_step;
                 state::write_config(&mut data, &config);
-            }
-
-            Instruction::SetMaintenanceFee { new_fee } => {
-                // Spec §8.2: "Implementations MUST NOT realize any recurring
-                // account-local maintenance fee." Reject non-zero values.
-                // Instruction retained for wire compatibility; only fee=0 accepted.
-                if new_fee != 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
-                accounts::expect_len(accounts, 2)?;
-                let a_admin = &accounts[0];
-                let a_slab = &accounts[1];
-
-                accounts::expect_signer(a_admin)?;
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if state::is_resolved(&data) {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
-
-                let engine = zc::engine_mut(&mut data)?;
-                engine.params.maintenance_fee_per_slot = percolator::U128::new(0);
             }
 
             Instruction::SetOracleAuthority { new_authority } => {

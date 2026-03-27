@@ -1662,13 +1662,6 @@ fn test_crank_updates_threshold_from_risk_metric() {
         process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0)).unwrap();
     }
 
-    // Verify threshold update ran by checking last_thr_update_slot
-    let last_thr_slot_after = state::read_last_thr_update_slot(&f.slab.data);
-    assert_eq!(
-        last_thr_slot_after, 110,
-        "last_thr_update_slot should be set to clock.slot after crank"
-    );
-
     // Verify insurance_floor is unchanged by crank (static admin-set field, LP risk gate removed in v11.21)
     {
         let engine = zc::engine_ref(&f.slab.data).unwrap();

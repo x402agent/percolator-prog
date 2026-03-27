@@ -43,7 +43,6 @@ use percolator_prog::verify::{
     decide_trade_cpi_from_ret,
     decide_trade_nocpi,
     decision_nonce,
-    gate_active,
     // New: InitMarket scale validation
     init_market_scale_ok,
     // New: Oracle inversion math
@@ -482,44 +481,6 @@ fn kani_cpi_uses_exec_size() {
 // I. GATE ACTIVATION LOGIC (3 proofs)
 // =============================================================================
 
-/// Prove: gate not active when threshold is zero
-#[kani::proof]
-fn kani_gate_inactive_when_threshold_zero() {
-    let balance: u128 = kani::any();
-
-    assert!(
-        !gate_active(0, balance),
-        "gate must be inactive when threshold is zero"
-    );
-}
-
-/// Prove: gate not active when balance exceeds threshold
-#[kani::proof]
-fn kani_gate_inactive_when_balance_exceeds() {
-    let threshold: u128 = kani::any();
-    let balance: u128 = kani::any();
-    kani::assume(balance > threshold);
-
-    assert!(
-        !gate_active(threshold, balance),
-        "gate must be inactive when balance > threshold"
-    );
-}
-
-/// Prove: gate active when threshold > 0 and balance <= threshold
-#[kani::proof]
-fn kani_gate_active_when_conditions_met() {
-    let threshold: u128 = kani::any();
-    kani::assume(threshold > 0);
-    let balance: u128 = kani::any();
-    kani::assume(balance <= threshold);
-
-    assert!(
-        gate_active(threshold, balance),
-        "gate must be active when threshold > 0 and balance <= threshold"
-    );
-}
-
 // =============================================================================
 // J. PER-INSTRUCTION AUTHORIZATION (4 proofs)
 // =============================================================================
@@ -598,9 +559,8 @@ fn valid_shape() -> MatcherAccountsShape {
 }
 
 /// Universal characterization of decide_trade_cpi: fully symbolic inputs.
-/// Proves: Accept iff shape_ok && identity && pda && abi && user && lp && !(gate && risk).
+/// Proves: Accept iff shape_ok && identity && pda && abi && user && lp.
 /// On Accept: new_nonce == nonce_on_success(old_nonce), chosen_size == exec_size.
-/// Subsumes kani_tradecpi_allows_gate_risk_decrease and all individual gate rejection proofs.
 #[kani::proof]
 fn kani_decide_trade_cpi_universal() {
     let old_nonce: u64 = kani::any();
@@ -616,18 +576,15 @@ fn kani_decide_trade_cpi_universal() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_key_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
 
     let decision = decide_trade_cpi(
         old_nonce, shape, identity_ok, pda_ok, abi_ok,
-        user_auth_ok, lp_key_ok, gate_active, risk_increase, exec_size,
+        user_auth_ok, lp_key_ok, exec_size,
     );
 
     let should_accept = matcher_shape_ok(shape)
         && identity_ok && pda_ok && abi_ok
-        && user_auth_ok && lp_key_ok
-        && !(gate_active && risk_increase);
+        && user_auth_ok && lp_key_ok;
 
     if should_accept {
         match decision {
@@ -661,7 +618,7 @@ fn kani_tradecpi_reject_nonce_unchanged() {
     kani::assume(!matcher_shape_ok(shape));
 
     let decision = decide_trade_cpi(
-        old_nonce, shape, true, true, true, true, true, false, false, exec_size,
+        old_nonce, shape, true, true, true, true, true, exec_size,
     );
 
     assert_eq!(
@@ -701,8 +658,6 @@ fn kani_tradecpi_accept_increments_nonce() {
         true,
         true,
         true,
-        false,
-        false,
         exec_size,
     );
 
@@ -731,26 +686,19 @@ fn kani_tradecpi_accept_increments_nonce() {
 // M. TRADENOCPI DECISION COUPLING (3 proofs — universal symbolic)
 // =============================================================================
 
-/// Universal: TradeNoCpi rejects when user_auth=false OR lp_auth=false
-/// (regardless of gate/risk state)
+/// Universal: TradeNoCpi rejects when user_auth=false OR lp_auth=false.
 ///
 /// NOTE: This proof is subsumed by `kani_tradenocpi_universal_characterization`
-/// (line ~751), which provides a full characterization of `decide_trade_nocpi`
-/// for all symbolic boolean inputs — including both accept and reject cases.
-/// This proof is retained as readable documentation of the auth-failure rejection
-/// property in isolation. In production, auth failure causes early return before
-/// the gate check (`gate_active && risk_increase`) is ever evaluated.
+/// which provides a full characterization of `decide_trade_nocpi`.
 #[kani::proof]
 fn kani_tradenocpi_auth_failure_rejects() {
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
 
     // At least one auth must fail
     kani::assume(!user_auth_ok || !lp_auth_ok);
 
-    let decision = decide_trade_nocpi(user_auth_ok, lp_auth_ok, gate_active, risk_increase);
+    let decision = decide_trade_nocpi(user_auth_ok, lp_auth_ok);
     assert_eq!(
         decision,
         TradeNoCpiDecision::Reject,
@@ -763,13 +711,11 @@ fn kani_tradenocpi_auth_failure_rejects() {
 fn kani_tradenocpi_universal_characterization() {
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
 
-    let decision = decide_trade_nocpi(user_auth_ok, lp_auth_ok, gate_active, risk_increase);
+    let decision = decide_trade_nocpi(user_auth_ok, lp_auth_ok);
 
-    // Full characterization: accept iff all auth passes AND NOT (gate_active && risk_increase)
-    let should_accept = user_auth_ok && lp_auth_ok && !(gate_active && risk_increase);
+    // Full characterization: accept iff all auth passes
+    let should_accept = user_auth_ok && lp_auth_ok;
     if should_accept {
         assert_eq!(decision, TradeNoCpiDecision::Accept, "must accept when all conditions pass");
     } else {
@@ -826,7 +772,7 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
             ctx_owner_is_prog: true,
             ctx_len_ok: true,
         };
-        let d = decide_trade_cpi(0, bad, true, true, true, true, true, false, false, 0);
+        let d = decide_trade_cpi(0, bad, true, true, true, true, true, 0);
         assert!(
             matches!(d, TradeCpiDecision::Reject),
             "non-vacuity: bad shape must reject"
@@ -848,8 +794,6 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -860,8 +804,6 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -883,7 +825,7 @@ fn kani_tradecpi_any_reject_nonce_unchanged() {
 fn kani_tradecpi_any_accept_increments_nonce() {
     // Non-vacuity witness: all-valid inputs produce Accept
     {
-        let d = decide_trade_cpi(0, valid_shape(), true, true, true, true, true, false, false, 0);
+        let d = decide_trade_cpi(0, valid_shape(), true, true, true, true, true, 0);
         assert!(
             matches!(d, TradeCpiDecision::Accept { .. }),
             "non-vacuity: all-valid inputs must accept"
@@ -905,8 +847,6 @@ fn kani_tradecpi_any_accept_increments_nonce() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -917,8 +857,6 @@ fn kani_tradecpi_any_accept_increments_nonce() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -1145,7 +1083,7 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
             oracle_price_e6: 0,
             reserved: 0,
         };
-        let d = decide_trade_cpi_from_ret(0, bad, true, true, true, true, false, false, dummy_ret, 0, 0, 0);
+        let d = decide_trade_cpi_from_ret(0, bad, true, true, true, true, dummy_ret, 0, 0, 0);
         assert!(
             matches!(d, TradeCpiDecision::Reject),
             "non-vacuity: bad shape must reject"
@@ -1163,8 +1101,6 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
     let pda_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_is_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let ret = any_matcher_return_fields();
     let lp_account_id: u64 = kani::any();
     let oracle_price_e6: u64 = kani::any();
@@ -1177,8 +1113,6 @@ fn kani_tradecpi_from_ret_any_reject_nonce_unchanged() {
         pda_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -1215,7 +1149,7 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
             reserved: 0,
         };
         let d = decide_trade_cpi_from_ret(
-            42, valid_shape(), true, true, true, true, false, false, valid_ret, 1, 50_000_000, 100,
+            42, valid_shape(), true, true, true, true, valid_ret, 1, 50_000_000, 100,
         );
         assert!(
             matches!(d, TradeCpiDecision::Accept { .. }),
@@ -1234,8 +1168,6 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
     let pda_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_is_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let ret = any_matcher_return_fields();
     let lp_account_id: u64 = kani::any();
     let oracle_price_e6: u64 = kani::any();
@@ -1248,8 +1180,6 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
         pda_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -1271,8 +1201,8 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
 /// Prove: ANY acceptance uses exec_size from ret, not req_size
 /// NON-VACUOUS: Forces Accept path by constraining inputs to valid state
 ///
-/// UNIT TEST: Shape is hardcoded valid; all authorization bools are concrete `true`;
-/// gate is concrete `false`. Only `exec_size`, `req_size`, `lp_account_id`, and
+/// UNIT TEST: Shape is hardcoded valid; all authorization bools are concrete `true`.
+/// Only `exec_size`, `req_size`, `lp_account_id`, and
 /// `oracle_price_e6` are symbolic. This functions as a unit test of `cpi_trade_size`
 /// on the accept path, verifying the exec_size binding property rather than the
 /// full symbolic space of authorization conditions.
@@ -1291,8 +1221,6 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
     let pda_ok: bool = true;
     let user_auth_ok: bool = true;
     let lp_auth_ok: bool = true;
-    let gate_is_active: bool = false; // Gate inactive = no risk check
-    let risk_increase: bool = kani::any(); // Doesn't matter when gate inactive
 
     // Force valid matcher return
     let exec_size: i128 = kani::any();
@@ -1328,8 +1256,6 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
         pda_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -2011,8 +1937,6 @@ fn kani_universal_shape_fail_rejects() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -2023,8 +1947,6 @@ fn kani_universal_shape_fail_rejects() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -2051,8 +1973,6 @@ fn kani_universal_pda_fail_rejects() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -2063,8 +1983,6 @@ fn kani_universal_pda_fail_rejects() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -2091,8 +2009,6 @@ fn kani_universal_user_auth_fail_rejects() {
     let abi_ok: bool = kani::any();
     let user_auth_ok = false; // Force failure
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -2103,8 +2019,6 @@ fn kani_universal_user_auth_fail_rejects() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -2131,8 +2045,6 @@ fn kani_universal_lp_auth_fail_rejects() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok = false; // Force failure
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -2143,8 +2055,6 @@ fn kani_universal_lp_auth_fail_rejects() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -2171,8 +2081,6 @@ fn kani_universal_identity_fail_rejects() {
     let abi_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -2183,8 +2091,6 @@ fn kani_universal_identity_fail_rejects() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -2211,8 +2117,6 @@ fn kani_universal_abi_fail_rejects() {
     let abi_ok = false; // Force failure
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let exec_size: i128 = kani::any();
 
     let decision = decide_trade_cpi(
@@ -2223,8 +2127,6 @@ fn kani_universal_abi_fail_rejects() {
         abi_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_active,
-        risk_increase,
         exec_size,
     );
 
@@ -2240,7 +2142,7 @@ fn kani_universal_abi_fail_rejects() {
 // Split into valid-shape and invalid-shape for faster/sharper proofs
 // =============================================================================
 
-/// Prove: consistency under VALID shape - focuses on ABI/nonce/gate/identity
+/// Prove: consistency under VALID shape - focuses on ABI/nonce/identity
 #[kani::proof]
 fn kani_tradecpi_variants_consistent_valid_shape() {
     let old_nonce: u64 = kani::any();
@@ -2250,8 +2152,6 @@ fn kani_tradecpi_variants_consistent_valid_shape() {
     let pda_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_is_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
 
     // Create ret fields
     let ret = any_matcher_return_fields();
@@ -2274,8 +2174,6 @@ fn kani_tradecpi_variants_consistent_valid_shape() {
         abi_passes,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret.exec_size,
     );
 
@@ -2286,8 +2184,6 @@ fn kani_tradecpi_variants_consistent_valid_shape() {
         pda_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -2332,8 +2228,6 @@ fn kani_tradecpi_variants_consistent_invalid_shape() {
     let pda_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_is_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
     let ret = any_matcher_return_fields();
     let lp_account_id: u64 = kani::any();
     let oracle_price_e6: u64 = kani::any();
@@ -2350,8 +2244,6 @@ fn kani_tradecpi_variants_consistent_invalid_shape() {
         abi_passes,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret.exec_size,
     );
 
@@ -2362,8 +2254,6 @@ fn kani_tradecpi_variants_consistent_invalid_shape() {
         pda_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -2387,7 +2277,7 @@ fn kani_tradecpi_variants_consistent_invalid_shape() {
 /// NON-VACUOUS: forces acceptance by constraining ret to be ABI-valid
 ///
 /// UNIT TEST: Shape is hardcoded via `valid_shape()`; all authorization bools are
-/// concrete `true`; gate is concrete `false`. Only `old_nonce`, `lp_account_id`,
+/// concrete `true`. Only `old_nonce`, `lp_account_id`,
 /// `oracle_price_e6`, and `req_size` are symbolic. This is a borderline unit test
 /// of nonce binding on a single forced-accept path; the full symbolic space is
 /// covered by `kani_tradecpi_from_ret_any_accept_increments_nonce`.
@@ -2420,8 +2310,6 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
         true,  // pda_ok
         true,  // user_auth_ok
         true,  // lp_auth_ok
-        false, // gate_active (inactive)
-        false, // risk_increase
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -2445,50 +2333,6 @@ fn kani_tradecpi_from_ret_req_id_is_nonce_plus_one() {
 // =============================================================================
 // AG. UNIVERSAL GATE PROOF (missing from AE)
 // =============================================================================
-
-/// Universal: gate_active && risk_increase => Reject (the kill switch)
-/// Strengthened: all non-gate inputs are symbolic — proves rejection regardless
-/// of shape validity, identity, PDA, ABI, or auth state.
-#[kani::proof]
-fn kani_universal_gate_risk_increase_rejects() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: kani::any(),
-        ctx_executable: kani::any(),
-        ctx_owner_is_prog: kani::any(),
-        ctx_len_ok: kani::any(),
-    };
-    // Force valid shape so we actually reach the gate check (invalid shape
-    // rejects earlier, which is already proved by kani_universal_shape_fail_rejects)
-    kani::assume(matcher_shape_ok(shape));
-    let identity_ok: bool = kani::any();
-    let pda_ok: bool = kani::any();
-    let abi_ok: bool = kani::any();
-    let user_auth_ok: bool = kani::any();
-    let lp_auth_ok: bool = kani::any();
-    let gate_active = true; // Gate IS active
-    let risk_increase = true; // Trade WOULD increase risk
-    let exec_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi(
-        old_nonce,
-        shape,
-        identity_ok,
-        pda_ok,
-        abi_ok,
-        user_auth_ok,
-        lp_auth_ok,
-        gate_active,
-        risk_increase,
-        exec_size,
-    );
-
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "gate_active && risk_increase must ALWAYS reject"
-    );
-}
 
 // =============================================================================
 // AH. ADDITIONAL STRENGTHENING PROOFS
@@ -2527,141 +2371,13 @@ fn kani_units_roundtrip_exact_when_no_dust() {
 // (runtime ignores it, model no longer includes it).
 
 // =============================================================================
-// AI. UNIVERSAL GATE KILL-SWITCH FOR FROM_RET PATH
-// =============================================================================
-
-/// Universal: gate_active && risk_increase => Reject in from_ret path
-/// Proves the kill-switch works in the mechanically-tied path too
-/// Strengthened: symbolic shape + symbolic auth bools
-#[kani::proof]
-fn kani_universal_gate_risk_increase_rejects_from_ret() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: kani::any(),
-        ctx_executable: kani::any(),
-        ctx_owner_is_prog: kani::any(),
-        ctx_len_ok: kani::any(),
-    };
-    kani::assume(matcher_shape_ok(shape));
-
-    let identity_ok: bool = kani::any();
-    let pda_ok: bool = kani::any();
-    let user_auth_ok: bool = kani::any();
-    let lp_auth_ok: bool = kani::any();
-
-    // Construct ABI-valid ret (so we get past ABI checks to the gate)
-    let expected_req_id = nonce_on_success(old_nonce);
-    let mut ret = any_matcher_return_fields();
-    ret.abi_version = MATCHER_ABI_VERSION;
-    ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
-    ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
-    ret.req_id = expected_req_id;
-    ret.exec_size = 0;
-
-    let lp_account_id: u64 = ret.lp_account_id;
-    let oracle_price_e6: u64 = ret.oracle_price_e6;
-    let req_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi_from_ret(
-        old_nonce,
-        shape,
-        identity_ok,
-        pda_ok,
-        user_auth_ok,
-        lp_auth_ok,
-        true, // gate_active - ACTIVE
-        true, // risk_increase - INCREASING
-        ret,
-        lp_account_id,
-        oracle_price_e6,
-        req_size,
-    );
-
-    // Reject whether prior gates fail OR gate+risk triggers
-    assert_eq!(
-        decision,
-        TradeCpiDecision::Reject,
-        "gate_active && risk_increase must reject (prior gate fail also rejects)"
-    );
-}
-
-/// Prove: gate_active=true + risk_increase=false => Accept in from_ret path
-/// when ALL other authorization checks also pass (symbolic on auth bools).
-///
-/// This is a proper symbolic proof: `identity_ok`, `pda_ok`, `user_auth_ok`,
-/// and `lp_auth_ok` are all symbolic, and we assume they all pass. This verifies
-/// that when all auth gates pass AND gate is active but risk is NOT increasing,
-/// the function accepts — proving the kill-switch does NOT block risk-neutral trades.
-///
-/// Companion to `kani_universal_gate_risk_increase_rejects_from_ret` which proves
-/// that `gate_active && risk_increase` always rejects regardless of auth state.
-#[kani::proof]
-fn kani_tradecpi_from_ret_gate_active_risk_neutral_accepts() {
-    let old_nonce: u64 = kani::any();
-    let shape = MatcherAccountsShape {
-        prog_executable: kani::any(),
-        ctx_executable: kani::any(),
-        ctx_owner_is_prog: kani::any(),
-        ctx_len_ok: kani::any(),
-    };
-    kani::assume(matcher_shape_ok(shape));
-
-    // All authorization bools are symbolic — proves the property holds for any
-    // auth combination, not just the hardcoded-true case.
-    let identity_ok: bool = kani::any();
-    let pda_ok: bool = kani::any();
-    let user_auth_ok: bool = kani::any();
-    let lp_auth_ok: bool = kani::any();
-    // Assume all auth checks pass — we want to prove the gate-active/risk-neutral
-    // accept path, not the auth-failure reject path.
-    kani::assume(identity_ok && pda_ok && user_auth_ok && lp_auth_ok);
-
-    // Construct ABI-valid ret to pass all pre-gate checks
-    let expected_req_id = nonce_on_success(old_nonce);
-    let mut ret = any_matcher_return_fields();
-    ret.abi_version = MATCHER_ABI_VERSION;
-    ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
-    ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
-    ret.req_id = expected_req_id;
-    ret.exec_size = 0;
-
-    let lp_account_id: u64 = ret.lp_account_id;
-    let oracle_price_e6: u64 = ret.oracle_price_e6;
-    let req_size: i128 = kani::any();
-
-    let decision = decide_trade_cpi_from_ret(
-        old_nonce,
-        shape,
-        identity_ok,
-        pda_ok,
-        user_auth_ok,
-        lp_auth_ok,
-        true,  // gate_active — ACTIVE
-        false, // risk_increase — NOT increasing (risk-neutral/reducing trade)
-        ret,
-        lp_account_id,
-        oracle_price_e6,
-        req_size,
-    );
-
-    match decision {
-        TradeCpiDecision::Accept { .. } => {} // Expected: gate-active + risk-neutral accepts
-        TradeCpiDecision::Reject => {
-            panic!("gate_active + risk_neutral with all auth passing and valid ABI must accept");
-        }
-    }
-}
-
-// =============================================================================
 // AJ. END-TO-END FORCED ACCEPTANCE FOR FROM_RET PATH
 // =============================================================================
 
 /// Prove: end-to-end acceptance when all conditions are met
 /// NON-VACUOUS: forces Accept and verifies all output fields
 ///
-/// UNIT TEST: All authorization bools are concrete `true`; gate is concrete `false`;
+/// UNIT TEST: All authorization bools are concrete `true`;
 /// `exec_size = 0` with `PARTIAL_OK`. Proves one specific happy-path execution.
 /// This serves as a non-vacuity witness for the from_ret accept path rather than
 /// a symbolic proof of the full authorization space.
@@ -2684,7 +2400,7 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
     let oracle_price_e6: u64 = ret.oracle_price_e6;
     let req_size: i128 = kani::any();
 
-    // All checks pass, gate inactive or risk not increasing
+    // All checks pass
     let decision = decide_trade_cpi_from_ret(
         old_nonce,
         shape,
@@ -2692,8 +2408,6 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
         true,  // pda_ok
         true,  // user_auth_ok
         true,  // lp_auth_ok
-        false, // gate_active (inactive)
-        false, // risk_increase (not increasing)
         ret,
         lp_account_id,
         oracle_price_e6,
@@ -3443,14 +3157,13 @@ fn inductive_clamp_within_bounds() {
 ///     && user_auth_ok && lp_auth_ok
 ///     && identity_ok
 ///     && abi_ok(ret, lp_account_id, oracle_price_e6, req_size, nonce_on_success(old_nonce))
-///     && !(gate_is_active && risk_increase)
 ///
 ///   On Accept:
 ///     new_nonce == nonce_on_success(old_nonce)
 ///     chosen_size == cpi_trade_size(ret.exec_size, req_size)
 ///
-/// This is the Tier 1 universal proof that was missing for `decide_trade_cpi_from_ret`.
-/// Analogous to `kani_decide_trade_cpi_universal` (line ~600) for `decide_trade_cpi`.
+/// This is the Tier 1 universal proof for `decide_trade_cpi_from_ret`.
+/// Analogous to `kani_decide_trade_cpi_universal` for `decide_trade_cpi`.
 ///
 /// Note on ABI validity: `abi_ok` computes `validate_matcher_return` with
 /// `req_id = nonce_on_success(old_nonce)`. We construct a symbolically ABI-valid
@@ -3471,8 +3184,6 @@ fn kani_decide_trade_cpi_from_ret_universal() {
     let pda_ok: bool = kani::any();
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let gate_is_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
 
     // Construct an ABI-valid ret symbolically.
     // The `abi_ok` call inside `decide_trade_cpi_from_ret` uses:
@@ -3504,8 +3215,7 @@ fn kani_decide_trade_cpi_from_ret_universal() {
         && user_auth_ok
         && lp_auth_ok
         && identity_ok
-        && abi_valid
-        && !(gate_is_active && risk_increase);
+        && abi_valid;
 
     let decision = decide_trade_cpi_from_ret(
         old_nonce,
@@ -3514,8 +3224,6 @@ fn kani_decide_trade_cpi_from_ret_universal() {
         pda_ok,
         user_auth_ok,
         lp_auth_ok,
-        gate_is_active,
-        risk_increase,
         ret,
         lp_account_id,
         oracle_price_e6,
