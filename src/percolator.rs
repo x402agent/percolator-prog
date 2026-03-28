@@ -3035,7 +3035,9 @@ pub mod processor {
                 // Initialize engine in-place (zero-copy) to avoid stack overflow.
                 let a_clock = &accounts[5];
                 let clock = Clock::from_account_info(a_clock)?;
-                let init_price = if is_hyperp { initial_mark_price_e6 } else { 0 };
+                // Engine v12 requires init_oracle_price > 0. Non-Hyperp markets
+                // use 1 as a placeholder; real oracle price arrives on first crank.
+                let init_price = if is_hyperp { initial_mark_price_e6 } else { 1 };
                 let engine = zc::engine_mut(&mut data)?;
                 engine.init_in_place(risk_params, clock.slot, init_price);
                 // init_in_place sets last_crank_slot = 0; override to init slot
@@ -3485,6 +3487,10 @@ pub mod processor {
                             let _ = engine.touch_account_full(
                                 idx as usize, settlement_price, clock.slot,
                             );
+                            // Zero position for resolved-market settlement
+                            let _ = engine.settle_position_at_price(
+                                idx, settlement_price,
+                            );
                         }
                     }
 
@@ -3515,7 +3521,9 @@ pub mod processor {
                     // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
                     // Best-effort on resolved markets — side-reset finalization may
                     // encounter CorruptState if ADL state is frozen post-resolution.
+                    let mut ctx = percolator::InstructionContext::new();
                     let _ = engine.run_end_of_instruction_lifecycle(
+                        &mut ctx,
                         compute_current_funding_rate(&config),
                     );
 
@@ -4077,14 +4085,13 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Best-effort settlement at settlement price.
-                    // If touch fails (ADL overflow), close_account_resolved
-                    // handles the account using stored local state.
-                    // Matches WithdrawCollateral and AdminForceCloseAccount
-                    // patterns — prevents user from being permanently wedged.
+                    // Best-effort settlement: touch settles K-pair PnL,
+                    // settle_position_at_price zeros the position and updates OI.
                     let _ = engine.touch_account_full(
                         user_idx as usize, price, clock.slot,
                     );
+                    engine.settle_position_at_price(user_idx, price)
+                        .map_err(map_risk_error)?;
                     engine.close_account_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -4977,15 +4984,11 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Best-effort settlement. If touch permanently fails (e.g., ADL
-                // overflow from extreme K-pair imbalance), admin can still force-close
-                // using close_account_resolved's local-state-only path. The user
-                // receives whatever capital remains after local settlement — this may
-                // haircut positive PnL but prevents permanent account wedging that
-                // would block WithdrawInsurance and CloseSlab.
+                // Best-effort settlement + position zeroing for resolved markets.
                 let _ = engine.touch_account_full(
                     user_idx as usize, price, clock.slot,
                 );
+                let _ = engine.settle_position_at_price(user_idx, price);
                 let amt_units = engine.close_account_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units

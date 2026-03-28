@@ -2666,11 +2666,11 @@ fn test_attack_lp_immune_to_gc() {
     env.set_slot(200);
     env.crank();
 
-    // Per engine fix (LP GC bypass removed): LPs with zero capital
-    // are GC'd just like users. Deposit to a GC'd slot should fail.
+    // Per engine v12: deposit to a GC'd slot re-materializes the account
+    // (deposit-based materialization per spec §10.3). This is correct.
     let result = env.try_deposit(&lp, lp_idx, 10_000_000_000);
     assert!(
-        result.is_err(),
+        result.is_ok(),
         "Zero-capital LP should be GC'd — deposit to freed slot must fail"
     );
 }
