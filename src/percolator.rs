@@ -2656,12 +2656,22 @@ pub mod processor {
         // POS_SCALE = 1_000_000 in spec v11.5, same as instruction units.
         // No conversion needed.
         let size_q: i128 = exec.size;
+        // Spec v12: size_q must be > 0. Account `a` buys from `b`.
+        // Positive size = user buys from LP (user goes long).
+        // Negative size = LP buys from user (user goes short) — swap order.
+        let (a, b, abs_size) = if size_q > 0 {
+            (user_idx, lp_idx, size_q)
+        } else if size_q < 0 {
+            (lp_idx, user_idx, -size_q)
+        } else {
+            return Err(RiskError::Overflow);
+        };
         engine.execute_trade(
-            user_idx,
-            lp_idx,
+            a,
+            b,
             oracle_price,
             now_slot,
-            size_q,
+            abs_size,
             exec.price,
             funding_rate,
         )
@@ -3023,16 +3033,13 @@ pub mod processor {
                 }
 
                 // Initialize engine in-place (zero-copy) to avoid stack overflow.
-                // The data is already zeroed above, so init_in_place only sets non-zero fields.
-                let engine = zc::engine_mut(&mut data)?;
-                engine.init_in_place(risk_params);
-                // insurance_floor already in params from read_risk_params
-
-                // Initialize slot fields to current slot to prevent overflow on first crank
                 let a_clock = &accounts[5];
                 let clock = Clock::from_account_info(a_clock)?;
-                engine.current_slot = clock.slot;
-                engine.last_market_slot = clock.slot;
+                let init_price = if is_hyperp { initial_mark_price_e6 } else { 0 };
+                let engine = zc::engine_mut(&mut data)?;
+                engine.init_in_place(risk_params, clock.slot, init_price);
+                // init_in_place sets last_crank_slot = 0; override to init slot
+                // so first crank doesn't see a huge staleness gap.
                 engine.last_crank_slot = clock.slot;
 
                 let config = MarketConfig {
