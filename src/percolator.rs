@@ -2627,17 +2627,22 @@ pub mod processor {
             }
         }
 
-        // Step 3: Absorb any remaining negative PnL as protocol loss
+        // Step 3: Absorb remaining negative PnL from insurance (above floor).
+        // Only zero the amount actually covered. Uncovered remainder stays
+        // as protocol loss — vault absorbs it implicitly when close_account_resolved
+        // returns less capital than the vault had.
         if engine.accounts[i].pnl < 0 {
             let loss = engine.accounts[i].pnl.unsigned_abs();
-            // absorb_protocol_loss: deduct from insurance fund
             let ins_bal = engine.insurance_fund.balance.get();
             let available = ins_bal.saturating_sub(engine.params.insurance_floor.get());
             let ins_pay = core::cmp::min(loss, available);
             if ins_pay > 0 {
                 engine.insurance_fund.balance = U128::new(ins_bal - ins_pay);
             }
-            // Zero the PnL (was negative, no pnl_pos_tot impact)
+            // Zero PnL for close_account_resolved precondition. Any uncovered
+            // loss (loss > capital + available_insurance) is an implicit haircut:
+            // the vault retains less, so future withdrawals/closes receive less.
+            // This matches the engine's absorb_protocol_loss semantics.
             engine.accounts[i].pnl = 0;
         }
 
@@ -4580,18 +4585,20 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
-                // Flush Hyperp index to current slot before changing params.
-                // This creates a real accrual boundary — the index is updated
-                // to the change slot, so new params only affect future intervals.
+                // Flush Hyperp index WITHOUT staleness check (admin recovery path).
                 let clock = Clock::from_account_info(a_clock)?;
                 if oracle::is_hyperp_mode(&config) {
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    // Advance index in config (writes last_effective_price_e6)
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, &accounts[1],
-                    )?;
+                    let prev_index = config.last_effective_price_e6;
+                    let mark = config.authority_price_e6;
+                    if mark > 0 && prev_index > 0 {
+                        let last_idx_slot = config.last_hyperp_index_slot;
+                        let dt = clock.slot.saturating_sub(last_idx_slot);
+                        let new_index = oracle::clamp_toward_with_dt(
+                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                        );
+                        config.last_effective_price_e6 = new_index;
+                        config.last_hyperp_index_slot = clock.slot;
+                    }
                     state::write_config(&mut data, &config);
                 }
                 // Stamp funding rate from OLD config (pre-change params)
@@ -4664,17 +4671,23 @@ pub mod processor {
 
                 let mut config = state::read_config(&data);
                 let is_hyperp = oracle::is_hyperp_mode(&config);
-                // Hyperp: flush index to current slot before mark push.
-                // Creates a real accrual boundary — index reflects pre-push state.
+                // Hyperp: flush index WITHOUT staleness check.
+                // PushOraclePrice is the recovery path for stale marks —
+                // it must not be blocked by the very staleness it's meant to fix.
                 if is_hyperp {
                     let push_clock = Clock::get()
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, push_clock.slot, push_clock.unix_timestamp,
-                        &mut config, a_slab,
-                    )?;
+                    let prev_index = config.last_effective_price_e6;
+                    let mark = config.authority_price_e6;
+                    if mark > 0 && prev_index > 0 {
+                        let last_idx_slot = config.last_hyperp_index_slot;
+                        let dt = push_clock.slot.saturating_sub(last_idx_slot);
+                        let new_index = oracle::clamp_toward_with_dt(
+                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                        );
+                        config.last_effective_price_e6 = new_index;
+                        config.last_hyperp_index_slot = push_clock.slot;
+                    }
                     state::write_config(&mut data, &config);
                     config = state::read_config(&data);
                 }
@@ -4772,15 +4785,20 @@ pub mod processor {
                 let mut config = state::read_config(&data);
                 let is_hyperp = oracle::is_hyperp_mode(&config);
 
-                // Flush Hyperp index to current slot before cap change
+                // Flush Hyperp index WITHOUT staleness check (admin path)
                 if is_hyperp {
                     let clock = Clock::from_account_info(a_clock)?;
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_slab,
-                    )?;
+                    let prev_index = config.last_effective_price_e6;
+                    let mark = config.authority_price_e6;
+                    if mark > 0 && prev_index > 0 {
+                        let last_idx_slot = config.last_hyperp_index_slot;
+                        let dt = clock.slot.saturating_sub(last_idx_slot);
+                        let new_index = oracle::clamp_toward_with_dt(
+                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                        );
+                        config.last_effective_price_e6 = new_index;
+                        config.last_hyperp_index_slot = clock.slot;
+                    }
                     state::write_config(&mut data, &config);
                     config = state::read_config(&data);
                 }
@@ -4850,15 +4868,20 @@ pub mod processor {
                 let clock = Clock::from_account_info(a_clock)?;
                 let mut config = config;
 
-                // Flush Hyperp index to resolution slot before freezing.
-                // Ensures resolved outcomes don't depend on last crank timing.
+                // Flush Hyperp index to resolution slot WITHOUT staleness check.
+                // Admin must be able to resolve even if mark is stale.
                 if oracle::is_hyperp_mode(&config) {
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_slab,
-                    )?;
+                    let prev_index = config.last_effective_price_e6;
+                    let mark = config.authority_price_e6;
+                    if mark > 0 && prev_index > 0 {
+                        let last_idx_slot = config.last_hyperp_index_slot;
+                        let dt = clock.slot.saturating_sub(last_idx_slot);
+                        let new_index = oracle::clamp_toward_with_dt(
+                            prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt,
+                        );
+                        config.last_effective_price_e6 = new_index;
+                        config.last_hyperp_index_slot = clock.slot;
+                    }
                 }
 
                 config.resolution_slot = clock.slot;
