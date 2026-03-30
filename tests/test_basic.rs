@@ -114,57 +114,32 @@ fn test_non_inverted_market_crank_succeeds() {
 /// Bug: CloseSlab only checks engine.vault and engine.insurance_fund.balance,
 /// but not dust_base which can hold residual base tokens.
 #[test]
-fn test_bug3_close_slab_with_dust_should_fail() {
+fn test_bug3_misaligned_deposit_rejected_with_unit_scale() {
     program_path();
 
     let mut env = TestEnv::new();
 
     // Initialize with unit_scale=1000 (1000 base = 1 unit)
-    // This means deposits with remainder < 1000 will create dust
     env.init_market_full(0, 1000, 0);
 
     let user = Keypair::new();
-    // init_user deposits min_initial_deposit tokens; with unit_scale=1000
-    // we need at least 100*1000 = 100_000 base tokens to reach 100 units.
     let user_idx = env.init_user_with_fee(&user, 100_000);
 
-    // Deposit 10_000_500 base tokens: 10_000 units + 500 dust
-    // - 10_000_500 / 1000 = 10_000 units credited
-    // - 10_000_500 % 1000 = 500 dust stored in dust_base
-    env.deposit(&user, user_idx, 10_000_500);
-
-    // Check vault has the full amount (100_000 from init + 10_000_500 from deposit)
-    let vault_balance = env.vault_balance();
-    assert_eq!(vault_balance, 10_100_500, "Vault should have init + deposit");
-
-    // Advance slot and crank to ensure state is updated
-    env.set_slot(200);
-    env.crank();
-
-    // Close account - returns capital in units converted to base
-    // 10_000 units * 1000 = 10_000_000 base returned
-    // The 500 dust remains in vault but isn't tracked by engine.vault
-    env.close_account(&user, user_idx);
-
-    // Check vault still has 500 dust
-    let vault_after = env.vault_balance();
-    println!(
-        "Bug #3: Vault balance after close_account = {}",
-        vault_after
+    // Deposit 10_000_500 base tokens: misaligned (500 remainder)
+    // Must be rejected — previously this silently donated 500 dust to protocol
+    let result = env.try_deposit(&user, user_idx, 10_000_500);
+    assert!(
+        result.is_err(),
+        "Misaligned deposit (10_000_500 with unit_scale=1000) must be rejected"
     );
 
-    // Vault should have dust remaining (500 base tokens)
-    assert!(vault_after > 0, "Vault should have dust remaining");
-
-    // Resolve market before CloseSlab (lifecycle requirement)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
-    env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
-    env.try_resolve_market(&admin).unwrap();
-
-    // CloseSlab drains stranded vault tokens and forgives dust_base
-    let result = env.try_close_slab();
-    assert!(result.is_ok(), "CloseSlab should drain dust and succeed: {:?}", result);
+    // Aligned deposit should succeed
+    let result = env.try_deposit(&user, user_idx, 10_000_000);
+    assert!(
+        result.is_ok(),
+        "Aligned deposit should succeed: {:?}",
+        result,
+    );
 }
 
 /// Test that withdrawals with amounts not divisible by unit_scale are rejected.
@@ -2287,14 +2262,100 @@ fn test_deposit_fee_credits_reduces_debt() {
         );
     } else {
         // No debt was generated (possible if fee is tiny or settled to capital).
-        // DepositFeeCredits with no debt should still succeed (it's a no-op).
+        // DepositFeeCredits with no debt must reject to prevent stranded tokens.
         let result = env.try_deposit_fee_credits(&user, user_idx, 100);
         assert!(
-            result.is_ok(),
-            "DepositFeeCredits with zero debt should succeed (no-op): {:?}",
-            result
+            result.is_err(),
+            "DepositFeeCredits with zero debt must reject (prevents stranded tokens)",
         );
     }
+}
+
+/// DepositFeeCredits must reject overpayment (amount > fee debt).
+/// Sending more tokens than the outstanding debt would strand the excess
+/// in the vault with no accounting entry — direct user fund loss.
+///
+/// We set up a market with a trading fee, trade to generate debt,
+/// crank to sweep debt from capital, then test that paying more than
+/// the remaining debt is rejected.
+#[test]
+fn test_deposit_fee_credits_rejects_overpayment() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Use a market with a trading fee to generate fee debt on trades
+    env.init_market_with_trading_fee(100); // 1% trading fee
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    // Trade to generate trading fee debt
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    // DON'T crank — the fee debt stays as-is (crank would sweep it from capital)
+    let fee_credits = env.read_account_fee_credits(user_idx);
+    println!("fee_credits after trade (no crank): {}", fee_credits);
+
+    if fee_credits < 0 {
+        let debt = (-fee_credits) as u64;
+        // Attempt to deposit 10x the actual debt — must be rejected
+        let overpayment = debt.saturating_mul(10).max(1000);
+        let result = env.try_deposit_fee_credits(&user, user_idx, overpayment);
+        assert!(
+            result.is_err(),
+            "DepositFeeCredits must reject overpayment (amount {} > debt {})",
+            overpayment, debt,
+        );
+
+        // Verify exact debt payment is accepted
+        let result = env.try_deposit_fee_credits(&user, user_idx, debt);
+        assert!(
+            result.is_ok(),
+            "DepositFeeCredits must accept exact debt payment: {:?}",
+            result,
+        );
+    } else {
+        // No debt: any payment must be rejected
+        let result = env.try_deposit_fee_credits(&user, user_idx, 1000);
+        assert!(
+            result.is_err(),
+            "DepositFeeCredits must reject when no debt exists",
+        );
+    }
+}
+
+/// DepositFeeCredits must reject when there is zero debt.
+/// Sending tokens with no debt would strand them permanently.
+#[test]
+fn test_deposit_fee_credits_rejects_zero_debt() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // No trading fee → no debt
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    let fee_credits = env.read_account_fee_credits(user_idx);
+    assert!(fee_credits >= 0, "Should have no debt with zero trading fee");
+
+    // Any deposit with zero debt must be rejected
+    let result = env.try_deposit_fee_credits(&user, user_idx, 100);
+    assert!(
+        result.is_err(),
+        "DepositFeeCredits must reject when fee debt is zero",
+    );
 }
 
 /// DepositFeeCredits requires the account owner's signature.
@@ -2954,6 +3015,103 @@ fn test_scaled_inverted_market_trades_correctly() {
         env.vault_balance(),
         vault_after_deposits,
         "conservation: crank must not change vault in scaled+inverted market"
+    );
+}
+
+// ── Misaligned deposit rejection (unit_scale > 0) ──────────────────────
+
+/// DepositCollateral must reject misaligned amounts when unit_scale > 0.
+/// With unit_scale=1000, depositing 1999 base tokens yields 1 unit + 999 dust.
+/// Those 999 dust tokens would be stranded (credited to global dust, not user capital).
+#[test]
+fn test_deposit_rejects_misaligned_amount_with_unit_scale() {
+    program_path();
+    let mut env = TestEnv::new();
+    // unit_scale=1000: 1 engine unit = 1000 base tokens
+    env.init_market_full(0, 1000, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp_with_fee(&lp, 100_000); // 100 units (meets min_initial_deposit)
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user_with_fee(&user, 100_000); // 100 units
+
+    // Deposit misaligned amount: 1999 base = 1 unit + 999 dust
+    // Must reject because 999 dust would be silently donated to protocol
+    let result = env.try_deposit(&user, user_idx, 1999);
+    assert!(
+        result.is_err(),
+        "DepositCollateral must reject misaligned amount (1999 base with unit_scale=1000)"
+    );
+
+    // Aligned deposit should succeed
+    let result = env.try_deposit(&user, user_idx, 2000);
+    assert!(
+        result.is_ok(),
+        "Aligned deposit (2000 base) should succeed: {:?}",
+        result,
+    );
+}
+
+/// InitUser must reject misaligned fee payments with unit_scale > 0.
+#[test]
+fn test_init_user_rejects_misaligned_fee_with_unit_scale() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_full(0, 1000, 0);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+    let ata = env.create_ata(&user.pubkey(), 999);
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_col, false),
+        ],
+        data: encode_init_user(999), // misaligned: 999 / 1000 = 0 units
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&user.pubkey()),
+        &[&user],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "InitUser must reject sub-scale fee payment (999 base with unit_scale=1000)"
+    );
+}
+
+/// DepositFeeCredits must reject sub-scale payment (units=0 after conversion).
+#[test]
+fn test_deposit_fee_credits_rejects_sub_scale_payment() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_full(0, 1000, 0); // unit_scale=1000
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp_with_fee(&lp, 100_000);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user_with_fee(&user, 100_000);
+    env.deposit(&user, user_idx, 1_000_000);
+
+    // Even if user has fee debt, paying 999 base (< 1 unit) must be rejected
+    let result = env.try_deposit_fee_credits(&user, user_idx, 999);
+    assert!(
+        result.is_err(),
+        "DepositFeeCredits must reject sub-scale payment (999 base with unit_scale=1000)"
     );
 }
 

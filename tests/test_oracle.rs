@@ -947,3 +947,103 @@ fn test_hyperp_index_smoothing_rate_limited() {
     );
 }
 
+/// Bug #1: conf_filter_bps = 0 should mean "disabled" (no confidence check).
+///
+/// Spec/init validation treats 0 as disabled, but the runtime check
+/// `conf * 10_000 > price * conf_bps` always rejects nonzero conf when
+/// conf_bps == 0. This bricks Pyth oracle reads for any market configured
+/// with conf_filter_bps = 0.
+///
+/// This test initializes a market with conf_filter_bps = 0, sets up a Pyth
+/// oracle with nonzero confidence, and verifies a crank (which reads the
+/// oracle) succeeds.
+#[test]
+fn test_conf_filter_bps_zero_does_not_brick_pyth() {
+    let mut env = TestEnv::new();
+    // Init with conf_filter_bps = 0 (should mean "disabled")
+    env.init_market_with_conf_bps(0);
+
+    // Set oracle with nonzero confidence (conf=1000 is realistic for Pyth)
+    let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1000, 100);
+    env.svm
+        .set_account(
+            env.pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data.clone(),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            env.pyth_col,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Crank reads the oracle — must succeed with conf_filter_bps=0
+    let result = env.try_crank();
+    assert!(
+        result.is_ok(),
+        "conf_filter_bps=0 should disable confidence check, but crank failed: {:?}",
+        result
+    );
+}
+
+/// Bug #2: expo.abs() overflows for i32::MIN, bypassing the exponent bound.
+///
+/// In optimized Rust builds, i32::MIN.abs() wraps to i32::MIN (negative),
+/// which can bypass the `> MAX_EXPO_ABS` check and produce nonsense scaling.
+/// The exponent bound must use a safe range check instead.
+///
+/// We verify this by setting up a Pyth oracle with expo = i32::MIN and
+/// confirming the oracle read is cleanly rejected (not a panic or bypass).
+#[test]
+fn test_pyth_expo_i32_min_rejected_safely() {
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Set oracle with expo = i32::MIN (should be rejected, not panic)
+    let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, i32::MIN, 1, 100);
+    env.svm
+        .set_account(
+            env.pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data.clone(),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            env.pyth_col,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Crank reads the oracle — must fail cleanly (not panic or bypass)
+    let result = env.try_crank();
+    assert!(
+        result.is_err(),
+        "Pyth oracle with expo=i32::MIN must be rejected, not accepted"
+    );
+}
+

@@ -1051,6 +1051,7 @@ pub mod ix {
             lp_idx: u16,
             user_idx: u16,
             size: i128,
+            limit_price_e6: u64, // 0 = no limit (backward compat)
         },
         UpdateAdmin {
             new_admin: Pubkey,
@@ -1287,10 +1288,17 @@ pub mod ix {
                     let lp_idx = read_u16(&mut rest)?;
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
+                    // Backward compat: limit_price_e6 is optional
+                    let limit_price_e6 = if rest.len() >= 8 {
+                        read_u64(&mut rest)?
+                    } else {
+                        0u64 // no limit
+                    };
                     Ok(Instruction::TradeCpi {
                         lp_idx,
                         user_idx,
                         size,
+                        limit_price_e6,
                     })
                 }
                 11 => {
@@ -1992,7 +2000,8 @@ pub mod oracle {
         }
 
         // SECURITY (C3): Bound exponent to prevent overflow in pow()
-        if expo.abs() > MAX_EXPO_ABS {
+        // Use explicit range check instead of abs() — i32::MIN.abs() overflows.
+        if expo < -MAX_EXPO_ABS || expo > MAX_EXPO_ABS {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
@@ -2007,14 +2016,16 @@ pub mod oracle {
         #[cfg(feature = "devnet")]
         let _ = (publish_time, max_staleness_secs, now_unix_ts);
 
-        // Confidence check (skip on devnet)
+        // Confidence check (skip on devnet; 0 = disabled)
         let price_u = price as u128;
         #[cfg(not(feature = "devnet"))]
         {
-            let lhs = (conf as u128) * 10_000;
-            let rhs = price_u * (conf_bps as u128);
-            if lhs > rhs {
-                return Err(PercolatorError::OracleConfTooWide.into());
+            if conf_bps != 0 {
+                let lhs = (conf as u128) * 10_000;
+                let rhs = price_u * (conf_bps as u128);
+                if lhs > rhs {
+                    return Err(PercolatorError::OracleConfTooWide.into());
+                }
             }
         }
         #[cfg(feature = "devnet")]
@@ -3342,15 +3353,17 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
 
+                // Reject misaligned deposits — dust would be silently donated
+                let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
+                if dust_check != 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
                 // Convert base tokens to units for engine
-                let (units, dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
-
-                // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
-                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+                let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
                 let engine = zc::engine_mut(&mut data)?;
                 // Canonical deposit-based materialization (spec §10.3).
@@ -3421,15 +3434,17 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
 
+                // Reject misaligned deposits — dust would be silently donated
+                let (_units_check, dust_check) = crate::units::base_to_units(fee_payment, config.unit_scale);
+                if dust_check != 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
                 // Convert base tokens to units for engine
-                let (units, dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
-
-                // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
-                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+                let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
                 let engine = zc::engine_mut(&mut data)?;
                 let idx = engine.free_head;
@@ -3496,15 +3511,17 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
 
+                // Reject misaligned deposits — dust would be silently donated
+                let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
+                if dust_check != 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
                 // Convert base tokens to units for engine
-                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
-
-                // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
-                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -3932,6 +3949,7 @@ pub mod processor {
                 lp_idx,
                 user_idx,
                 size,
+                limit_price_e6,
             } => {
                 // Phase 1: Updated account layout - lp_pda must be in accounts
                 accounts::expect_len(accounts, 8)?;
@@ -4103,6 +4121,21 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 drop(ctx_data);
+
+                // User-side slippage protection
+                if limit_price_e6 != 0 && ret.exec_size != 0 {
+                    if size > 0 {
+                        // User is buying — reject if exec price too high
+                        if ret.exec_price_e6 > limit_price_e6 {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                    } else {
+                        // User is selling — reject if exec price too low
+                        if ret.exec_price_e6 < limit_price_e6 {
+                            return Err(ProgramError::InvalidAccountData);
+                        }
+                    }
+                }
 
                 // Zero-fill: ABI-valid no-op when matcher returns exec_size == 0
                 // with FLAG_PARTIAL_OK. Skip engine call which rejects size_q == 0.
@@ -4308,10 +4341,16 @@ pub mod processor {
                 }
                 let amt_units = if resolved {
                     let frozen_slot = config.resolution_slot;
-                    // Best-effort touch (mirrors AdminForceCloseAccount)
-                    let _ = engine.touch_account_full(
+                    // Best-effort touch — but abort on CorruptState
+                    match engine.touch_account_full(
                         user_idx as usize, price, frozen_slot,
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(percolator::RiskError::CorruptState) => {
+                            return Err(map_risk_error(percolator::RiskError::CorruptState));
+                        }
+                        Err(_) => {} // same-epoch, overflow, etc. — fallback handles
+                    }
                     let funding_rate = compute_current_funding_rate(&config);
                     engine.close_account(user_idx, frozen_slot, price, funding_rate)
                         .or_else(|e| match e {
@@ -4393,15 +4432,17 @@ pub mod processor {
                 )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                // Reject misaligned deposits — dust would be silently donated
+                let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
+                if dust_check != 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
                 // Convert base tokens to units for engine
-                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
-
-                // Accumulate dust
-                let old_dust = state::read_dust_base(&data);
-                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
 
                 let clock = Clock::from_account_info(a_clock)?;
                 let engine = zc::engine_mut(&mut data)?;
@@ -4568,9 +4609,9 @@ pub mod processor {
                 if funding_horizon_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                if funding_inv_scale_notional_e6 == 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
+                // funding_inv_scale_notional_e6: reserved for future use.
+                // Not currently read by funding computation.
+                let _ = funding_inv_scale_notional_e6;
                 // Reject negative funding bounds — reversed clamp bounds panic
                 if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
                     || funding_max_bps_per_slot > percolator::MAX_ABS_FUNDING_BPS_PER_SLOT
@@ -4601,11 +4642,18 @@ pub mod processor {
                     }
                     state::write_config(&mut data, &config);
                 }
-                // Stamp funding rate from OLD config (pre-change params)
+                // Create engine-side boundary: accrue market to current slot
+                // with old rate, then stamp old rate. This ensures the interval
+                // [old_slot..now] uses the old funding params.
                 {
                     let old_rate = compute_current_funding_rate(&config);
                     let engine = zc::engine_mut(&mut data)?;
                     engine.funding_rate_bps_per_slot_last = old_rate;
+                    if oracle::is_hyperp_mode(&config) {
+                        let _ = engine.accrue_market_to(
+                            clock.slot, config.authority_price_e6,
+                        );
+                    }
                 }
 
                 config.funding_horizon_slots = funding_horizon_slots;
@@ -4613,6 +4661,12 @@ pub mod processor {
                 config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
+                // Stamp post-change funding rate for next interval
+                if oracle::is_hyperp_mode(&config) {
+                    let new_rate = compute_current_funding_rate(&config);
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_bps_per_slot_last = new_rate;
+                }
                 state::write_config(&mut data, &config);
             }
 
@@ -4730,13 +4784,19 @@ pub mod processor {
                 //   cap-width regardless of how many same-slot pushes occur.
                 //   The index only moves per-slot via clamp_toward_with_dt.
                 // Non-Hyperp: clamp against last_effective_price_e6 baseline.
-                // Stamp engine's funding rate from OLD config state before
-                // changing the mark. Creates a funding boundary so the next
-                // accrual uses the pre-push rate for the elapsed interval.
+                // Create engine-side boundary: accrue market to current slot
+                // before changing the mark. This advances engine.slot_last and
+                // fund_px_last so the interval [old_slot..now] uses the old rate,
+                // and the post-change interval starts clean.
                 if is_hyperp {
                     let old_rate = compute_current_funding_rate(&config);
                     let engine = zc::engine_mut(&mut data)?;
                     engine.funding_rate_bps_per_slot_last = old_rate;
+                    let push_clock2 = Clock::get()
+                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
+                    let _ = engine.accrue_market_to(
+                        push_clock2.slot, config.authority_price_e6,
+                    );
                 }
 
                 let clamp_base = config.last_effective_price_e6;
@@ -4801,6 +4861,13 @@ pub mod processor {
                     }
                     state::write_config(&mut data, &config);
                     config = state::read_config(&data);
+                    // Accrue engine to boundary before changing cap
+                    let old_rate = compute_current_funding_rate(&config);
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_bps_per_slot_last = old_rate;
+                    let _ = engine.accrue_market_to(
+                        clock.slot, config.authority_price_e6,
+                    );
                 }
 
                 // Hyperp markets must not set cap to 0 — it would freeze index
@@ -4882,6 +4949,15 @@ pub mod processor {
                         config.last_effective_price_e6 = new_index;
                         config.last_hyperp_index_slot = clock.slot;
                     }
+                    state::write_config(&mut data, &config);
+                    // Accrue engine to resolution boundary
+                    let old_rate = compute_current_funding_rate(&config);
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_bps_per_slot_last = old_rate;
+                    let _ = engine.accrue_market_to(
+                        clock.slot, config.authority_price_e6,
+                    );
+                    config = state::read_config(&data);
                 }
 
                 config.resolution_slot = clock.slot;
@@ -5312,8 +5388,15 @@ pub mod processor {
                 // Best-effort touch to settle K-pair PnL at settlement price.
                 // May fail for same-epoch accounts — that's fine,
                 // settle_and_close_resolved handles settlement independently.
+                // But CorruptState = real engine invariant violation — abort.
                 let frozen_slot = config.resolution_slot;
-                let _ = engine.touch_account_full(user_idx as usize, price, frozen_slot);
+                match engine.touch_account_full(user_idx as usize, price, frozen_slot) {
+                    Ok(()) => {}
+                    Err(percolator::RiskError::CorruptState) => {
+                        return Err(map_risk_error(percolator::RiskError::CorruptState));
+                    }
+                    Err(_) => {} // same-epoch, overflow, etc. — fallback handles
+                }
 
                 // Try canonical close first (handles stale-epoch accounts
                 // where touch_account_full already zeroed the position).
@@ -5437,6 +5520,9 @@ pub mod processor {
 
             Instruction::DepositFeeCredits { user_idx, amount } => {
                 // Direct fee-debt repayment (§10.3.1). Owner only.
+                // SECURITY: Read fee debt BEFORE the SPL transfer to reject
+                // overpayment. Without this, excess tokens become stranded
+                // vault surplus with no withdrawal path for the user.
                 accounts::expect_len(accounts, 6)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
@@ -5449,13 +5535,38 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
-                // Transfer tokens to vault BEFORE mutable slab borrow
+                // Phase 1: Read fee debt and validate (immutable borrow)
+                let (unit_scale, debt_units) = {
+                    let data = a_slab.try_borrow_data()?;
+                    slab_guard(program_id, a_slab, &data)?;
+                    require_initialized(&data)?;
+                    let cfg = state::read_config(&data);
+                    let engine = zc::engine_ref(&data)?;
+                    check_idx(engine, user_idx)?;
+                    let owner = engine.accounts[user_idx as usize].owner;
+                    if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
+                    let fc = engine.accounts[user_idx as usize].fee_credits.get();
+                    let debt = if fc < 0 { fc.unsigned_abs() } else { 0u128 };
+                    (cfg.unit_scale, debt)
+                };
+                // data (Ref) dropped here — releases immutable borrow
+
+                // Phase 2: Reject misaligned or overpayment
+                let (units, dust) = crate::units::base_to_units(amount, unit_scale);
+                if dust != 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
+                if (units as u128) > debt_units {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                // Phase 3: SPL transfer (only after validation)
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
+                // Phase 4: Engine deposit_fee_credits (mutable borrow)
                 let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -5465,20 +5576,12 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
-
-                // Convert to units and handle dust
-                let (units, dust) = crate::units::base_to_units(amount, config.unit_scale);
+                let (units2, dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let old_dust = state::read_dust_base(&data);
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-                check_idx(engine, user_idx)?;
-                let owner = engine.accounts[user_idx as usize].owner;
-                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
-                    return Err(PercolatorError::EngineUnauthorized.into());
-                }
-
-                engine.deposit_fee_credits(user_idx, units as u128, clock.slot)
+                engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
 

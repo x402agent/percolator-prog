@@ -687,26 +687,24 @@ fn test_liquidate_blocked_on_resolved_market() {
 /// Resolved crank must forgive sub-scale dust, leaving dust_base == 0.
 /// This ensures CloseSlab can eventually succeed after resolution.
 #[test]
-fn test_resolved_crank_sweeps_dust_to_zero() {
+fn test_resolved_crank_dust_base_stays_zero_with_aligned_deposits() {
     program_path();
     let mut env = TestEnv::new();
 
     // Initialize with unit_scale=1000 (1000 base tokens = 1 engine unit)
+    // Misaligned deposits now rejected → dust_base stays 0 through lifecycle.
     env.init_market_full(0, 1000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let user = Keypair::new();
-    // With unit_scale=1000, need 100*1000=100_000 base for min_initial_deposit
     let user_idx = env.init_user_with_fee(&user, 100_000);
 
-    // Deposit an amount that creates dust: 10_000_500 = 10_000 units + 500 dust
-    env.deposit(&user, user_idx, 10_000_500);
+    // Aligned deposit: no dust created
+    env.deposit(&user, user_idx, 10_000_000);
 
-    // Verify dust_base is non-zero (500 sub-scale remainder)
     let read_dust_base = |svm: &LiteSVM, slab: &Pubkey| -> u64 {
         let slab_data = svm.get_account(slab).unwrap().data;
-        // dust_base is at RESERVED_OFF(48) + 16 = offset 64 in slab
         const DUST_BASE_OFF: usize = 64;
         u64::from_le_bytes(
             slab_data[DUST_BASE_OFF..DUST_BASE_OFF + 8]
@@ -715,35 +713,23 @@ fn test_resolved_crank_sweeps_dust_to_zero() {
         )
     };
     let dust_after_deposit = read_dust_base(&env.svm, &env.slab);
-    assert_eq!(dust_after_deposit, 500, "Deposit should create 500 dust at unit_scale=1000");
+    assert_eq!(dust_after_deposit, 0, "Aligned deposit must not create dust");
 
-    // Advance slot and crank to settle state
     env.set_slot(200);
     env.crank();
-
-    // Close the user account so no positions remain
     env.close_account(&user, user_idx);
 
-    // Dust should still be present after close_account (close returns units, not dust)
-    let dust_after_close = read_dust_base(&env.svm, &env.slab);
-    assert_eq!(dust_after_close, 500, "Dust should persist after close_account");
-
-    // Set oracle authority and push a settlement price for resolution
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 138_000_000, 200).unwrap();
-
-    // Resolve the market
     env.try_resolve_market(&admin).unwrap();
 
-    // Crank the resolved market — should sweep/forgive dust
     env.set_slot(300);
     env.crank();
 
-    // dust_base must be zero after resolved crank
     let dust_after_resolved_crank = read_dust_base(&env.svm, &env.slab);
     assert_eq!(
         dust_after_resolved_crank, 0,
-        "Resolved crank must forgive sub-scale dust, leaving dust_base == 0"
+        "dust_base must be zero after resolved crank with aligned deposits"
     );
 }
 

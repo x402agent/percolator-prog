@@ -1189,51 +1189,45 @@ fn test_attack_topup_insurance_correct_accounting() {
 /// correctly sweeps dust to insurance fund. Attacker cannot prevent dust sweep.
 /// Non-vacuous: asserts insurance increases by swept dust units.
 #[test]
-fn test_attack_dust_sweep_to_insurance_on_crank() {
+fn test_dust_sweep_to_insurance_on_crank_with_aligned_deposits() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Use unit_scale=1000 so deposits create dust
+    // Use unit_scale=1000. Misaligned deposits are now rejected.
+    // Dust can still accumulate from other sources (e.g., withdrawal rounding).
+    // This test verifies aligned deposits don't create dust and crank is stable.
     env.init_market_full(0, 1000, 0);
 
     let lp_owner = Keypair::new();
-    // With unit_scale=1000, need 100*1000=100_000 base for min_initial_deposit
     let lp_idx = env.init_user_with_fee(&lp_owner, 100_000);
 
     let user_owner = Keypair::new();
     let user_idx = env.init_user_with_fee(&user_owner, 100_000);
 
-    // Deposit 1500 with unit_scale=1000: 1 unit + 500 dust
-    env.deposit(&lp_owner, lp_idx, 1500);
-    env.deposit(&user_owner, user_idx, 1500);
+    // Aligned deposits: 2000 base = exactly 2 units, no dust
+    env.deposit(&lp_owner, lp_idx, 2000);
+    env.deposit(&user_owner, user_idx, 2000);
 
-    // Read insurance balance before crank
     let insurance_before = env.read_insurance_balance();
-
-    // Crank - should sweep dust if dust >= unit_scale
-    // Two deposits of 500 dust = 1000 dust >= 1000 scale = 1 unit swept
     env.crank();
-
     let insurance_after = env.read_insurance_balance();
 
-    // Verify dust was swept to insurance (1000 dust / 1000 scale = 1 unit)
-    assert!(
-        insurance_after > insurance_before,
-        "Dust sweep should increase insurance: before={}, after={} \
-         (2x500 dust = 1000 >= unit_scale 1000 = 1 unit expected)",
+    // No dust was created, so insurance should not change from dust sweep
+    assert_eq!(
+        insurance_after, insurance_before,
+        "Aligned deposits should not create dust to sweep: before={}, after={}",
         insurance_before, insurance_after
     );
 
-    // Vault balance from SPL should include both deposits
+    // Vault balance: 2 init deposits (100_000 each) + 2 deposits (2000 each) = 204000
     let spl_vault_balance = {
         let vault_data = env.svm.get_account(&env.vault).unwrap().data;
         let vault_account = TokenAccount::unpack(&vault_data).unwrap();
         vault_account.amount
     };
-    // vault = 2 init deposits (100_000 each) + 2 deposits (1500 each) = 203000
     assert_eq!(
-        spl_vault_balance, 203_000,
-        "ATTACK: SPL vault should hold all deposited base tokens (including inits)"
+        spl_vault_balance, 204_000,
+        "SPL vault should hold all deposited base tokens"
     );
 }
 

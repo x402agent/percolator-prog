@@ -1118,33 +1118,26 @@ fn test_update_config_rejects_zero_horizon() {
 
 /// Spec: UpdateConfig rejects funding_inv_scale_notional_e6 = 0 (would cause division by zero).
 #[test]
-fn test_update_config_rejects_zero_inv_scale() {
+/// funding_inv_scale_notional_e6 is reserved (not read by funding computation).
+/// Zero should be accepted since the field has no runtime effect.
+fn test_update_config_accepts_zero_inv_scale_reserved_field() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-
-    // Capture config snapshot before rejected operation
-    let config_before = env.read_update_config_snapshot();
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let result = env.try_update_config_with_params(
         &admin,
         3600,   // funding_horizon_slots (valid)
-        0u128,  // funding_inv_scale_notional_e6 = 0 (invalid)
+        0u128,  // funding_inv_scale_notional_e6 = 0 (reserved, accepted)
         1000,
         0u128,
         1_000_000_000_000_000u128,
     );
     assert!(
-        result.is_err(),
-        "UpdateConfig must reject funding_inv_scale_notional_e6 = 0"
-    );
-
-    // Config must be unchanged after rejection
-    let config_after = env.read_update_config_snapshot();
-    assert_eq!(
-        config_after, config_before,
-        "config must not change on rejected UpdateConfig (zero inv_scale)"
+        result.is_ok(),
+        "UpdateConfig must accept funding_inv_scale_notional_e6 = 0 (reserved field): {:?}",
+        result,
     );
 }
 

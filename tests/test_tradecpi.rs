@@ -5122,3 +5122,145 @@ fn test_zero_fill_must_not_advance_circuit_breaker_baseline() {
     );
 }
 
+// ── TradeCpi slippage protection (limit_price_e6) ──────────────────────
+
+/// Slippage: buy with high limit (above any realistic exec_price) should succeed.
+/// The VAMM matcher adds spread above oracle price for buys, so the limit
+/// must be above the VAMM exec_price, not just the oracle price.
+#[test]
+fn test_tradecpi_slippage_buy_limit_generous_succeeds() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Buy (size > 0), limit = 200M (well above any VAMM spread) → should succeed
+    let result = env.try_trade_cpi_with_limit(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000i128, 200_000_000u64,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Buy with generous limit should succeed: {:?}", result);
+}
+
+/// Slippage: buy with limit below oracle price should be rejected.
+/// The VAMM exec_price for buys is at or above oracle, so a limit below
+/// oracle will always reject.
+#[test]
+fn test_tradecpi_slippage_buy_limit_below_oracle_rejected() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Buy (size > 0), limit = 100M (well below oracle 138M + VAMM spread) → reject
+    let result = env.try_trade_cpi_with_limit(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000i128, 100_000_000u64,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_err(), "Buy with limit below oracle must be rejected");
+}
+
+/// Slippage: sell with low limit (below any realistic exec_price) should succeed.
+/// The VAMM matcher discounts below oracle price for sells, so the limit
+/// must be below the VAMM exec_price.
+#[test]
+fn test_tradecpi_slippage_sell_limit_low_succeeds() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Sell (size < 0), limit = 1 (well below VAMM exec_price) → should succeed
+    let result = env.try_trade_cpi_with_limit(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        -1_000_000i128, 1u64,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Sell with low limit should succeed: {:?}", result);
+}
+
+/// Slippage: sell with limit above oracle price should be rejected.
+/// The VAMM exec_price for sells is at or below oracle, so a limit above
+/// oracle will always reject.
+#[test]
+fn test_tradecpi_slippage_sell_limit_above_oracle_rejected() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Sell (size < 0), limit = 200M (above any exec_price for sells) → reject
+    let result = env.try_trade_cpi_with_limit(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        -1_000_000i128, 200_000_000u64,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_err(), "Sell with limit above oracle must be rejected");
+}
+
+/// Slippage: limit_price_e6 = 0 means no limit (backward compat).
+#[test]
+fn test_tradecpi_slippage_zero_limit_is_no_limit() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // limit = 0 should mean "no slippage check" → always succeeds
+    let result = env.try_trade_cpi_with_limit(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000i128, 0u64,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "limit_price_e6=0 should be no-op (backward compat): {:?}", result);
+}
+
+/// Slippage: old wire format (no limit field) is backward compatible.
+#[test]
+fn test_tradecpi_slippage_old_wire_format_backward_compat() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Use OLD encode_trade_cpi (no limit field) — must still work
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx,
+        1_000_000i128,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Old wire format (no limit) must still work: {:?}", result);
+}
+

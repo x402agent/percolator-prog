@@ -1482,33 +1482,21 @@ fn test_attack_dust_accumulation_theft() {
     env.init_market_full(0, 1000, 0); // unit_scale = 1000
 
     let user = Keypair::new();
-    // With unit_scale=1000, need 100*1000=100_000 base for min_initial_deposit
     let user_idx = env.init_user_with_fee(&user, 100_000);
 
-    let vault_before = env.vault_balance();
-
-    // Deposit amounts that create dust: 1500 % 1000 = 500 dust each
-    for _ in 0..5 {
-        env.deposit(&user, user_idx, 1_500);
-    }
-
-    let vault_after = env.vault_balance();
-    let total_deposited = vault_after - vault_before;
-
-    // User should only be credited for full units (5 * 1 unit = 5000 base)
-    // Remaining 500 * 5 = 2500 dust is tracked separately
-    let capital = env.read_account_capital(user_idx);
-    println!(
-        "Capital credited: {} (total deposited: {})",
-        capital, total_deposited
+    // Misaligned deposits (1500 % 1000 = 500 dust) must now be rejected
+    let result = env.try_deposit(&user, user_idx, 1_500);
+    assert!(
+        result.is_err(),
+        "ATTACK: Misaligned deposit must be rejected (prevents dust donation)"
     );
 
-    // Capital should be less than total deposited (dust not credited)
-    // With unit_scale=1000, capital is in units, so 5 * 1500 / 1000 = 7 units
-    // Dust cannot be extracted by the user
+    // Aligned deposit succeeds
+    let result = env.try_deposit(&user, user_idx, 1_000);
     assert!(
-        total_deposited == 7_500,
-        "Vault should have all 7500 deposited"
+        result.is_ok(),
+        "Aligned deposit (1000 base) should succeed: {:?}",
+        result,
     );
 }
 
@@ -1950,21 +1938,21 @@ fn test_attack_high_unit_scale_dust_boundary() {
     env.init_market_full(0, 1_000_000, 0); // 1M base per unit
 
     let user = Keypair::new();
-    // With unit_scale=1M, need 100*1M=100M base for min_initial_deposit
     let user_idx = env.init_user_with_fee(&user, 100_000_000);
 
-    // Deposit less than one full unit
-    env.deposit(&user, user_idx, 500_000); // 0.5 units = all dust
-
-    let capital = env.read_account_capital(user_idx);
-    // With init deposit of 100M (=100 units) + 500k (=0 units), capital is 100
-    assert_eq!(capital, 100, "Init deposit gives 100 units; sub-unit deposit adds 0");
-
-    // Cannot withdraw anything (no capital)
-    let result = env.try_withdraw(&user, user_idx, 500_000);
+    // Sub-unit deposit (500k < 1M unit_scale) must now be rejected
+    let result = env.try_deposit(&user, user_idx, 500_000);
     assert!(
         result.is_err(),
-        "ATTACK: Cannot withdraw dust that wasn't credited as capital"
+        "ATTACK: Sub-unit deposit must be rejected (prevents dust donation)"
+    );
+
+    // Aligned deposit succeeds
+    let result = env.try_deposit(&user, user_idx, 1_000_000);
+    assert!(
+        result.is_ok(),
+        "Aligned deposit (1M base) should succeed: {:?}",
+        result,
     );
 }
 
@@ -2398,37 +2386,29 @@ fn test_attack_config_zero_funding_horizon() {
     assert_eq!(vault_after, vault_before, "Rejected UpdateConfig must not move vault funds");
 }
 
-/// ATTACK: UpdateConfig with funding_inv_scale_notional_e6 = 0 (division by zero).
-/// Expected: Rejected with InvalidConfigParam.
+/// funding_inv_scale_notional_e6 is reserved (not read by funding computation).
+/// Zero is accepted — no division-by-zero risk since the field is unused.
 #[test]
-fn test_attack_config_zero_inv_scale() {
+fn test_config_zero_inv_scale_accepted_reserved() {
     program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let cfg_before = env.read_update_config_snapshot();
-    let vault_before = env.vault_balance();
     let result = env.try_update_config_with_params(
         &admin,
         3600, // normal horizon
-        0,    // inv_scale = 0 (invalid)
+        0,    // inv_scale = 0 (reserved, accepted)
         1000, // normal alpha
         0,
         u128::MAX,
     );
     assert!(
-        result.is_err(),
-        "ATTACK: Zero inv_scale should be rejected (InvalidConfigParam)"
+        result.is_ok(),
+        "Zero inv_scale should be accepted (reserved field): {:?}",
+        result,
     );
-    let cfg_after = env.read_update_config_snapshot();
-    let vault_after = env.vault_balance();
-    assert_eq!(
-        cfg_after, cfg_before,
-        "Rejected UpdateConfig must not mutate funding/threshold config"
-    );
-    assert_eq!(vault_after, vault_before, "Rejected UpdateConfig must not move vault funds");
 }
 
 /// ATTACK: Setting oracle authority to [0;32] disables authority price and clears stored price.

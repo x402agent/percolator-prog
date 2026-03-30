@@ -5,7 +5,7 @@
 
 use percolator::{I128, MAX_ACCOUNTS, U128};
 use percolator_prog::{
-    constants::{MAGIC, VERSION},
+    constants::MAGIC,
     error::PercolatorError,
     oracle,
     processor::process_instruction,
@@ -474,7 +474,7 @@ fn test_init_market() {
 
     let header = state::read_header(&f.slab.data);
     assert_eq!(header.magic, MAGIC);
-    assert_eq!(header.version, VERSION);
+    assert_eq!(header.version, 0);
 
     let engine = zc::engine_ref(&f.slab.data).unwrap();
     assert_eq!(engine.params.max_accounts, MAX_ACCOUNTS as u64);
