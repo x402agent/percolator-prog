@@ -13071,6 +13071,86 @@ fn test_attack_deposit_to_lp_wrong_owner() {
     );
 }
 
+/// ATTACK: Settlement guard bypass via cap=0 + PushOraclePrice baseline poisoning.
+///
+/// If admin can set oracle_price_cap to 0 on a non-Hyperp market with
+/// min_oracle_price_cap > 0, they can push arbitrary prices that overwrite
+/// last_effective_price_e6, then resolve against the poisoned baseline.
+/// The immutable floor check in ResolveMarket would trivially pass because
+/// both authority_price and last_effective_price are the same arbitrary value.
+///
+/// Fix: non-Hyperp SetOraclePriceCap rejects cap=0 when min floor is set.
+#[test]
+fn test_attack_settlement_guard_bypass_cap_zero_poisoning() {
+    program_path();
+
+    let mut env = TestEnv::new();
+
+    // Init market with non-zero min_oracle_price_cap_e2bps = 10_000 (1%)
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            100_000_000_000_000_000_000u128, // max_maintenance_fee
+            10_000_000_000_000_000u128,       // max_insurance_floor
+            10_000u64,                        // min_oracle_price_cap_e2bps = 1%
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init market with min_cap");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Step 1: try to set cap to 0 to disable clamping
+    let result = env.try_set_oracle_price_cap(&admin, 0);
+    assert!(
+        result.is_err(),
+        "SetOraclePriceCap(0) must be rejected when min_oracle_price_cap > 0 (prevents settlement bypass)"
+    );
+
+    // Verify cap above floor is accepted
+    let result = env.try_set_oracle_price_cap(&admin, 10_000);
+    assert!(
+        result.is_ok(),
+        "SetOraclePriceCap at floor should succeed: {:?}",
+        result,
+    );
+}
+
 /// ATTACK: i128::MIN trade size overflows -size_q (unary negation).
 ///
 /// In BPF release builds (overflow checks off), -i128::MIN wraps to i128::MIN,

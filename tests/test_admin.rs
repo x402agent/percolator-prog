@@ -311,12 +311,12 @@ fn test_init_market_admin_limits_enforced() {
     let result = env.try_set_oracle_price_cap(&admin, 4999);
     assert!(result.is_err(), "Cap below floor should fail");
 
-    // SetOraclePriceCap: zero (disabled) is always allowed
+    // SetOraclePriceCap: zero is rejected when min floor is set
+    // (prevents settlement guard bypass via baseline poisoning)
     let result = env.try_set_oracle_price_cap(&admin, 0);
     assert!(
-        result.is_ok(),
-        "Zero cap (disabled) should succeed: {:?}",
-        result
+        result.is_err(),
+        "Cap=0 must be rejected when min_oracle_price_cap > 0 (settlement guard)"
     );
 
     println!("INIT MARKET ADMIN LIMITS ENFORCED: PASSED");

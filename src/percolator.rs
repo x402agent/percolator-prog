@@ -4860,6 +4860,17 @@ pub mod processor {
                 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                // Non-Hyperp: cap=0 disables clamping, but if the immutable
+                // floor is set, disabling clamping would let PushOraclePrice
+                // walk last_effective_price_e6 arbitrarily, poisoning the
+                // baseline that ResolveMarket checks against. Reject cap=0
+                // when the floor is non-zero.
+                if !is_hyperp
+                    && max_change_e2bps == 0
+                    && config.min_oracle_price_cap_e2bps != 0
+                {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 config.oracle_price_cap_e2bps = max_change_e2bps;
                 // Stamp post-change funding rate for next interval
