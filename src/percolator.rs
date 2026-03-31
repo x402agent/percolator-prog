@@ -5556,6 +5556,12 @@ pub mod processor {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
+                    // Block on resolved markets — deposit_fee_credits advances
+                    // engine.current_slot, which bricks WithdrawCollateral's
+                    // touch_account_full(frozen_slot) time monotonicity check.
+                    if state::is_resolved(&data) {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
                     let cfg = state::read_config(&data);
                     let engine = zc::engine_ref(&data)?;
                     check_idx(engine, user_idx)?;
@@ -5569,9 +5575,9 @@ pub mod processor {
                 };
                 // data (Ref) dropped here — releases immutable borrow
 
-                // Phase 2: Reject misaligned or overpayment
+                // Phase 2: Reject zero, misaligned, or overpayment
                 let (units, dust) = crate::units::base_to_units(amount, unit_scale);
-                if dust != 0 {
+                if units == 0 || dust != 0 {
                     return Err(ProgramError::InvalidArgument);
                 }
                 if (units as u128) > debt_units {
