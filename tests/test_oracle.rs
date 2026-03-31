@@ -1196,26 +1196,27 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
         rate_new, k_long_after, k_short_after
     );
 
-    // Assertions:
-    //
-    // (A) If old rate was non-zero, K coefficients must have changed
-    //     (proving accrue_market_to ran during UpdateConfig).
-    if rate_old != 0 {
-        let k_long_delta = k_long_after.wrapping_sub(k_long_before);
-        let k_short_delta = k_short_after.wrapping_sub(k_short_before);
-        assert!(
-            k_long_delta != 0 || k_short_delta != 0,
-            "Non-zero stored rate {} must cause K coefficient change during UpdateConfig: \
-             K_long delta={} K_short delta={}",
-            rate_old, k_long_delta, k_short_delta
-        );
-        println!(
-            "   K deltas: long={} short={} (accrual happened at old rate)",
-            k_long_delta, k_short_delta
-        );
-    } else {
-        println!("   Stored rate was 0 -- no funding accrual (zero premium)");
-    }
+    // Precondition: the old rate MUST be non-zero for this test to be meaningful.
+    // If rate_old == 0, the test setup failed to establish a premium.
+    assert_ne!(
+        rate_old, 0,
+        "Precondition: stored funding rate must be non-zero to test anti-retroactivity"
+    );
+
+    // (A) K coefficients must have changed — proving accrue_market_to ran
+    // during UpdateConfig using the old stored rate.
+    let k_long_delta = k_long_after.wrapping_sub(k_long_before);
+    let k_short_delta = k_short_after.wrapping_sub(k_short_before);
+    assert!(
+        k_long_delta != 0 || k_short_delta != 0,
+        "Non-zero stored rate {} must cause K coefficient change during UpdateConfig: \
+         K_long delta={} K_short delta={}",
+        rate_old, k_long_delta, k_short_delta
+    );
+    println!(
+        "   K deltas: long={} short={} (accrual happened at old rate)",
+        k_long_delta, k_short_delta
+    );
 
     // (B) Stored rate should now reflect new config (k=2000).
     //     If the premium is non-zero, doubling k should change the rate.
