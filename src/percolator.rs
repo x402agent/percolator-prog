@@ -4812,7 +4812,10 @@ pub mod processor {
                     config.last_mark_push_slot = push_clock.slot as u128;
                 } else {
                     config.authority_timestamp = timestamp;
-                    config.last_effective_price_e6 = clamped;
+                    // Do NOT write last_effective_price_e6 here.
+                    // That baseline must only be set by external oracle reads
+                    // (crank/trade/withdraw) so admin can't poison it to bypass
+                    // the settlement circuit breaker in ResolveMarket.
                 }
                 // Stamp post-change funding rate for next interval
                 if is_hyperp {
@@ -4938,9 +4941,13 @@ pub mod processor {
                 // so admin can't bypass by setting cap to 0 first.
                 // Hyperp: admin IS the price source, no external baseline.
                 if !oracle::is_hyperp_mode(&config)
-                    && config.last_effective_price_e6 != 0
                     && config.min_oracle_price_cap_e2bps != 0
                 {
+                    // Require at least one external oracle read before resolution.
+                    // Without a baseline, the settlement guard has nothing to compare against.
+                    if config.last_effective_price_e6 == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
                     let clamped = oracle::clamp_oracle_price(
                         config.last_effective_price_e6,
                         config.authority_price_e6,

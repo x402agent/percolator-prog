@@ -1062,13 +1062,16 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
+    // Crank first to establish external oracle baseline
+    env.crank();
+
     // Set oracle authority and cap
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .expect("oracle authority setup must succeed");
     env.try_set_oracle_price_cap(&admin, 100)
-        .expect("oracle price cap setup must succeed"); // 1% per slot
+        .expect("oracle price cap setup must succeed"); // 0.01% per slot
 
-    // Push initial price
+    // Push initial price (clamped against external baseline $138)
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
     env.set_slot(101);
@@ -2601,6 +2604,9 @@ fn test_attack_oracle_cap_ultra_restrictive() {
     env.init_market_with_invert(0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // Crank first to establish external oracle baseline
+    env.crank();
+
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .expect("oracle authority setup must succeed");
 
@@ -2608,7 +2614,7 @@ fn test_attack_oracle_cap_ultra_restrictive() {
     env.try_set_oracle_price_cap(&admin, 1)
         .expect("oracle price cap setup must succeed");
 
-    // Push initial price
+    // Push initial price (clamped against external baseline $138)
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
     env.set_slot(200);
@@ -13252,5 +13258,107 @@ fn test_trade_nocpi_user_bilateral_allowed_by_spec() {
     // Conservation: vault unchanged (no token flow in trade)
     let vault = env.vault_balance();
     assert!(vault > 0, "Vault must still hold deposits");
+}
+
+/// ATTACK: Settlement guard bypass via first-push baseline poisoning.
+///
+/// On non-Hyperp markets, PushOraclePrice must NOT overwrite
+/// last_effective_price_e6 — only external oracle reads (crank/trade)
+/// should set the baseline. Otherwise the admin can push an arbitrary
+/// price, poisoning the baseline, then resolve against it.
+#[test]
+fn test_attack_first_push_does_not_poison_baseline() {
+    program_path();
+
+    let mut env = TestEnv::new();
+
+    // Init with non-zero min_oracle_price_cap = 10_000 (1%)
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            100_000_000_000_000_000_000u128,
+            10_000_000_000_000_000u128,
+            10_000u64, // min_oracle_price_cap = 1%
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Crank to establish external oracle baseline ($138)
+    env.crank();
+
+    let baseline = env.read_last_effective_price();
+    assert_eq!(baseline, 138_000_000, "Baseline should be $138 from oracle");
+
+    // Set authority and push a very different price ($500)
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 500_000_000, 100).unwrap();
+
+    // Baseline must NOT have moved — push doesn't write last_effective_price_e6
+    let baseline_after_push = env.read_last_effective_price();
+    assert_eq!(
+        baseline_after_push, baseline,
+        "Authority push must not overwrite external oracle baseline: before={} after={}",
+        baseline, baseline_after_push
+    );
+
+    // Even after many pushes with escalating timestamps, baseline stays put
+    for i in 0..50 {
+        env.set_slot(200 + i * 10);
+        let _ = env.try_push_oracle_price(&admin, 500_000_000, 0);
+    }
+    let baseline_after_burst = env.read_last_effective_price();
+    assert_eq!(
+        baseline_after_burst, baseline,
+        "Burst of authority pushes must not walk baseline: before={} after={}",
+        baseline, baseline_after_burst
+    );
+
+    // authority_price_e6 is clamped to within 1 cap-width of baseline
+    let auth_price = env.read_authority_price();
+    let max_delta = baseline as u128 * 10_000 / 1_000_000; // 1% of baseline
+    let upper = baseline + max_delta as u64;
+    assert!(
+        auth_price <= upper,
+        "Authority price must be clamped within cap of baseline: auth={} upper={}",
+        auth_price, upper
+    );
 }
 
