@@ -4936,6 +4936,16 @@ pub mod processor {
                 if config.authority_price_e6 == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
+                // Non-Hyperp: require the settlement push to be fresh.
+                // Prevents parking an old price in state and resolving later.
+                if !oracle::is_hyperp_mode(&config) {
+                    let clock_fresh = Clock::from_account_info(a_clock)?;
+                    let push_age = clock_fresh.unix_timestamp
+                        .saturating_sub(config.authority_timestamp);
+                    if push_age < 0 || push_age as u64 > config.max_staleness_secs {
+                        return Err(PercolatorError::OracleStale.into());
+                    }
+                }
                 // Non-Hyperp: settlement price must be within circuit-breaker
                 // bounds of a FRESH external oracle read — not stored baseline
                 // which can be authority-influenced. Uses the immutable
