@@ -13551,3 +13551,97 @@ fn test_attack_authority_push_crank_does_not_ratchet_baseline() {
     );
 }
 
+/// ATTACK: Caller supplies bad oracle to bypass fresh external anchor.
+///
+/// When authority pricing is active and circuit breaker is configured,
+/// the external oracle read MUST succeed. Otherwise the caller could
+/// supply a stale/wrong oracle to skip the baseline refresh, using the
+/// authority price without a fresh external bound.
+#[test]
+fn test_attack_bad_oracle_with_authority_requires_external_success() {
+    program_path();
+
+    let mut env = TestEnv::new();
+
+    // Init with non-zero min cap so circuit breaker is configured
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_with_limits(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            100_000_000_000_000_000_000u128,
+            10_000_000_000_000_000u128,
+            10_000u64, // 1% min cap — circuit breaker configured
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Establish baseline via crank with good oracle
+    env.crank();
+
+    // Enable authority and push a fresh price
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
+
+    // Advance slot first (set_slot restores oracle data)
+    env.set_slot(200);
+
+    // THEN poison the oracle account data so external read fails
+    env.svm
+        .set_account(
+            env.pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; 10], // Too short for Pyth — will fail
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Try to crank with bad oracle + authority pricing.
+    // Should FAIL because circuit breaker requires external oracle success.
+    let result = env.try_crank();
+    assert!(
+        result.is_err(),
+        "Crank with bad oracle must fail when circuit breaker is configured + authority active"
+    );
+}
+

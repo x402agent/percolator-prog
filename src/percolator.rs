@@ -2285,6 +2285,11 @@ pub mod oracle {
     /// oracle reads (Pyth/Chainlink). Authority-pushed prices are used as the
     /// returned effective price but do NOT contaminate the baseline. This
     /// prevents the admin from ratcheting the baseline via push+crank interleaving.
+    ///
+    /// When the circuit breaker is configured (min_oracle_price_cap_e2bps > 0),
+    /// the external oracle read MUST succeed whenever authority pricing is used.
+    /// This prevents callers from bypassing the fresh external anchor by
+    /// supplying a bad/stale oracle account.
     pub fn read_price_clamped(
         config: &mut super::state::MarketConfig,
         price_ai: &AccountInfo,
@@ -2313,6 +2318,12 @@ pub mod oracle {
 
         // Return the authority price if fresh, otherwise the external price
         if let Some(auth_price) = read_authority_price(config, now_unix_ts, config.max_staleness_secs) {
+            // When circuit breaker is configured, require the external oracle
+            // to have succeeded. Otherwise the caller can bypass the fresh
+            // external anchor by supplying a bad oracle account.
+            if config.min_oracle_price_cap_e2bps != 0 && external.is_err() {
+                return external; // propagate the external oracle error
+            }
             // Authority price is clamped against the (now-updated) external baseline
             let clamped_auth = clamp_oracle_price(
                 config.last_effective_price_e6,
