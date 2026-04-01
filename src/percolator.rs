@@ -4482,9 +4482,6 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
-                // With unsafe_close: skip all validation and zeroing (CU limit)
-                // Account will be garbage collected after lamports are drained
-                #[cfg(not(feature = "unsafe_close"))]
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     slab_guard(program_id, a_slab, &data)?;
