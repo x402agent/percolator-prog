@@ -2174,7 +2174,13 @@ pub mod oracle {
                 conf_bps,
             )?
         } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
-            read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)?
+            // Chainlink support is devnet-only. The parser uses hardcoded offsets
+            // for a specific devnet layout with no discriminator check — a valid
+            // Chainlink-owned account with a different layout could be misread.
+            #[cfg(feature = "devnet")]
+            { read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)? }
+            #[cfg(not(feature = "devnet"))]
+            { return Err(ProgramError::IllegalOwner); }
         } else {
             // In test mode, try Pyth format first (for existing tests)
             #[cfg(feature = "test")]
