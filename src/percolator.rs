@@ -6001,11 +6001,13 @@ pub mod processor {
                     config = state::read_config(&data);
                 }
 
-                // Settlement price = last oracle price from engine
+                // Settlement price = last oracle price from engine.
+                // Reject if no real oracle read ever happened (sentinel price=1
+                // from non-Hyperp init, or price=0 from uninitialized state).
                 let last_price = {
                     let engine = zc::engine_ref(&data)?;
                     let p = engine.last_oracle_price;
-                    if p == 0 {
+                    if p <= 1 {
                         return Err(PercolatorError::OracleInvalid.into());
                     }
                     config.resolution_slot = engine.last_crank_slot;
