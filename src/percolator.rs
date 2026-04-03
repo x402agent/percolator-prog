@@ -727,7 +727,12 @@ pub mod verify {
         fee_paid: u64,
         mark_min_fee: u64,
     ) -> u64 {
-        if old == 0 { return price; }
+        // First update: seed EWMA to price, but only if fee threshold is met.
+        // This prevents dust trades from bootstrapping the mark on non-Hyperp markets.
+        if old == 0 {
+            if mark_min_fee > 0 && fee_paid < mark_min_fee { return 0; }
+            return price;
+        }
         let dt = now_slot.saturating_sub(last_slot);
         if dt == 0 { return old; }
         if halflife_slots == 0 { return price; }
@@ -1262,6 +1267,12 @@ pub mod ix {
                     } else {
                         0u64 // disabled
                     };
+                    // Reject trailing bytes to prevent silent misparsing.
+                    // All optional fields are parsed — leftover data means the
+                    // client sent a malformed or future-version payload.
+                    if !rest.is_empty() {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     Ok(Instruction::InitMarket {
                         admin,
                         collateral_mint,
@@ -1858,7 +1869,7 @@ pub mod state {
         // ========================================
         // Fee-Weighted EWMA
         // ========================================
-        /// Minimum fee (in quote atomic units) for full mark EWMA weight.
+        /// Minimum fee (in engine units, same as insurance_fund.balance) for full mark EWMA weight.
         /// Trades with fee below this get proportionally reduced alpha.
         /// 0 = disabled (all trades get full weight, backward compat).
         /// Set at InitMarket, immutable.
@@ -4220,14 +4231,20 @@ pub mod processor {
                         let delta = ins_after.saturating_sub(ins_before);
                         core::cmp::min(delta, u64::MAX as u128) as u64
                     } else { 0u64 };
+                    let old_ewma = config.mark_ewma_e6;
                     config.mark_ewma_e6 = crate::verify::ewma_update(
-                        config.mark_ewma_e6, clamped_price,
+                        old_ewma, clamped_price,
                         config.mark_ewma_halflife_slots,
                         config.mark_ewma_last_slot, clock.slot,
                         fee_paid_nocpi,
                         config.mark_min_fee,
                     );
-                    config.mark_ewma_last_slot = clock.slot;
+                    // Only update the EWMA clock when the mark actually moved.
+                    // Zero-weight trades must not refresh the clock — that would
+                    // shrink future dt and damp legitimate updates.
+                    if config.mark_ewma_e6 != old_ewma {
+                        config.mark_ewma_last_slot = clock.slot;
+                    }
                     engine.funding_rate_bps_per_slot_last =
                         compute_current_funding_rate(&config);
                 }
@@ -4517,8 +4534,9 @@ pub mod processor {
                             let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else { 0u64 };
+                        let old_ewma_cpi = config.mark_ewma_e6;
                         config.mark_ewma_e6 = crate::verify::ewma_update(
-                            config.mark_ewma_e6,
+                            old_ewma_cpi,
                             clamped_exec,
                             config.mark_ewma_halflife_slots,
                             config.mark_ewma_last_slot,
@@ -4526,7 +4544,10 @@ pub mod processor {
                             fee_paid_cpi,
                             config.mark_min_fee,
                         );
-                        config.mark_ewma_last_slot = clock.slot;
+                        // Only update EWMA clock when mark actually moved
+                        if config.mark_ewma_e6 != old_ewma_cpi {
+                            config.mark_ewma_last_slot = clock.slot;
+                        }
                         // Stamp funding rate from updated mark
                         engine.funding_rate_bps_per_slot_last =
                             compute_current_funding_rate(&config);

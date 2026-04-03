@@ -3742,6 +3742,37 @@ fn test_ewma_fee_weight_equals_notional_weight() {
     );
 }
 
+/// First EWMA update (old=0) must NOT bootstrap from a zero-fee dust trade.
+/// When mark_min_fee > 0, the first trade needs real fees to seed the EWMA.
+#[test]
+fn test_ewma_first_update_respects_fee_weight() {
+    let old = 0u64; // first update
+    let price = 138_000_000u64;
+    let min_fee = 1_000u64;
+    // Dust trade with zero fee should NOT seed the EWMA
+    let result = ewma_update(old, price, 100, 0, 100, 0, min_fee);
+    assert_eq!(result, 0, "First update with zero fee must not seed EWMA, got {}", result);
+}
+
+/// First EWMA update with sufficient fee should still bootstrap normally.
+#[test]
+fn test_ewma_first_update_with_fee_seeds_normally() {
+    let old = 0u64;
+    let price = 138_000_000u64;
+    let min_fee = 1_000u64;
+    let result = ewma_update(old, price, 100, 0, 100, 1_000, min_fee);
+    assert_eq!(result, price, "First update with sufficient fee must seed to price");
+}
+
+/// First EWMA update with mark_min_fee=0 (disabled) seeds normally regardless of fee.
+#[test]
+fn test_ewma_first_update_disabled_seeds_normally() {
+    let old = 0u64;
+    let price = 138_000_000u64;
+    let result = ewma_update(old, price, 100, 0, 100, 0, 0);
+    assert_eq!(result, price, "Disabled weighting must seed normally");
+}
+
 // ============================================================================
 // TDD Item 1: Funding bootstrap on non-Hyperp markets
 // ============================================================================
@@ -4122,8 +4153,10 @@ fn test_init_market_mark_min_fee_immutable() {
 fn test_trade_nocpi_dust_does_not_move_mark() {
     program_path();
     let mut env = TestEnv::new();
-    // 10 bps trading fee, cap=1%, mark_min_fee = large threshold
-    env.init_market_fee_weighted(0, 10_000, 10, 1_000_000_000);
+    // 10 bps trading fee, cap=1%, mark_min_fee = moderate threshold
+    // Fee from a 1M-unit trade at $138 with 10bps: ~13_800 units (both sides ~27_600)
+    // Set threshold well above that so dust fails but below seed trade's fee.
+    env.init_market_fee_weighted(0, 10_000, 10, 100_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4286,8 +4319,8 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_k_bps (2x)
         data.extend_from_slice(&1000i64.to_le_bytes()); // max_premium
         data.extend_from_slice(&10i64.to_le_bytes()); // max_per_slot
-        // mark_min_fee
-        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // 1M units
+        // mark_min_fee (in engine units — must be below seed trade fee ~16)
+        data.extend_from_slice(&10u64.to_le_bytes());
 
         let ix = Instruction {
             program_id: env.program_id,
@@ -4321,7 +4354,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     }
 
     // Verify config
-    assert_eq!(env.read_mark_min_fee(), 1_000_000);
+    assert_eq!(env.read_mark_min_fee(), 10);
     assert_eq!(env.read_funding_horizon(), 200);
 
     // Open positions
