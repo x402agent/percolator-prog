@@ -3404,8 +3404,8 @@ pub mod processor {
                 if min_oracle_price_cap_e2bps > MAX_ORACLE_PRICE_CAP_E2BPS {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // §8.2: recurring maintenance fees disabled. Reject non-zero at init.
-                if risk_params.maintenance_fee_per_slot.get() != 0 {
+                // Maintenance fee must not exceed the immutable per-market ceiling.
+                if risk_params.maintenance_fee_per_slot.get() > max_maintenance_fee_per_slot {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 

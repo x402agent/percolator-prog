@@ -2929,9 +2929,10 @@ fn test_inverted_market_full_lifecycle() {
         .expect("lp close should succeed");
 }
 
-/// Audit gap 4: InitMarket rejects non-zero maintenance_fee_per_slot.
+/// Audit gap 4: InitMarket rejects maintenance_fee_per_slot exceeding max.
 ///
-/// Spec behavior: maintenance_fee_per_slot must be 0 at market initialization.
+/// The old encode_init_market_with_maintenance_fee sets max to a huge value,
+/// so we use invert=0 to ensure the fee exceeds max_maintenance_fee_per_slot.
 /// Admin can set it later via SetMaintenanceFee. This prevents markets from
 /// launching with hidden fee extraction.
 #[test]
@@ -2944,18 +2945,19 @@ fn test_maintenance_fee_zero_enforced_at_init() {
     // Snapshot slab header before the rejected operation (slab is uninitialized, all zeros)
     let slab_header_before: Vec<u8> = env.svm.get_account(&env.slab).unwrap().data[..72].to_vec();
 
-    // Try to init with non-zero maintenance_fee_per_slot
-    let bad_data = encode_init_market_with_maintenance_fee(
+    // Try to init with maintenance_fee exceeding max
+    let bad_data = encode_init_market_with_maint_fee_bounded(
         &admin.pubkey(),
         &env.mint,
         &TEST_FEED_ID,
+        1000,    // max_maintenance_fee_per_slot = 1000
+        1001,    // exceeds max
         0,
-        1_000_000, // non-zero maintenance_fee_per_slot
     );
     let result = env.try_init_market_raw(bad_data);
     assert!(
         result.is_err(),
-        "InitMarket must reject non-zero maintenance_fee_per_slot"
+        "InitMarket must reject maintenance_fee exceeding max"
     );
 
     // Slab header must remain unchanged (still uninitialized) after rejection
@@ -4094,6 +4096,58 @@ fn test_init_market_rejects_excessive_mark_min_fee() {
     let result = env.try_init_market_raw(data);
     assert!(result.is_err(), "mark_min_fee > MAX_PROTOCOL_FEE_ABS must be rejected");
 }
+
+// ============================================================================
+// Change 1: Maintenance fees at init
+// ============================================================================
+
+/// InitMarket with nonzero maintenance_fee_per_slot within max bound succeeds.
+#[test]
+fn test_init_market_maintenance_fee_nonzero_accepted() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1000, // max_maintenance_fee_per_slot
+        100,  // maintenance_fee_per_slot
+        0,    // min_oracle_price_cap
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_ok(), "Nonzero maintenance fee within bound must be accepted: {:?}", result);
+}
+
+/// InitMarket with maintenance_fee_per_slot exceeding max is rejected.
+#[test]
+fn test_init_market_maintenance_fee_exceeds_max_rejected() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1000, // max
+        1001, // exceeds max
+        0,
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_err(), "Maintenance fee exceeding max must be rejected");
+}
+
+/// InitMarket with maintenance_fee_per_slot = 0 still accepted (backward compat).
+#[test]
+fn test_init_market_maintenance_fee_zero_still_accepted() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1000, 0, 0,
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(result.is_ok(), "Zero maintenance fee must still be accepted: {:?}", result);
+}
+
+// NOTE: Maintenance fee charging is not yet implemented in the engine
+// (settle_maintenance_fee_internal is a no-op stub). The init-time validation
+// is correct (allows nonzero bounded by max), but drain/lifecycle tests require
+// engine changes to implement the charging logic.
 
 // ============================================================================
 // Phase 3: mark_min_fee config field + wire format
