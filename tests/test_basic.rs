@@ -4144,10 +4144,135 @@ fn test_init_market_maintenance_fee_zero_still_accepted() {
     assert!(result.is_ok(), "Zero maintenance fee must still be accepted: {:?}", result);
 }
 
-// NOTE: Maintenance fee charging is not yet implemented in the engine
-// (settle_maintenance_fee_internal is a no-op stub). The init-time validation
-// is correct (allows nonzero bounded by max), but drain/lifecycle tests require
-// engine changes to implement the charging logic.
+/// Full abandoned-account lifecycle with maintenance fees:
+/// 1. Init market with maintenance fee
+/// 2. User deposits, opens position
+/// 3. Cranks drain capital via maintenance fees
+/// 4. Account becomes undercollateralized → crank liquidates
+/// 5. More cranks drain remaining capital
+/// 6. Account becomes dust → ReclaimEmptyAccount frees slot
+/// 7. Verify num_used_accounts decrements
+#[test]
+fn test_maintenance_fee_abandoned_account_lifecycle() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Init with maintenance fee = 1000 per slot, max = 10000
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        10_000, // max_maintenance_fee_per_slot
+        1_000,  // maintenance_fee_per_slot (1000 units/slot)
+        0,      // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init failed");
+
+    // Set up LP with large capital (won't be drained — it's the counterparty)
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // Set up "abandoned" user with moderate capital
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10B units
+
+    // Open a small position (user goes long 1000 units)
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000);
+
+    // Top up insurance so crank doesn't force-realize
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let initial_cap = env.read_account_capital(user_idx);
+    assert!(initial_cap > 0, "User must have capital");
+    assert_ne!(env.read_account_position(user_idx), 0, "User must have position");
+
+    let used_initial = env.read_num_used_accounts();
+
+    // Phase 1: Crank repeatedly to drain capital via maintenance fees.
+    // With fee=1000/slot, 200K slots per crank = 200M fee per crank.
+    // 10B capital / 200M per crank ≈ 50 cranks to drain.
+    let mut slot = 200u64;
+    let mut cap_before = initial_cap;
+    let mut drained = false;
+    let mut saw_position_while_draining = false;
+    let mut position_liquidated = false;
+
+    for _ in 0..50 {
+        slot += 200_000;
+        env.set_slot(slot);
+
+        // Crank settles maintenance fees AND liquidates if undercollateralized
+        let result = env.try_crank();
+        if result.is_err() {
+            // Crank might fail if the account state is already terminal
+            break;
+        }
+
+        let cap_after = env.read_account_capital(user_idx);
+        let pos = env.read_account_position(user_idx);
+
+        // Check if capital is draining
+        if cap_after < cap_before {
+            drained = true;
+        }
+        // Track that position was open while capital was being drained
+        if pos != 0 && drained {
+            saw_position_while_draining = true;
+        }
+        if pos == 0 && saw_position_while_draining && !position_liquidated {
+            position_liquidated = true;
+        }
+        cap_before = cap_after;
+
+        // If position is gone AND capital is dust, try reclaim
+        if pos == 0 && cap_after < 100 {
+            // Account should be reclaimable
+            slot += 10;
+            env.set_slot(slot);
+            let reclaim_result = env.try_reclaim_empty_account(user_idx);
+            if reclaim_result.is_ok() {
+                let used_after = env.read_num_used_accounts();
+                assert_eq!(
+                    used_after,
+                    used_initial - 1,
+                    "num_used must decrement after reclaim"
+                );
+                println!("SUCCESS: Abandoned account reclaimed after {} cranks", slot / 200_000);
+                return; // Test passed!
+            }
+        }
+
+        // If position is gone but capital remains, keep cranking to drain more
+        if pos == 0 && cap_after == 0 {
+            slot += 10;
+            env.set_slot(slot);
+            let reclaim_result = env.try_reclaim_empty_account(user_idx);
+            if reclaim_result.is_ok() {
+                let used_after = env.read_num_used_accounts();
+                assert_eq!(used_after, used_initial - 1, "num_used must decrement");
+                println!("SUCCESS: Zero-capital account reclaimed");
+                return;
+            }
+        }
+    }
+
+    // If we got here without reclaiming, verify the lifecycle progressed correctly
+    assert!(drained, "Maintenance fees must drain capital over time");
+    assert!(saw_position_while_draining,
+        "Must observe open position while maintenance fees are draining capital");
+    assert!(position_liquidated,
+        "Position must be liquidated by crank when capital drops below maintenance margin");
+    let final_pos = env.read_account_position(user_idx);
+    let final_cap = env.read_account_capital(user_idx);
+    assert_eq!(final_pos, 0, "Position must be zero after liquidation");
+    assert!(
+        final_cap < initial_cap / 10,
+        "Capital must be substantially drained: initial={} final={}",
+        initial_cap, final_cap
+    );
+    panic!("Lifecycle incomplete: account not reclaimed after 50 cranks (cap={})", final_cap);
+}
 
 // ============================================================================
 // Phase 3: mark_min_fee config field + wire format
