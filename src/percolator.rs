@@ -5275,10 +5275,12 @@ pub mod processor {
                         config.last_hyperp_index_slot = clock.slot;
                     }
                     state::write_config(&mut data, &config);
-                    // Accrue to resolution boundary using engine's stored rate.
+                    // Accrue to resolution boundary at the settlement mark price
+                    // (authority_price_e6), NOT the smoothed index. force_close_resolved
+                    // uses K coefficients that must reflect the declared settlement price.
                     let engine = zc::engine_mut(&mut data)?;
                     engine.accrue_market_to(
-                        clock.slot, config.last_effective_price_e6,
+                        clock.slot, config.authority_price_e6,
                     ).map_err(map_risk_error)?;
                     config = state::read_config(&data);
                 }
@@ -6043,23 +6045,25 @@ pub mod processor {
                     let prev_index = config.last_effective_price_e6;
                     if mark > 0 && prev_index > 0 {
                         let last_idx_slot = config.last_hyperp_index_slot;
-                        let engine_slot = {
-                            let e = zc::engine_ref(&data)?;
-                            e.last_crank_slot
-                        };
-                        let dt = engine_slot.saturating_sub(last_idx_slot);
+                        // Use clock.slot (not engine.last_crank_slot) to avoid
+                        // monotonicity failure when current_slot > last_crank_slot
+                        // from trades/withdrawals after the last crank.
+                        let dt = clock.slot.saturating_sub(last_idx_slot);
                         let new_index = oracle::clamp_toward_with_dt(
                             prev_index.max(1), mark,
                             config.oracle_price_cap_e2bps, dt,
                         );
                         config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = engine_slot;
+                        config.last_hyperp_index_slot = clock.slot;
                     }
                     state::write_config(&mut data, &config);
+                    // Accrue at the mark (settlement price), not the smoothed index.
+                    // force_close_resolved uses K coefficients that must reflect mark.
+                    let settle_price = mark.max(1);
                     let engine = zc::engine_mut(&mut data)?;
                     engine.accrue_market_to(
-                        engine.last_crank_slot,
-                        config.last_effective_price_e6,
+                        clock.slot,
+                        settle_price,
                     ).map_err(map_risk_error)?;
                     config = state::read_config(&data);
                 }
