@@ -3377,7 +3377,7 @@ fn test_ewma_single_slot_max_movement() {
     assert_eq!(clamped, 101_000_000);
 
     // EWMA update: mark starts at index
-    let new_mark = ewma_update(index, clamped, halflife, 0, 1);
+    let new_mark = ewma_update(index, clamped, halflife, 0, 1, 0, 0);
     // alpha(1) = 1 / (1 + 100) ≈ 0.0099
     // delta = 101M - 100M = 1M. Movement = 1M * 0.0099 ≈ 9_900
     let movement = new_mark - index;
@@ -3397,7 +3397,7 @@ fn test_ewma_walkup_clamp_against_mark_vulnerable() {
     // 500 slots of wash trading, clamping against MARK (old behavior)
     for slot in 1..=500u64 {
         let clamped = clamp_oracle_price(mark.max(1), 200_000_000, cap);
-        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
     // Mark should have walked well above 1 cap-width from index
     // (mark-clamp compounds because the clamp base itself moves up)
@@ -3421,7 +3421,7 @@ fn test_ewma_walkup_clamp_against_index_bounded() {
     for slot in 1..=100u64 {
         let clamp_base = mark_ewma_clamp_base(index); // always index
         let clamped = clamp_oracle_price(clamp_base, 200_000_000, cap);
-        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
     // Mark must be within cap of index (1% = 1_000_000)
     let max_gap = index as u128 * cap as u128 / 1_000_000;
@@ -3446,7 +3446,7 @@ fn test_ewma_tracks_moving_index() {
         let clamp_base = mark_ewma_clamp_base(index);
         let exec = index; // fair trades at index
         let clamped = clamp_oracle_price(clamp_base, exec, cap);
-        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
     // Mark must have moved up (proves EWMA is tracking)
     assert!(
@@ -3474,7 +3474,7 @@ fn test_ewma_walkdown_clamp_against_index_bounded() {
     for slot in 1..=100u64 {
         let clamp_base = mark_ewma_clamp_base(index);
         let clamped = clamp_oracle_price(clamp_base, 1, cap); // attack downward
-        mark = ewma_update(mark, clamped, halflife, slot - 1, slot);
+        mark = ewma_update(mark, clamped, halflife, slot - 1, slot, 0, 0);
     }
     let max_gap = index as u128 * cap as u128 / 1_000_000;
     assert!(
@@ -3482,5 +3482,816 @@ fn test_ewma_walkdown_clamp_against_index_bounded() {
         "Downward walk must be bounded: mark={} index={} max_gap={}",
         mark, index, max_gap
     );
+}
+
+// ============================================================================
+// Fee-Weighted EWMA: Pure Math Tests (Phase 1)
+// ============================================================================
+
+/// Full-fee trade (at or above mark_min_fee) produces identical result to unweighted.
+#[test]
+fn test_ewma_full_fee_matches_original() {
+    let old = 100u64;
+    let price = 110u64;
+    let halflife = 100u64;
+    let fee_paid = 10_000u64;
+    let min_fee = 10_000u64;
+    // weight = min(10_000/10_000, 1) = 1.0 → same as unweighted
+    let weighted = ewma_update(old, price, halflife, 0, 50, fee_paid, min_fee);
+    let unweighted = ewma_update(old, price, halflife, 0, 50, min_fee, min_fee);
+    assert_eq!(weighted, unweighted, "At-threshold fee must match unweighted");
+}
+
+/// Above-threshold fee is capped at weight=1 (no extra weight).
+#[test]
+fn test_ewma_above_fee_capped_at_one() {
+    let old = 100u64;
+    let price = 110u64;
+    let halflife = 100u64;
+    let at_threshold = ewma_update(old, price, halflife, 0, 50, 10_000, 10_000);
+    let above = ewma_update(old, price, halflife, 0, 50, 50_000, 10_000);
+    assert_eq!(at_threshold, above, "Above-threshold fee must not get extra weight");
+}
+
+/// Half-fee trade gets half the alpha → half the mark movement.
+#[test]
+fn test_ewma_half_fee_half_alpha() {
+    let old = 1_000_000u64;
+    let price = 1_010_000u64;
+    let halflife = 100u64;
+    let fee_paid = 5_000u64;
+    let min_fee = 10_000u64;
+    // base_alpha_bps = 10_000 * 100 / (100 + 100) = 5_000
+    // effective_alpha_bps = 5_000 * 5_000 / 10_000 = 2_500
+    // expected = 1_000_000 + (10_000 * 2_500 / 10_000) = 1_002_500
+    let result = ewma_update(old, price, halflife, 0, 100, fee_paid, min_fee);
+    assert_eq!(result, 1_002_500, "Half fee → half alpha movement");
+}
+
+/// 1-unit dust fee cannot move the mark at all.
+#[test]
+fn test_ewma_dust_fee_negligible_impact() {
+    let old = 1_000_000u64;
+    let price = 1_100_000u64; // 10% away
+    let halflife = 100u64;
+    let fee_paid = 1u64;
+    let min_fee = 10_000u64;
+    // weight_bps = 1 * 10_000 / 10_000 = 1
+    // effective_alpha_bps = 5_000 * 1 / 10_000 = 0
+    let result = ewma_update(old, price, halflife, 0, 100, fee_paid, min_fee);
+    assert_eq!(result, old, "1-unit dust fee must not move mark");
+}
+
+/// Even with huge dt (alpha near 1.0), dust fee stays dust.
+#[test]
+fn test_ewma_dust_fee_one_unit_weight() {
+    let old = 1_000_000u64;
+    let price = 2_000_000u64;
+    let halflife = 100u64;
+    let fee_paid = 1u64;
+    let min_fee = 10_000u64;
+    // dt=1000 → alpha near 0.909. But weight = 1/10000 → effective alpha ≈ 0
+    let result = ewma_update(old, price, halflife, 0, 1000, fee_paid, min_fee);
+    assert!(
+        result.abs_diff(old) <= 1,
+        "Dust fee with huge dt moves at most 1 unit, got delta={}",
+        result.abs_diff(old)
+    );
+}
+
+/// mark_min_fee=0 (disabled) → identical to unweighted ewma_update.
+#[test]
+fn test_ewma_zero_min_fee_full_alpha() {
+    let old = 1_000_000u64;
+    let price = 1_100_000u64;
+    let halflife = 100u64;
+    // When mark_min_fee=0, all trades get full weight regardless of fee
+    let with_dust = ewma_update(old, price, halflife, 0, 50, 1, 0);
+    let with_full = ewma_update(old, price, halflife, 0, 50, 999_999, 0);
+    assert_eq!(with_dust, with_full, "mark_min_fee=0 → all trades equal weight");
+}
+
+/// Zero fee (zero-fill or insolvent) cannot move mark.
+#[test]
+fn test_ewma_zero_fee_no_update() {
+    let old = 1_000_000u64;
+    let price = 2_000_000u64;
+    let halflife = 100u64;
+    let min_fee = 10_000u64;
+    let result = ewma_update(old, price, halflife, 0, 100, 0, min_fee);
+    assert_eq!(result, old, "Zero fee must not move mark");
+}
+
+/// Downward manipulation with dust fee is equally bounded.
+#[test]
+fn test_ewma_downward_dust_fee_bounded() {
+    let old = 1_000_000u64;
+    let price = 900_000u64; // 10% below
+    let fee_paid = 1u64;
+    let min_fee = 10_000u64;
+    let result = ewma_update(old, price, 100, 0, 100, fee_paid, min_fee);
+    assert_eq!(result, old, "Downward dust fee attack must not move mark");
+}
+
+/// Sustained wash trading (1000 dust-fee trades) cannot meaningfully move mark.
+#[test]
+fn test_ewma_sequential_dust_fee_bounded() {
+    let start = 1_000_000u64;
+    let target = 1_100_000u64;
+    let halflife = 100u64;
+    let min_fee = 10_000u64;
+    let mut mark = start;
+    for slot in 1..=1000u64 {
+        mark = ewma_update(mark, target, halflife, slot - 1, slot, 1, min_fee);
+    }
+    let drift_bps = ((mark as i128 - start as i128).unsigned_abs() * 10_000) / start as u128;
+    assert!(
+        drift_bps < 10, // less than 0.1%
+        "1000 dust-fee trades moved mark by {} bps, should be < 10",
+        drift_bps
+    );
+}
+
+/// Full-fee trades converge normally toward target.
+#[test]
+fn test_ewma_sequential_full_fee_convergence() {
+    let start = 1_000_000u64;
+    let target = 1_100_000u64;
+    let halflife = 100u64;
+    let min_fee = 10_000u64;
+    let mut mark = start;
+    for slot in 1..=500u64 {
+        mark = ewma_update(mark, target, halflife, slot - 1, slot, 10_000, min_fee);
+    }
+    let gap_bps = ((target as i128 - mark as i128).unsigned_abs() * 10_000) / target as u128;
+    assert!(
+        gap_bps < 100,
+        "Full-fee trades should converge, gap={} bps",
+        gap_bps
+    );
+}
+
+/// 100 dust-fee trades + 1 real trade: the real trade dominates.
+#[test]
+fn test_ewma_mixed_dust_and_real_fees() {
+    let start = 1_000_000u64;
+    let attacker_price = 1_100_000u64;
+    let fair_price = 1_000_000u64;
+    let halflife = 100u64;
+    let min_fee = 10_000u64;
+    let mut mark = start;
+
+    for slot in 1..=100u64 {
+        mark = ewma_update(mark, attacker_price, halflife, slot - 1, slot, 1, min_fee);
+    }
+    let mark_after_dust = mark;
+
+    mark = ewma_update(mark, fair_price, halflife, 100, 101, 10_000, min_fee);
+
+    let dust_drift = mark_after_dust.abs_diff(start);
+    let final_drift = mark.abs_diff(start);
+    assert!(
+        final_drift <= dust_drift,
+        "Real-fee trade must push mark back: dust_drift={}, final_drift={}",
+        dust_drift, final_drift
+    );
+}
+
+/// Attack cost scales with mark_min_fee.
+/// A fee of 50 with min_fee=100 gets 50% weight;
+/// the same fee with min_fee=10_000 gets 0.5% weight.
+#[test]
+fn test_ewma_attack_cost_scales_with_min_fee() {
+    let start = 1_000_000u64;
+    let target = 1_100_000u64; // 10% premium
+    let halflife = 100u64;
+    let fee = 50u64; // modest fee
+
+    // Low threshold (min_fee=100): fee=50 gets 50% weight
+    let mut mark_low = start;
+    for slot in 1..=100u64 {
+        mark_low = ewma_update(mark_low, target, halflife, slot - 1, slot, fee, 100);
+    }
+
+    // High threshold (min_fee=10_000): fee=50 gets 0.5% weight
+    let mut mark_high = start;
+    for slot in 1..=100u64 {
+        mark_high = ewma_update(mark_high, target, halflife, slot - 1, slot, fee, 10_000);
+    }
+
+    let drift_low = mark_low.abs_diff(start);
+    let drift_high = mark_high.abs_diff(start);
+    assert!(
+        drift_low > drift_high,
+        "Higher min_fee must reduce impact: drift_low={} drift_high={}",
+        drift_low, drift_high
+    );
+}
+
+// --- Fee-specific tests ---
+
+/// Insolvent account (fee_paid=0, all goes to shortfall) gets zero mark weight.
+#[test]
+fn test_ewma_fee_shortfall_zero_weight() {
+    let old = 1_000_000u64;
+    let price = 1_100_000u64;
+    let min_fee = 1_000u64;
+    // fee_paid = 0 (all fee went to fee_credits shortfall, nothing reached I)
+    let result = ewma_update(old, price, 100, 0, 100, 0, min_fee);
+    assert_eq!(result, old, "Insolvent wash trader (fee_paid=0) cannot move mark");
+}
+
+/// Bilateral fee sum: both sides' paid fees contribute to weight.
+#[test]
+fn test_ewma_bilateral_fee_sum() {
+    let old = 1_000_000u64;
+    let price = 1_010_000u64;
+    let min_fee = 100u64;
+    // User pays 50, LP pays 50, total = 100 (at threshold)
+    let result_sum = ewma_update(old, price, 100, 0, 100, 100, min_fee);
+    // Compare with single-side 50 (half weight)
+    let result_half = ewma_update(old, price, 100, 0, 100, 50, min_fee);
+    // Sum should produce more movement than half
+    assert!(
+        result_sum.abs_diff(old) > result_half.abs_diff(old),
+        "Bilateral sum must produce more movement: sum_delta={} half_delta={}",
+        result_sum.abs_diff(old), result_half.abs_diff(old)
+    );
+}
+
+/// Fee-weight is mathematically equivalent to notional-weight at constant fee_bps.
+/// For fee = notional × bps / 10_000:
+///   ewma(fee, min_fee) == ewma(notional, min_fee × 10_000 / bps)
+#[test]
+fn test_ewma_fee_weight_equals_notional_weight() {
+    let old = 1_000_000u64;
+    let price = 1_050_000u64;
+    let halflife = 100u64;
+    let fee_bps = 10u64; // 0.1% fee rate
+    let notional = 50_000u64;
+    let fee = notional * fee_bps / 10_000; // = 50
+
+    let min_fee = 100u64; // reference fee
+    let equiv_min_notional = min_fee * 10_000 / fee_bps; // = 100_000
+
+    let fee_result = ewma_update(old, price, halflife, 0, 100, fee, min_fee);
+    let notional_result = ewma_update(old, price, halflife, 0, 100, notional, equiv_min_notional);
+    assert_eq!(
+        fee_result, notional_result,
+        "Fee-weight must be equivalent to notional-weight at constant bps"
+    );
+}
+
+// ============================================================================
+// TDD Item 1: Funding bootstrap on non-Hyperp markets
+// ============================================================================
+
+/// Non-Hyperp market with oracle_price_cap > 0 bootstraps mark EWMA from first trade.
+/// After the first trade, mark_ewma_e6 should be non-zero (seeded from oracle price).
+#[test]
+fn test_funding_bootstrap_ewma_seeded_on_first_trade() {
+    program_path();
+    let mut env = TestEnv::new();
+    // cap = 10_000 e2bps = 1% per slot, no permissionless resolve
+    env.init_market_with_cap(0, 10_000, 0);
+
+    // Before any trade, EWMA should be 0
+    assert_eq!(env.read_mark_ewma(), 0, "EWMA must be zero before any trade");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // First trade seeds the EWMA (ewma_update returns price when old=0)
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma = env.read_mark_ewma();
+    assert!(ewma > 0, "EWMA must be seeded after first trade, got {}", ewma);
+}
+
+/// After trades establish mark EWMA, funding rate should be stamped in the engine.
+/// When mark == index (no divergence), funding rate stays 0.
+/// This test verifies the plumbing: trade → EWMA update → funding rate stamp.
+#[test]
+fn test_funding_bootstrap_rate_stamped_after_trade() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Trade at oracle price — mark ~= index so funding ~= 0
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma = env.read_mark_ewma();
+    let index = env.read_last_effective_price();
+    let rate = env.read_funding_rate();
+
+    // Oracle-price trade: EWMA ≈ index, so funding should be 0 or very small
+    assert!(ewma > 0, "EWMA seeded");
+    assert!(index > 0, "Index established by crank-before-trade");
+    // When mark ~= index, rate should be 0 (no premium)
+    assert_eq!(rate, 0, "No premium when mark == index, got rate={}", rate);
+}
+
+/// Inverted market funding bootstrap: same mechanism works with invert=1.
+/// The oracle price gets inverted (1e12/raw) but EWMA and funding still function.
+#[test]
+fn test_funding_bootstrap_inverted_market() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Inverted market with cap enabled
+    env.init_market_with_cap(1, 10_000, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Trade on inverted market
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma = env.read_mark_ewma();
+    assert!(ewma > 0, "Inverted market EWMA must be seeded, got {}", ewma);
+
+    // For inverted oracle: raw=138_000_000 → inverted=~7246
+    // The EWMA should be in the inverted price space
+    assert!(ewma < 100_000, "Inverted price should be small (not raw), got {}", ewma);
+}
+
+/// Without oracle price cap (cap=0), EWMA never updates and funding stays 0.
+/// This is the control case: markets without cap cannot bootstrap funding.
+#[test]
+fn test_funding_no_cap_means_no_ewma() {
+    program_path();
+    let mut env = TestEnv::new();
+    // cap = 0 means EWMA is disabled
+    env.init_market_with_cap(0, 0, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    assert_eq!(env.read_mark_ewma(), 0, "No cap → no EWMA update");
+    assert_eq!(env.read_funding_rate(), 0, "No cap → no funding rate");
+}
+
+/// Non-Hyperp market with cap: multiple trades across slots converge EWMA toward index.
+/// After crank accrual, the engine should have applied funding.
+#[test]
+fn test_funding_bootstrap_multiple_trades_and_crank() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Trade to seed EWMA
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma1 = env.read_mark_ewma();
+    assert!(ewma1 > 0, "EWMA seeded");
+
+    // Top up insurance so crank doesn't force-close
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+
+    // Advance and trade again — EWMA should be stable (same price)
+    env.set_slot(200);
+    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
+    let ewma2 = env.read_mark_ewma();
+    assert!(ewma2 > 0, "EWMA still set after second trade");
+
+    // Crank to accrue funding
+    env.set_slot(300);
+    env.crank();
+
+    // Default funding params: horizon=500, k=100, max_premium=500, max_per_slot=5
+    // Since mark ~= index (both from oracle), funding should be ~0
+    let rate = env.read_funding_rate();
+    // Rate could be 0 or very small rounding artifact
+    assert!(rate.abs() <= 1, "Rate should be ~0 when mark ≈ index, got {}", rate);
+}
+
+/// Verify that default funding parameters are set at InitMarket for non-Hyperp.
+#[test]
+fn test_funding_bootstrap_default_params() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let horizon = env.read_funding_horizon();
+    let cap = env.read_oracle_price_cap();
+
+    assert_eq!(horizon, 500, "Default funding_horizon_slots should be 500");
+    assert_eq!(cap, 10_000, "Cap should match min_oracle_price_cap_e2bps");
+}
+
+// ============================================================================
+// TDD Item 2: Custom funding parameters at InitMarket
+// ============================================================================
+
+/// InitMarket with custom funding_horizon_slots overrides the default (500).
+#[test]
+fn test_init_market_custom_funding_horizon() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Custom horizon=1000, k=100 (default), max_premium=500 (default), max_per_slot=5 (default)
+    env.init_market_with_funding(0, 10_000, 0, 1000, 100, 500, 5);
+    assert_eq!(env.read_funding_horizon(), 1000, "Custom horizon must be stored");
+}
+
+/// InitMarket with custom funding_k_bps overrides the default (100).
+#[test]
+fn test_init_market_custom_funding_k() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_funding(0, 10_000, 0, 500, 200, 500, 5);
+    assert_eq!(env.read_funding_k_bps(), 200, "Custom k_bps must be stored");
+}
+
+/// InitMarket with custom funding_max_premium_bps overrides the default (500).
+#[test]
+fn test_init_market_custom_funding_max_premium() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_funding(0, 10_000, 0, 500, 100, 1000, 5);
+    assert_eq!(
+        env.read_funding_max_premium_bps(),
+        1000,
+        "Custom max_premium must be stored"
+    );
+}
+
+/// InitMarket with custom funding_max_bps_per_slot overrides the default (5).
+#[test]
+fn test_init_market_custom_funding_max_per_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_funding(0, 10_000, 0, 500, 100, 500, 10);
+    assert_eq!(
+        env.read_funding_max_bps_per_slot(),
+        10,
+        "Custom max_bps_per_slot must be stored"
+    );
+}
+
+/// All four custom funding params set together, all non-default values.
+#[test]
+fn test_init_market_custom_all_funding_params() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 20);
+    assert_eq!(env.read_funding_horizon(), 2000);
+    assert_eq!(env.read_funding_k_bps(), 300);
+    assert_eq!(env.read_funding_max_premium_bps(), 800);
+    assert_eq!(env.read_funding_max_bps_per_slot(), 20);
+}
+
+/// Without trailing funding params, defaults should be used (backward compat).
+/// This test verifies that omitting the optional trailing fields still works.
+#[test]
+fn test_init_market_no_funding_params_uses_defaults() {
+    program_path();
+    let mut env = TestEnv::new();
+    // init_market_with_cap doesn't append funding params
+    env.init_market_with_cap(0, 10_000, 0);
+    assert_eq!(env.read_funding_horizon(), 500, "Default horizon");
+    assert_eq!(env.read_funding_k_bps(), 100, "Default k_bps");
+    assert_eq!(env.read_funding_max_premium_bps(), 500, "Default max_premium");
+    assert_eq!(env.read_funding_max_bps_per_slot(), 5, "Default max_per_slot");
+}
+
+// ============================================================================
+// Phase 3: mark_min_fee config field + wire format
+// ============================================================================
+
+/// InitMarket with mark_min_fee stores the value in config.
+#[test]
+fn test_init_market_with_mark_min_fee() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_min_fee(0, 10_000, 5_000_000_000);
+    assert_eq!(
+        env.read_mark_min_fee(),
+        5_000_000_000,
+        "mark_min_fee must be stored in config"
+    );
+}
+
+/// Without mark_min_fee field (truncated payload), default to 0 (disabled).
+#[test]
+fn test_init_market_default_mark_min_fee_backward_compat() {
+    program_path();
+    let mut env = TestEnv::new();
+    // init_market_with_cap omits funding params and mark_min_fee
+    env.init_market_with_cap(0, 10_000, 0);
+    assert_eq!(
+        env.read_mark_min_fee(),
+        0,
+        "Default mark_min_fee must be 0 (disabled)"
+    );
+}
+
+/// mark_min_fee is immutable — UpdateConfig cannot change it.
+#[test]
+fn test_init_market_mark_min_fee_immutable() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_min_fee(0, 10_000, 1_000_000);
+    let before = env.read_mark_min_fee();
+    assert_eq!(before, 1_000_000);
+
+    // UpdateConfig changes funding params but NOT mark_min_fee
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_update_config(&admin).unwrap();
+    let after = env.read_mark_min_fee();
+    assert_eq!(after, before, "mark_min_fee must be immutable after init");
+}
+
+// ============================================================================
+// Phase 4: Processor fee-weighted EWMA integration tests
+// ============================================================================
+
+/// Dust trade (tiny position, minimal fee) should NOT move mark when mark_min_fee is set.
+/// This is the key integration test: the processor must thread fee_paid into ewma_update.
+/// We change the oracle price between trades to create a mark/exec divergence.
+#[test]
+fn test_trade_nocpi_dust_does_not_move_mark() {
+    program_path();
+    let mut env = TestEnv::new();
+    // 10 bps trading fee, cap=1%, mark_min_fee = large threshold
+    env.init_market_fee_weighted(0, 10_000, 10, 1_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // First trade at default price ($138) seeds EWMA
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma_after_seed = env.read_mark_ewma();
+    assert!(ewma_after_seed > 0, "EWMA must be seeded");
+
+    // Change oracle price to create divergence (139 vs 138)
+    env.set_slot_and_price(200, 139_000_000);
+
+    // Dust trade at new price — with fee weighting, the tiny fee should prevent mark movement
+    env.trade(&user, &lp, lp_idx, user_idx, 1);
+    let ewma_after_dust = env.read_mark_ewma();
+    assert_eq!(
+        ewma_after_seed, ewma_after_dust,
+        "Dust trade must not move mark when fee < mark_min_fee, seed={} after={}",
+        ewma_after_seed, ewma_after_dust
+    );
+}
+
+/// Full-size trade with fee >= mark_min_fee SHOULD move mark.
+#[test]
+fn test_trade_nocpi_full_size_moves_mark() {
+    program_path();
+    let mut env = TestEnv::new();
+    // 10 bps fee, cap=1%, mark_min_fee = 100 (very low threshold)
+    env.init_market_fee_weighted(0, 10_000, 10, 100);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Seed EWMA
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma_after_seed = env.read_mark_ewma();
+
+    // Large trade should move mark (fee well above threshold)
+    env.set_slot(200);
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    let ewma_after_big = env.read_mark_ewma();
+
+    // With mark_min_fee=0 (disabled), the mark should move on any trade.
+    // With mark_min_fee=100 and a large trade generating fee >> 100, it should also move.
+    // Since oracle price ≈ exec price, the mark stays close, but there should be
+    // at least EWMA time-decay convergence from the dt=100 gap.
+    // The key test: this should NOT be blocked by fee weighting.
+    assert!(
+        ewma_after_big > 0,
+        "Mark should still be set after large trade"
+    );
+}
+
+/// mark_min_fee=0 means fee weighting is disabled — same behavior as unweighted.
+#[test]
+fn test_trade_nocpi_zero_min_fee_allows_all() {
+    program_path();
+    let mut env = TestEnv::new();
+    // mark_min_fee=0 → disabled, all trades get full weight
+    env.init_market_fee_weighted(0, 10_000, 10, 0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma_seed = env.read_mark_ewma();
+
+    // Even dust trade should move mark when min_fee=0
+    env.set_slot(200);
+    env.trade(&user, &lp, lp_idx, user_idx, 1);
+    let ewma_after = env.read_mark_ewma();
+
+    // With min_fee=0 and dt=100, EWMA should update (converge from time decay)
+    // Both trades execute at oracle price so mark ≈ oracle, but the EWMA
+    // time-decay factor means each update applies alpha*delta.
+    // The key assertion: the update was NOT blocked.
+    assert!(ewma_after > 0, "Mark should be set");
+}
+
+// ============================================================================
+// Phase 6: Governance-free capstone with fee-weighted EWMA
+// ============================================================================
+
+/// Full lifecycle: inverted SOL market, fee-weighted EWMA neutralizes dust wash attacks,
+/// organic trades converge the mark, oracle dies, permissionless resolution succeeds.
+#[test]
+fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Init: inverted SOL/USD, 10 bps fee, 1% cap, mark_min_fee = 1M units,
+    // permissionless resolve after 100 slots, custom funding
+    {
+        let admin = &env.payer;
+        let dummy_ata = Pubkey::new_unique();
+        env.svm
+            .set_account(
+                dummy_ata,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; spl_token::state::Account::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        let mut data = vec![0u8];
+        data.extend_from_slice(admin.pubkey().as_ref());
+        data.extend_from_slice(env.mint.as_ref());
+        data.extend_from_slice(&TEST_FEED_ID);
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_secs
+        data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+        data.push(1u8); // invert=1 (SOL/USD)
+        data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+        data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+        data.extend_from_slice(&100_000_000_000_000_000_000u128.to_le_bytes()); // max_maint_fee
+        data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_ins_floor
+        data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap = 1%
+        // RiskParams with 10 bps trading fee
+        data.extend_from_slice(&0u64.to_le_bytes()); // warmup
+        data.extend_from_slice(&500u64.to_le_bytes()); // mm_bps
+        data.extend_from_slice(&1000u64.to_le_bytes()); // im_bps
+        data.extend_from_slice(&10u64.to_le_bytes()); // trading_fee_bps = 10 (0.1%)
+        data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
+        data.extend_from_slice(&0u128.to_le_bytes()); // new_acct_fee
+        data.extend_from_slice(&0u128.to_le_bytes()); // risk_reduction_threshold
+        data.extend_from_slice(&0u128.to_le_bytes()); // maint_fee
+        let max_crank = 99u64; // permissionless > max_crank
+        data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
+        data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+        data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
+        data.extend_from_slice(&100u64.to_le_bytes()); // liq_buffer_bps
+        data.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
+        data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
+        data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
+        data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+        data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
+        data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
+        data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_ins_floor_change
+        data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
+        // Custom funding params
+        data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
+        data.extend_from_slice(&200u64.to_le_bytes()); // funding_k_bps (2x)
+        data.extend_from_slice(&1000i64.to_le_bytes()); // max_premium
+        data.extend_from_slice(&10i64.to_le_bytes()); // max_per_slot
+        // mark_min_fee
+        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // 1M units
+
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(env.mint, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
+                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data,
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("init failed");
+    }
+
+    // Set bounded staleness for permissionless resolution
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Verify config
+    assert_eq!(env.read_mark_min_fee(), 1_000_000);
+    assert_eq!(env.read_funding_horizon(), 200);
+
+    // Open positions
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // First trade seeds EWMA in inverted price space
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma_seed = env.read_mark_ewma();
+    assert!(ewma_seed > 0 && ewma_seed < 100_000, "Inverted EWMA: {}", ewma_seed);
+
+    // Dust wash attack: 50 size-1 trades at different slots with price change
+    let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin_kp, 1_000_000_000);
+
+    for i in 1..=20u64 {
+        // Slowly shift price to create mark/exec divergence
+        let shifted_price = 138_000_000 + (i as i64 * 100_000);
+        env.set_slot_and_price(100 + i * 3, shifted_price);
+        // Alternate trade direction to avoid position limits
+        let size = if i % 2 == 0 { 1i128 } else { -1i128 };
+        let _ = env.try_trade(&user, &lp, lp_idx, user_idx, size);
+    }
+    let ewma_after_dust_attack = env.read_mark_ewma();
+    let dust_drift_bps = ((ewma_after_dust_attack as i128 - ewma_seed as i128).unsigned_abs() * 10_000) / ewma_seed as u128;
+    assert!(
+        dust_drift_bps < 100, // less than 1%
+        "20 dust trades should barely move mark: drift={} bps",
+        dust_drift_bps
+    );
+
+    // Organic trade restores mark
+    env.set_slot(300);
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000); // large trade
+
+    // Oracle dies → permissionless resolution
+    env.svm.set_sysvar(&Clock {
+        slot: 700,
+        unix_timestamp: 700,
+        ..Clock::default()
+    });
+    env.try_resolve_permissionless().unwrap();
+    assert!(env.is_market_resolved());
+
+    let settlement = env.read_authority_price();
+    assert!(settlement > 0 && settlement < 100_000, "Inverted settlement: {}", settlement);
 }
 

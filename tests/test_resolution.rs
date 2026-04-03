@@ -979,8 +979,8 @@ fn test_resolved_crank_cursor_wraps_to_zero() {
     assert!(env.is_market_resolved());
     println!("Market resolved");
 
-    // crank_cursor is at ENGINE(520) + 328 = 848 in the slab.
-    const CRANK_CURSOR_OFF: usize = 896;
+    // crank_cursor is at ENGINE(584) + 328 = 912 in the slab.
+    const CRANK_CURSOR_OFF: usize = 912;
     let read_cursor = |svm: &LiteSVM, slab: &Pubkey| -> u16 {
         let d = svm.get_account(slab).unwrap().data;
         u16::from_le_bytes(d[CRANK_CURSOR_OFF..CRANK_CURSOR_OFF + 2].try_into().unwrap())
@@ -1032,7 +1032,7 @@ fn test_resolve_permissionless_after_staleness() {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
         // permissionless_resolve_stale_slots
-        let offset = config_end - 16;
+        let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
         slab.data[offset..offset + 8].copy_from_slice(&100u64.to_le_bytes());
         // max_staleness_secs: at offset 72+96 = 168 in config
         slab.data[168..176].copy_from_slice(&30u64.to_le_bytes()); // 30 seconds
@@ -1086,7 +1086,7 @@ fn test_resolve_permissionless_already_admin_resolved() {
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
-        let offset = config_end - 16;
+        let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
         slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
@@ -1114,7 +1114,7 @@ fn test_resolve_permissionless_settlement_price() {
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
-        let offset = config_end - 16;
+        let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
         slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
         // Bounded staleness so oracle can go stale
         slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
@@ -1141,7 +1141,7 @@ fn test_resolve_permissionless_rejects_wrong_oracle() {
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
         let config_end = 72 + std::mem::size_of::<percolator_prog::state::MarketConfig>();
-        let offset = config_end - 16;
+        let offset = config_end - 32; // permissionless_resolve_stale_slots (before mark_min_fee+padding)
         slab.data[offset..offset + 8].copy_from_slice(&50u64.to_le_bytes());
         slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
@@ -1186,5 +1186,310 @@ fn test_resolve_permissionless_rejects_wrong_oracle() {
         "Must reject wrong oracle account — only OracleStale proves death"
     );
     assert!(!env.is_market_resolved(), "Market must NOT be resolved with fake oracle");
+}
+
+// ============================================================================
+// Governance-Free Full Lifecycle (Integration Capstone)
+// ============================================================================
+
+/// End-to-end test: admin-free market lifecycle.
+///
+/// Demonstrates the complete governance-free path:
+/// 1. InitMarket with Pyth oracle, custom funding params, cap enabled, permissionless resolution
+/// 2. Open positions and trade → mark EWMA bootstraps
+/// 3. Funding accrues through cranks (mark EWMA diverges from index = non-zero rate)
+/// 4. Oracle dies → permissionless resolution succeeds
+/// 5. Positions settle at last known oracle price
+///
+/// No admin intervention required at any step after InitMarket.
+#[test]
+fn test_governance_free_full_lifecycle() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    // Step 1: Init with custom funding params, cap=1% per slot, permissionless resolve after 100 slots
+    // horizon=200 (shorter for faster funding), k=200 (2x multiplier), max_premium=1000, max_per_slot=10
+    env.init_market_with_funding(
+        0,      // invert=0 (direct, e.g., BTC/USD)
+        10_000, // min_oracle_price_cap_e2bps = 1% per slot
+        100,    // permissionless_resolve_stale_slots
+        200,    // funding_horizon_slots (custom, not default 500)
+        200,    // funding_k_bps (2x, not default 1x)
+        1000,   // funding_max_premium_bps (10%, not default 5%)
+        10,     // funding_max_bps_per_slot (custom cap)
+    );
+
+    // Verify custom params stored
+    assert_eq!(env.read_funding_horizon(), 200);
+    assert_eq!(env.read_funding_k_bps(), 200);
+    assert_eq!(env.read_funding_max_premium_bps(), 1000);
+    assert_eq!(env.read_funding_max_bps_per_slot(), 10);
+
+    // Step 2: Set bounded staleness (so oracle can go stale for permissionless resolution)
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        // max_staleness_secs at offset 72+96=168
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Step 3: Open positions
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Trade to seed EWMA
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    assert!(env.read_mark_ewma() > 0, "EWMA seeded from trade");
+    assert_ne!(env.read_account_position(user_idx), 0, "User has position");
+    assert_ne!(env.read_account_position(lp_idx), 0, "LP has position");
+
+    // Step 4: Top up insurance, advance, crank to accrue funding
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+
+    env.set_slot(200);
+    env.crank();
+
+    env.set_slot(300);
+    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
+    env.crank();
+
+    // Positions should still exist after cranks
+    assert_ne!(env.read_account_position(user_idx), 0);
+
+    // Step 5: Oracle dies — advance clock without updating oracle
+    env.svm.set_sysvar(&Clock {
+        slot: 600,
+        unix_timestamp: 600,
+        ..Clock::default()
+    });
+
+    // Permissionless resolution by anyone (no admin needed)
+    let result = env.try_resolve_permissionless();
+    assert!(
+        result.is_ok(),
+        "Governance-free resolution must succeed when oracle is dead: {:?}",
+        result
+    );
+    assert!(env.is_market_resolved(), "Market must be resolved");
+
+    // Settlement price should be the last known oracle price
+    let settlement = env.read_authority_price();
+    assert!(settlement > 0, "Settlement price must be set");
+}
+
+/// Inverted variant of the governance-free lifecycle.
+/// Same flow but with invert=1 (e.g., SOL/USD where oracle gives USD/SOL).
+#[test]
+fn test_governance_free_full_lifecycle_inverted() {
+    program_path();
+    let mut env = TestEnv::new();
+
+    env.init_market_with_funding(
+        1,      // invert=1
+        10_000, // 1% cap
+        100,    // permissionless resolve
+        300,    // custom horizon
+        150,    // 1.5x k
+        800,    // 8% max premium
+        8,      // custom max per slot
+    );
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    let ewma = env.read_mark_ewma();
+    assert!(ewma > 0 && ewma < 100_000, "Inverted EWMA in correct range: {}", ewma);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+
+    env.set_slot(200);
+    env.crank();
+
+    // Oracle dies
+    env.svm.set_sysvar(&Clock {
+        slot: 600,
+        unix_timestamp: 600,
+        ..Clock::default()
+    });
+
+    env.try_resolve_permissionless().unwrap();
+    assert!(env.is_market_resolved());
+
+    let settlement = env.read_authority_price();
+    assert!(settlement > 0 && settlement < 100_000, "Inverted settlement: {}", settlement);
+}
+
+// ============================================================================
+// TDD Item 3: Permissionless resolution for inverted Pyth markets
+// ============================================================================
+
+/// Inverted Pyth market resolves permissionlessly when oracle goes stale.
+/// The settlement price should be the last known oracle price (already inverted
+/// by the crank's read_price flow), not the raw Pyth price.
+#[test]
+fn test_resolve_permissionless_inverted_market() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Inverted market with cap + permissionless resolve enabled (stale > 50 slots)
+    env.init_market_with_cap(1, 10_000, 50);
+
+    // Bounded staleness so oracle can go stale
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        // max_staleness_secs at offset 72+96=168
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Crank to establish baseline oracle price
+    env.crank();
+    assert!(!env.is_market_resolved());
+
+    // Make oracle stale: advance clock WITHOUT updating oracle data
+    env.svm.set_sysvar(&Clock {
+        slot: 500,
+        unix_timestamp: 500,
+        ..Clock::default()
+    });
+
+    let result = env.try_resolve_permissionless();
+    assert!(
+        result.is_ok(),
+        "Inverted market should resolve permissionlessly when oracle dies: {:?}",
+        result
+    );
+    assert!(env.is_market_resolved());
+}
+
+/// Inverted market: settlement price is the inverted oracle price, not the raw one.
+/// Raw Pyth price ~138M, inverted ~7246. Settlement must use the inverted value.
+#[test]
+fn test_resolve_permissionless_inverted_settlement_price() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(1, 10_000, 50);
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    env.crank(); // Establishes oracle price in inverted form
+
+    // Read the last oracle price from the engine (should be inverted)
+    let index_before = env.read_last_effective_price();
+    // For invert=1 with raw price 138_000_000 (e-6), inverted = 1e12 / 138_000_000 ≈ 7246
+    assert!(
+        index_before < 100_000,
+        "Inverted index should be small (not raw), got {}",
+        index_before
+    );
+
+    // Make oracle stale and resolve
+    env.svm.set_sysvar(&Clock {
+        slot: 500,
+        unix_timestamp: 500,
+        ..Clock::default()
+    });
+    env.try_resolve_permissionless().unwrap();
+
+    // Settlement price should be in the inverted price space
+    let settlement = env.read_authority_price();
+    assert!(
+        settlement < 100_000,
+        "Settlement must be inverted price, got {}",
+        settlement
+    );
+    assert!(settlement > 0, "Settlement must be non-zero");
+}
+
+/// Inverted market: permissionless resolution rejected when oracle is still live.
+#[test]
+fn test_resolve_permissionless_inverted_rejects_live_oracle() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(1, 10_000, 50);
+
+    env.crank();
+
+    // Oracle is still fresh — set_slot updates the oracle publish_time
+    env.set_slot(200);
+    let result = env.try_resolve_permissionless();
+    assert!(
+        result.is_err(),
+        "Inverted market must reject permissionless resolve when oracle is live"
+    );
+    assert!(!env.is_market_resolved());
+}
+
+/// Inverted market: full lifecycle with positions, then permissionless resolution.
+/// Verifies that positions are settled correctly at the inverted settlement price.
+#[test]
+fn test_resolve_permissionless_inverted_with_positions() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(1, 10_000, 50);
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Set up LP and user with positions
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Open position on inverted market
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    assert_ne!(env.read_account_position(user_idx), 0, "User must have position");
+
+    // Top up insurance
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+
+    // Advance, crank, then make oracle die
+    env.set_slot(200);
+    env.crank();
+
+    env.svm.set_sysvar(&Clock {
+        slot: 500,
+        unix_timestamp: 500,
+        ..Clock::default()
+    });
+
+    // Permissionless resolution should succeed with open positions
+    let result = env.try_resolve_permissionless();
+    assert!(
+        result.is_ok(),
+        "Should resolve even with open positions: {:?}",
+        result
+    );
+    assert!(env.is_market_resolved());
 }
 

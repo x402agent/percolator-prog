@@ -30,6 +30,8 @@ use percolator_prog::verify::{
     abi_ok,
     // New: Dust math
     accumulate_dust,
+    // Fee-weighted EWMA
+    ewma_update,
     admin_ok,
     // New: Unit scale conversion math
     base_to_units,
@@ -3343,5 +3345,121 @@ fn kani_ins_withdraw_meta_roundtrip() {
     let (rt_bps, rt_slot) = percolator_prog::unpack_ins_withdraw_meta(packed);
     assert_eq!(rt_bps, max_bps);
     assert_eq!(rt_slot, last_slot);
+}
+
+// ============================================================================
+// Fee-Weighted EWMA Proofs
+// ============================================================================
+
+/// Bounded price range for EWMA proofs (keeps verification tractable).
+const KANI_MAX_PRICE: u64 = 1_000_000;
+
+/// For all valid inputs: result is in [min(old, price), max(old, price)].
+/// Fee-weighting cannot push EWMA outside the convex hull of old and price.
+#[kani::proof]
+#[kani::unwind(2)]
+fn proof_ewma_weighted_result_bounded() {
+    let old: u64 = kani::any();
+    let price: u64 = kani::any();
+    let halflife: u64 = kani::any();
+    let last_slot: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    let fee_paid: u64 = kani::any();
+    let min_fee: u64 = kani::any();
+
+    kani::assume(old > 0 && old <= KANI_MAX_PRICE);
+    kani::assume(price > 0 && price <= KANI_MAX_PRICE);
+    kani::assume(halflife > 0 && halflife <= 10_000);
+    kani::assume(now_slot >= last_slot);
+    kani::assume(now_slot - last_slot <= 10_000);
+    kani::assume(min_fee <= KANI_MAX_PRICE);
+
+    let result = ewma_update(old, price, halflife, last_slot, now_slot, fee_paid, min_fee);
+    let lo = core::cmp::min(old, price);
+    let hi = core::cmp::max(old, price);
+    assert!(result >= lo && result <= hi,
+        "EWMA result must be in [min(old,price), max(old,price)]");
+}
+
+/// Monotone in fee: larger fee moves mark more toward price (never less).
+/// For price > old: fee_a < fee_b implies result_a <= result_b.
+/// For price < old: fee_a < fee_b implies result_a >= result_b.
+#[kani::proof]
+#[kani::unwind(2)]
+fn proof_ewma_weighted_monotone_in_fee() {
+    let old: u64 = kani::any();
+    let price: u64 = kani::any();
+    let halflife: u64 = kani::any();
+    let last_slot: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    let fee_a: u64 = kani::any();
+    let fee_b: u64 = kani::any();
+    let min_fee: u64 = kani::any();
+
+    kani::assume(old > 0 && old <= KANI_MAX_PRICE);
+    kani::assume(price > 0 && price <= KANI_MAX_PRICE);
+    kani::assume(halflife > 0 && halflife <= 10_000);
+    kani::assume(now_slot >= last_slot);
+    kani::assume(now_slot - last_slot <= 10_000);
+    kani::assume(min_fee > 0 && min_fee <= KANI_MAX_PRICE);
+    kani::assume(fee_a < fee_b);
+
+    let result_a = ewma_update(old, price, halflife, last_slot, now_slot, fee_a, min_fee);
+    let result_b = ewma_update(old, price, halflife, last_slot, now_slot, fee_b, min_fee);
+
+    if price > old {
+        assert!(result_a <= result_b, "Higher fee must move mark more toward higher price");
+    } else if price < old {
+        assert!(result_a >= result_b, "Higher fee must move mark more toward lower price");
+    }
+    // price == old: both results equal old, trivially monotone
+}
+
+/// Zero fee with weighting enabled never moves the mark.
+#[kani::proof]
+#[kani::unwind(2)]
+fn proof_ewma_zero_fee_identity() {
+    let old: u64 = kani::any();
+    let price: u64 = kani::any();
+    let halflife: u64 = kani::any();
+    let last_slot: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    let min_fee: u64 = kani::any();
+
+    kani::assume(old > 0 && old <= KANI_MAX_PRICE);
+    kani::assume(price > 0 && price <= KANI_MAX_PRICE);
+    kani::assume(halflife > 0 && halflife <= 10_000);
+    kani::assume(now_slot >= last_slot);
+    kani::assume(now_slot - last_slot <= 10_000);
+    kani::assume(min_fee > 0);
+
+    let result = ewma_update(old, price, halflife, last_slot, now_slot, 0, min_fee);
+    assert_eq!(result, old, "Zero fee must never move mark");
+}
+
+/// At-or-above threshold, fee-weighted result equals unweighted (min_fee=0).
+#[kani::proof]
+#[kani::unwind(2)]
+fn proof_ewma_weight_at_threshold_equals_unweighted() {
+    let old: u64 = kani::any();
+    let price: u64 = kani::any();
+    let halflife: u64 = kani::any();
+    let last_slot: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    let min_fee: u64 = kani::any();
+    let fee_paid: u64 = kani::any();
+
+    kani::assume(old > 0 && old <= KANI_MAX_PRICE);
+    kani::assume(price > 0 && price <= KANI_MAX_PRICE);
+    kani::assume(halflife > 0 && halflife <= 10_000);
+    kani::assume(now_slot >= last_slot);
+    kani::assume(now_slot - last_slot <= 10_000);
+    kani::assume(min_fee > 0 && min_fee <= KANI_MAX_PRICE);
+    kani::assume(fee_paid >= min_fee);
+
+    let weighted = ewma_update(old, price, halflife, last_slot, now_slot, fee_paid, min_fee);
+    let unweighted = ewma_update(old, price, halflife, last_slot, now_slot, 0, 0);
+    assert_eq!(weighted, unweighted,
+        "At-or-above threshold must equal unweighted");
 }
 

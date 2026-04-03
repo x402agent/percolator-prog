@@ -724,20 +724,38 @@ pub mod verify {
         halflife_slots: u64,
         last_slot: u64,
         now_slot: u64,
+        fee_paid: u64,
+        mark_min_fee: u64,
     ) -> u64 {
         if old == 0 { return price; }
         let dt = now_slot.saturating_sub(last_slot);
         if dt == 0 { return old; }
         if halflife_slots == 0 { return price; }
+        // Zero fee with weighting enabled: no mark movement
+        if fee_paid == 0 && mark_min_fee > 0 { return old; }
+
         let alpha_bps = (10_000u128 * dt as u128) / (dt as u128 + halflife_slots as u128);
+
+        // Fee weighting: scale alpha by min(fee_paid/mark_min_fee, 1).
+        // Trades below the fee threshold get proportionally reduced mark influence.
+        // This makes wash trading cost-proportional: to move the mark like a
+        // legitimate trade, the attacker must burn the same fee into insurance.
+        let effective_alpha_bps = if mark_min_fee == 0
+            || fee_paid >= mark_min_fee
+        {
+            alpha_bps
+        } else {
+            alpha_bps * (fee_paid as u128) / (mark_min_fee as u128)
+        };
+
         let old128 = old as u128;
         let price128 = price as u128;
         let result = if price >= old {
             let delta = price128 - old128;
-            old128 + (delta * alpha_bps / 10_000)
+            old128 + (delta * effective_alpha_bps / 10_000)
         } else {
             let delta = old128 - price128;
-            old128 - (delta * alpha_bps / 10_000)
+            old128 - (delta * effective_alpha_bps / 10_000)
         };
         core::cmp::min(result, u64::MAX as u128) as u64
     }
@@ -1051,6 +1069,13 @@ pub mod ix {
             insurance_floor: u128,
             /// Slots of oracle staleness for permissionless resolution. 0 = disabled.
             permissionless_resolve_stale_slots: u64,
+            /// Optional custom funding parameters (override defaults when present)
+            funding_horizon_slots: Option<u64>,
+            funding_k_bps: Option<u64>,
+            funding_max_premium_bps: Option<i64>,
+            funding_max_bps_per_slot: Option<i64>,
+            /// Fee-weighted EWMA: min fee for full mark weight. 0 = disabled.
+            mark_min_fee: u64,
         },
         InitUser {
             fee_payment: u64,
@@ -1219,6 +1244,24 @@ pub mod ix {
                     } else {
                         0u64 // disabled by default
                     };
+                    // Optional custom funding parameters (trailing, all-or-nothing:
+                    // if horizon is present, all four must be provided)
+                    let (funding_horizon_slots, funding_k_bps, funding_max_premium_bps, funding_max_bps_per_slot) =
+                        if rest.len() >= 32 {
+                            let h = read_u64(&mut rest)?;
+                            let k = read_u64(&mut rest)?;
+                            let mp = read_i64(&mut rest)?;
+                            let ms = read_i64(&mut rest)?;
+                            (Some(h), Some(k), Some(mp), Some(ms))
+                        } else {
+                            (None, None, None, None)
+                        };
+                    // Optional mark_min_fee (after funding params)
+                    let mark_min_fee = if rest.len() >= 8 {
+                        read_u64(&mut rest)?
+                    } else {
+                        0u64 // disabled
+                    };
                     Ok(Instruction::InitMarket {
                         admin,
                         collateral_mint,
@@ -1237,6 +1280,11 @@ pub mod ix {
                         risk_params,
                         insurance_floor,
                         permissionless_resolve_stale_slots,
+                        funding_horizon_slots,
+                        funding_k_bps,
+                        funding_max_premium_bps,
+                        funding_max_bps_per_slot,
+                        mark_min_fee,
                     })
                 }
                 1 => {
@@ -1806,6 +1854,17 @@ pub mod state {
         pub permissionless_resolve_stale_slots: u64,
         /// Padding for u128 alignment.
         pub _perm_resolve_padding: u64,
+
+        // ========================================
+        // Fee-Weighted EWMA
+        // ========================================
+        /// Minimum fee (in quote atomic units) for full mark EWMA weight.
+        /// Trades with fee below this get proportionally reduced alpha.
+        /// 0 = disabled (all trades get full weight, backward compat).
+        /// Set at InitMarket, immutable.
+        pub mark_min_fee: u64,
+        /// Padding for u128 alignment.
+        pub _min_fee_padding: u64,
     }
 
     pub fn slab_data_mut<'a, 'b>(
@@ -3190,6 +3249,11 @@ pub mod processor {
                 risk_params,
                 insurance_floor,
                 permissionless_resolve_stale_slots,
+                funding_horizon_slots: custom_funding_horizon,
+                funding_k_bps: custom_funding_k,
+                funding_max_premium_bps: custom_max_premium,
+                funding_max_bps_per_slot: custom_max_per_slot,
+                mark_min_fee,
             } => {
                 // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
                 // (feed_id is now passed in instruction data, not as account)
@@ -3376,12 +3440,12 @@ pub mod processor {
                     vault_authority_bump: bump,
                     invert,
                     unit_scale,
-                    // Funding parameters (defaults)
-                    funding_horizon_slots: DEFAULT_FUNDING_HORIZON_SLOTS,
-                    funding_k_bps: DEFAULT_FUNDING_K_BPS,
+                    // Funding parameters (custom overrides or defaults)
+                    funding_horizon_slots: custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS),
+                    funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
                     funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
-                    funding_max_premium_bps: DEFAULT_FUNDING_MAX_PREMIUM_BPS,
-                    funding_max_bps_per_slot: DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+                    funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
+                    funding_max_bps_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_BPS_PER_SLOT),
                     // Threshold parameters (defaults)
                     thresh_floor: DEFAULT_THRESH_FLOOR,
                     thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
@@ -3431,6 +3495,8 @@ pub mod processor {
                     _ewma_padding: 0,
                     permissionless_resolve_stale_slots,
                     _perm_resolve_padding: 0,
+                    mark_min_fee,
+                    _min_fee_padding: 0,
                 };
                 // Hyperp markets must have non-zero cap for index smoothing
                 if is_hyperp && config.oracle_price_cap_e2bps == 0 {
@@ -4071,6 +4137,10 @@ pub mod processor {
 
                 // Side-mode gating is handled inside engine.execute_trade()
 
+                // Snapshot capitals for fee-weighted EWMA (before execute_trade modifies them)
+                let cap_user_before = engine.accounts[user_idx as usize].capital.get();
+                let cap_lp_before = engine.accounts[lp_idx as usize].capital.get();
+
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
@@ -4091,10 +4161,26 @@ pub mod processor {
                         price,
                         config.oracle_price_cap_e2bps,
                     );
+                    // Compute fee_paid for EWMA weighting (mirrors engine fee logic)
+                    let fee_paid_nocpi = if config.mark_min_fee > 0 {
+                        let notional = (size.unsigned_abs())
+                            .saturating_mul(price as u128)
+                            / (percolator::POS_SCALE as u128);
+                        let fee_bps = engine.params.trading_fee_bps;
+                        let fee = if notional > 0 && fee_bps > 0 {
+                            // ceil(notional * fee_bps / 10_000)
+                            (notional.saturating_mul(fee_bps as u128) + 9_999) / 10_000
+                        } else { 0u128 };
+                        let paid_user = core::cmp::min(fee, cap_user_before) as u64;
+                        let paid_lp = core::cmp::min(fee, cap_lp_before) as u64;
+                        paid_user.saturating_add(paid_lp)
+                    } else { 0u64 };
                     config.mark_ewma_e6 = crate::verify::ewma_update(
                         config.mark_ewma_e6, clamped_price,
                         config.mark_ewma_halflife_slots,
                         config.mark_ewma_last_slot, clock.slot,
+                        fee_paid_nocpi,
+                        config.mark_min_fee,
                     );
                     config.mark_ewma_last_slot = clock.slot;
                     engine.funding_rate_bps_per_slot_last =
@@ -4342,6 +4428,11 @@ pub mod processor {
                     let engine = zc::engine_mut(&mut data)?;
 
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
+
+                    // Snapshot capitals for fee-weighted EWMA
+                    let cap_user_cpi = engine.accounts[user_idx as usize].capital.get();
+                    let cap_lp_cpi = engine.accounts[lp_idx as usize].capital.get();
+
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_start");
@@ -4371,12 +4462,27 @@ pub mod processor {
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
+                        // Compute fee_paid for EWMA weighting (TradeCpi path)
+                        let fee_paid_cpi = if config.mark_min_fee > 0 {
+                            let notional = (trade_size.unsigned_abs())
+                                .saturating_mul(exec_price as u128)
+                                / (percolator::POS_SCALE as u128);
+                            let fee_bps = engine.params.trading_fee_bps;
+                            let fee = if notional > 0 && fee_bps > 0 {
+                                (notional.saturating_mul(fee_bps as u128) + 9_999) / 10_000
+                            } else { 0u128 };
+                            let paid_user = core::cmp::min(fee, cap_user_cpi) as u64;
+                            let paid_lp = core::cmp::min(fee, cap_lp_cpi) as u64;
+                            paid_user.saturating_add(paid_lp)
+                        } else { 0u64 };
                         config.mark_ewma_e6 = crate::verify::ewma_update(
                             config.mark_ewma_e6,
                             clamped_exec,
                             config.mark_ewma_halflife_slots,
                             config.mark_ewma_last_slot,
                             clock.slot,
+                            fee_paid_cpi,
+                            config.mark_min_fee,
                         );
                         config.mark_ewma_last_slot = clock.slot;
                         // Stamp funding rate from updated mark
@@ -5017,10 +5123,12 @@ pub mod processor {
                     // Admin push feeds through EWMA like trades do.
                     // Direct overwrite was removed — it would let a single push
                     // reset the trade-derived EWMA, defeating smoothing.
+                    // Admin push always gets full weight (pass min_fee as fee_paid)
                     config.mark_ewma_e6 = crate::verify::ewma_update(
                         config.mark_ewma_e6, clamped,
                         config.mark_ewma_halflife_slots,
                         config.mark_ewma_last_slot, push_clock.slot,
+                        config.mark_min_fee, config.mark_min_fee,
                     );
                     config.mark_ewma_last_slot = push_clock.slot;
                 } else {
