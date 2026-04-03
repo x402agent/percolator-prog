@@ -4153,6 +4153,10 @@ pub mod processor {
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
+                // NOTE: NoOpMatcher fills at oracle price, so mark_ewma converges to oracle
+                // for TradeNoCpi trades. This means TradeNoCpi-only markets have zero premium
+                // and zero funding. Markets that need funding must use TradeCpi with a matcher
+                // that can set exec_price != oracle (creating mark/index divergence).
                 // Only when circuit breaker is active (cap > 0) — without cap,
                 // exec prices are unbounded and EWMA would be manipulable.
                 if config.oracle_price_cap_e2bps > 0 {
@@ -4407,6 +4411,9 @@ pub mod processor {
                 // Revert last_effective_price_e6 for ALL markets — prevents repeated
                 // zero-fills from walking the circuit-breaker baseline toward the raw
                 // oracle price (Hyperp: index ratchet, non-Hyperp: baseline walk).
+                // SAFETY: mark_ewma_e6 is NOT reverted here because the EWMA update
+                // happens AFTER this early return (inside the exec_size != 0 branch below).
+                // Zero-fills never touch the EWMA, so no revert is needed.
                 if ret.exec_size == 0 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let pristine = state::read_config(&data);
@@ -5953,9 +5960,8 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 let config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
-                let (units2, dust) = crate::units::base_to_units(amount, config.unit_scale);
-                let old_dust = state::read_dust_base(&data);
-                state::write_dust_base(&mut data, old_dust.saturating_add(dust));
+                let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+                // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
 
                 let engine = zc::engine_mut(&mut data)?;
                 engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
