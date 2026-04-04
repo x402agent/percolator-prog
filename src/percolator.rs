@@ -1874,8 +1874,10 @@ pub mod state {
         /// Slots of oracle staleness required before anyone can resolve.
         /// 0 = disabled (admin-only resolution). Set at InitMarket, immutable.
         pub permissionless_resolve_stale_slots: u64,
-        /// Padding for u128 alignment.
-        pub _perm_resolve_padding: u64,
+        /// Slot of last successful external oracle read (non-Hyperp only).
+        /// Used by ResolvePermissionless to measure oracle-death duration.
+        /// Stamped by read_price_clamped wrapper on every successful read.
+        pub last_good_oracle_slot: u64,
 
         // ========================================
         // Fee-Weighted EWMA
@@ -2788,7 +2790,20 @@ pub mod processor {
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved()
     // which handles K-pair PnL, checked arithmetic, and all settlement internally.
-    // (function body deleted — ~150 lines of wrapper-level state surgery)
+
+    /// Read oracle price for non-Hyperp markets and stamp last_good_oracle_slot.
+    /// Every successful external oracle read updates the field so
+    /// ResolvePermissionless can measure oracle-death duration accurately.
+    fn read_price_and_stamp(
+        config: &mut state::MarketConfig,
+        a_oracle: &AccountInfo,
+        clock_unix_ts: i64,
+        clock_slot: u64,
+    ) -> Result<u64, ProgramError> {
+        let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts)?;
+        config.last_good_oracle_slot = clock_slot;
+        Ok(price)
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct TradeExecution {
@@ -3465,7 +3480,7 @@ pub mod processor {
                     mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
                     _ewma_padding: 0,
                     permissionless_resolve_stale_slots,
-                    _perm_resolve_padding: 0,
+                    last_good_oracle_slot: 0,
                     mark_min_fee,
                     force_close_delay_slots,
                 };
@@ -3765,7 +3780,7 @@ pub mod processor {
                             &mut config, a_oracle_idx,
                         )?
                     } else {
-                        oracle::read_price_clamped(&mut config, a_oracle_idx, clock.unix_timestamp)?
+                        read_price_and_stamp(&mut config, a_oracle_idx, clock.unix_timestamp, clock.slot)?
                     };
                     state::write_config(&mut data, &config);
                     px
@@ -3991,12 +4006,7 @@ pub mod processor {
                         a_oracle,
                     )?
                 } else {
-                    let p = oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
-                    // Stamp last good oracle slot for permissionless resolution delay.
-                    // ResolvePermissionless checks against this (not last_crank_slot)
-                    // so the delay counts from oracle death, not crank inactivity.
-                    config.last_hyperp_index_slot = clock.slot;
-                    p
+                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
                 };
 
                 state::write_config(&mut data, &config);
@@ -4104,11 +4114,7 @@ pub mod processor {
 
                 // Read oracle price with circuit-breaker clamping
                 let price =
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
-                // Stamp last good oracle slot for permissionless resolution delay
-                if !oracle::is_hyperp_mode(&config) {
-                    config.last_hyperp_index_slot = clock.slot;
-                }
+                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?;
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -4311,7 +4317,7 @@ pub mod processor {
                         &mut config, a_oracle,
                     )?
                 } else {
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
                 };
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -4534,7 +4540,7 @@ pub mod processor {
                         &mut config, a_oracle,
                     )?
                 } else {
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
                 };
                 state::write_config(&mut data, &config);
 
@@ -4619,7 +4625,7 @@ pub mod processor {
                             &mut config, a_oracle,
                         )?
                     } else {
-                        oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                        read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
                     };
                     state::write_config(&mut data, &config);
                     px
@@ -4641,11 +4647,6 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Best-effort touch to settle maintenance fees before force-close.
-                    // force_close_resolved does not run settle_maintenance_fee_internal.
-                    let _ = engine.touch_account_full(
-                        user_idx as usize, price, config.resolution_slot,
-                    );
                     engine.force_close_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -5779,10 +5780,6 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Best-effort touch to settle maintenance fees before force-close.
-                let _ = engine.touch_account_full(
-                    user_idx as usize, price, config.resolution_slot,
-                );
                 let amt_units = engine.force_close_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
@@ -5882,7 +5879,7 @@ pub mod processor {
                         &mut config, a_oracle,
                     )?
                 } else {
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
                 };
                 state::write_config(&mut data, &config);
 
@@ -5993,7 +5990,7 @@ pub mod processor {
                         &mut config, a_oracle,
                     )?
                 } else {
-                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                    read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot)?
                 };
                 state::write_config(&mut data, &config);
 
@@ -6090,16 +6087,20 @@ pub mod processor {
                     }
                 }
 
-                // Require oracle has been dead for the configured delay.
-                // Non-Hyperp: use last_hyperp_index_slot (repurposed as last_good_oracle_slot)
-                // which is stamped on every successful external oracle read.
-                // Hyperp: use last_crank_slot (mark staleness already checked above).
+                // Require oracle/mark has been dead for the configured delay.
+                // Non-Hyperp: use dedicated last_good_oracle_slot, stamped on every
+                //   successful read_price_clamped across all instruction paths.
+                // Hyperp: use max(mark_ewma_last_slot, last_mark_push_slot) — the
+                //   same signal used for the mark staleness check above, so both
+                //   checks use consistent liveness information.
                 {
                     let reference_slot = if !is_hyperp {
-                        config.last_hyperp_index_slot // = last_good_oracle_slot
+                        config.last_good_oracle_slot
                     } else {
-                        let engine = zc::engine_ref(&data)?;
-                        engine.last_crank_slot
+                        core::cmp::max(
+                            config.mark_ewma_last_slot,
+                            config.last_mark_push_slot as u64,
+                        )
                     };
                     let oracle_dead_duration = clock.slot.saturating_sub(reference_slot);
                     if oracle_dead_duration < config.permissionless_resolve_stale_slots {
@@ -6233,11 +6234,6 @@ pub mod processor {
                 );
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
-                // Best-effort touch to settle maintenance fees before force-close.
-                let frozen_slot = config.resolution_slot;
-                let _ = engine.touch_account_full(
-                    user_idx as usize, price, frozen_slot,
-                );
                 let amt_units = engine.force_close_resolved(user_idx)
                     .map_err(map_risk_error)?;
 
