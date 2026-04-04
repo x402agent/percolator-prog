@@ -4664,6 +4664,9 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
+                    let _ = engine.touch_account_full(
+                        user_idx as usize, price, config.resolution_slot,
+                    );
                     engine.force_close_resolved(user_idx)
                         .map_err(map_risk_error)?
                 } else {
@@ -5797,6 +5800,12 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
+                // Best-effort touch to settle K-pair PnL and maintenance fees.
+                // If touch fails (epoch mismatch, overflow), force_close_resolved
+                // handles it via its manual K-pair fallback.
+                let _ = engine.touch_account_full(
+                    user_idx as usize, price, config.resolution_slot,
+                );
                 let amt_units = engine.force_close_resolved(user_idx)
                     .map_err(map_risk_error)?;
                 let amt_units_u64: u64 = amt_units
@@ -6251,6 +6260,9 @@ pub mod processor {
                 );
                 verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
+                let _ = engine.touch_account_full(
+                    user_idx as usize, price, config.resolution_slot,
+                );
                 let amt_units = engine.force_close_resolved(user_idx)
                     .map_err(map_risk_error)?;
 

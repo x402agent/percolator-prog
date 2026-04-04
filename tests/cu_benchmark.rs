@@ -100,6 +100,8 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    // verification_level = Full (1) at offset 40
+    data[40..42].copy_from_slice(&1u16.to_le_bytes());
     // feed_id at offset 42
     data[42..74].copy_from_slice(feed_id);
     // price at offset 74
@@ -1888,13 +1890,19 @@ fn benchmark_all_instructions() {
 
     // --- PushOraclePrice (Tag 17) ---
     {
+        // Advance clock so push timestamp passes anchoring check
+        env.svm.set_sysvar(&solana_sdk::clock::Clock {
+            slot: 700,
+            unix_timestamp: 700,
+            ..Default::default()
+        });
         let ix = Instruction {
             program_id: env.program_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
             ],
-            data: encode_push_oracle_price(100_000_000, 600),
+            data: encode_push_oracle_price(100_000_000, 100),
         };
         let cu = measure(&mut env.svm, ix, &[&admin]).unwrap();
         println!("PushOraclePrice:       {:>8} CU", cu);
@@ -2013,6 +2021,7 @@ fn benchmark_all_instructions() {
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(env.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
             ],
             data: encode_resolve_market(),
         };

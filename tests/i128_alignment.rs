@@ -24,7 +24,7 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096) - native 128-bit fields
-const SLAB_LEN: usize = 1156736;
+const SLAB_LEN: usize = 1156784;
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -357,6 +357,7 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    data[40..42].copy_from_slice(&1u16.to_le_bytes()); // verification_level = Full
     data[42..74].copy_from_slice(feed_id);
     data[74..82].copy_from_slice(&price.to_le_bytes());
     data[82..90].copy_from_slice(&conf.to_le_bytes());
@@ -594,7 +595,7 @@ fn test_bpf_i128_alignment() {
         lp_ata,
         SolanaAccount {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &lp.pubkey(), 0),
+            data: make_token_account_data(&mint, &lp.pubkey(), 100),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
@@ -624,10 +625,11 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new(lp_ata, false),
             AccountMeta::new(vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
             AccountMeta::new_readonly(matcher, false),
             AccountMeta::new_readonly(ctx, false),
         ],
-        data: encode_init_lp(&matcher, &ctx, 0),
+        data: encode_init_lp(&matcher, &ctx, 100),
     };
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -647,7 +649,7 @@ fn test_bpf_i128_alignment() {
         user_ata,
         SolanaAccount {
             lamports: 1_000_000,
-            data: make_token_account_data(&mint, &user.pubkey(), 0),
+            data: make_token_account_data(&mint, &user.pubkey(), 200_000_000_000),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
@@ -666,7 +668,7 @@ fn test_bpf_i128_alignment() {
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(pyth_col, false),
         ],
-        data: encode_init_user(0),
+        data: encode_init_user(100),
     };
     let tx = Transaction::new_signed_with_payer(
         &[ix],

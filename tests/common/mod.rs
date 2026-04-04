@@ -7623,10 +7623,9 @@ impl TestEnv {
     /// Read insurance_floor from RiskEngine (standalone field, not in RiskParams)
     pub fn read_insurance_floor(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // RiskEngine.insurance_floor is the field immediately before the `used`
-        // bitmap array.  BITMAP_OFFSET = ENGINE_OFF + 608 = 520 + 608 = 1128.
-        // insurance_floor is u128 (16 bytes), so it starts at 1128 - 16 = 1112.
-        pub const INSURANCE_FLOOR_OFFSET: usize = 584 + 592 - 16;
+        // insurance_floor is now in params.insurance_floor (no separate engine field).
+        // params at engine offset 32, insurance_floor at params offset 168.
+        pub const INSURANCE_FLOOR_OFFSET: usize = 584 + 32 + 176;
         u128::from_le_bytes(
             slab_data[INSURANCE_FLOOR_OFFSET..INSURANCE_FLOOR_OFFSET + 16]
                 .try_into()
