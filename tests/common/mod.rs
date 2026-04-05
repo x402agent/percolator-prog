@@ -137,7 +137,7 @@ fn append_default_extended_tail(data: &mut Vec<u8>) {
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps (default)
     data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot (default)
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
-    let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 }; data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots (default tail has permissionless=0)
 }
 
 /// Encode InitMarket instruction with invert flag
@@ -337,7 +337,8 @@ pub fn encode_init_market_with_funding(
     data.extend_from_slice(&funding_max_premium_bps.to_le_bytes());
     data.extend_from_slice(&funding_max_bps_per_slot.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee (disabled)
-    let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 }; data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
+    let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 };
+    data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
     data
 }
 
@@ -364,7 +365,8 @@ pub fn encode_init_market_with_min_fee(
     // Truncate default mark_min_fee + force_close_delay (16 bytes), replace with custom
     data.truncate(data.len() - 16);
     data.extend_from_slice(&mark_min_fee.to_le_bytes());
-    let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 }; data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
+    let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 };
+    data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
     data
 }
 
@@ -419,7 +421,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
     // mark_min_fee
     data.extend_from_slice(&mark_min_fee.to_le_bytes());
-    let fc = if permissionless_resolve_stale_slots > 0 { 50u64 } else { 0u64 }; data.extend_from_slice(&fc.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
     data
 }
 

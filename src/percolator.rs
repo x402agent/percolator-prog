@@ -4977,10 +4977,16 @@ pub mod processor {
                 {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    let _ = engine.run_end_of_instruction_lifecycle(
+                    match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
                         compute_current_funding_rate(&config),
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(percolator::RiskError::CorruptState) => {
+                            return Err(map_risk_error(percolator::RiskError::CorruptState));
+                        }
+                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
+                    }
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5163,10 +5169,16 @@ pub mod processor {
                 if is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    let _ = engine.run_end_of_instruction_lifecycle(
+                    match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
                         compute_current_funding_rate(&config),
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(percolator::RiskError::CorruptState) => {
+                            return Err(map_risk_error(percolator::RiskError::CorruptState));
+                        }
+                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
+                    }
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5248,10 +5260,16 @@ pub mod processor {
                 if is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
                     let mut ctx = percolator::InstructionContext::new();
-                    let _ = engine.run_end_of_instruction_lifecycle(
+                    match engine.run_end_of_instruction_lifecycle(
                         &mut ctx,
                         compute_current_funding_rate(&config),
-                    );
+                    ) {
+                        Ok(()) => {}
+                        Err(percolator::RiskError::CorruptState) => {
+                            return Err(map_risk_error(percolator::RiskError::CorruptState));
+                        }
+                        Err(_) => {} // non-fatal (side reset may fail on frozen ADL state)
+                    }
                 }
                 state::write_config(&mut data, &config);
             }
