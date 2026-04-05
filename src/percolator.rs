@@ -2901,17 +2901,8 @@ pub mod processor {
         )
     }
 
-    /// Validated funding rate stamp (spec §4.12 compliance).
-    /// Clamps rate to MAX_ABS_FUNDING_BPS_PER_SLOT before writing,
-    /// ensuring the engine field never exceeds the protocol bound.
-    fn stamp_funding_rate(engine: &mut RiskEngine, config: &MarketConfig) {
-        let rate = compute_current_funding_rate(config);
-        let clamped = rate.clamp(
-            -percolator::MAX_ABS_FUNDING_BPS_PER_SLOT,
-            percolator::MAX_ABS_FUNDING_BPS_PER_SLOT,
-        );
-        engine.funding_rate_bps_per_slot_last = clamped;
-    }
+    // stamp_funding_rate removed — all paths now use engine.run_end_of_instruction_lifecycle
+    // or the engine's internal recompute_r_last_from_final_state. No direct field writes.
 
     fn execute_trade_with_matcher<M: MatchingEngine>(
         engine: &mut RiskEngine,
@@ -4981,10 +4972,15 @@ pub mod processor {
                 config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
-                // Stamp post-change funding rate for next interval (all market types)
+                // Run end-of-instruction lifecycle after accrue + config change.
+                // Finalizes pending resets triggered by the accrual.
                 {
                     let engine = zc::engine_mut(&mut data)?;
-                    stamp_funding_rate(engine, &config);
+                    let mut ctx = percolator::InstructionContext::new();
+                    let _ = engine.run_end_of_instruction_lifecycle(
+                        &mut ctx,
+                        compute_current_funding_rate(&config),
+                    );
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5160,10 +5156,17 @@ pub mod processor {
                     // (crank/trade/withdraw) so admin can't poison it to bypass
                     // the settlement circuit breaker in ResolveMarket.
                 }
-                // Stamp post-change funding rate for next interval
+                // Run end-of-instruction lifecycle (§5.7-5.8) after accrue_market_to.
+                // This finalizes any pending DrainOnly→ResetPending→Normal transitions
+                // triggered by the accrual. Without this, sides could stay DrainOnly
+                // with OI=0 until the next standard-lifecycle instruction.
                 if is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
-                    stamp_funding_rate(engine, &config);
+                    let mut ctx = percolator::InstructionContext::new();
+                    let _ = engine.run_end_of_instruction_lifecycle(
+                        &mut ctx,
+                        compute_current_funding_rate(&config),
+                    );
                 }
                 state::write_config(&mut data, &config);
             }
@@ -5241,10 +5244,14 @@ pub mod processor {
                 }
 
                 config.oracle_price_cap_e2bps = max_change_e2bps;
-                // Stamp post-change funding rate for next interval
+                // Run end-of-instruction lifecycle after accrue + cap change.
                 if is_hyperp {
                     let engine = zc::engine_mut(&mut data)?;
-                    stamp_funding_rate(engine, &config);
+                    let mut ctx = percolator::InstructionContext::new();
+                    let _ = engine.run_end_of_instruction_lifecycle(
+                        &mut ctx,
+                        compute_current_funding_rate(&config),
+                    );
                 }
                 state::write_config(&mut data, &config);
             }
