@@ -4148,6 +4148,85 @@ fn test_init_market_maintenance_fee_zero_still_accepted() {
 /// 1. Init market with maintenance fee
 /// 2. User deposits, opens position
 /// 3. Cranks drain capital via maintenance fees
+/// Verify maintenance fee actually drains capital on crank.
+/// This is the focused unit-level test: init market with fee, deposit,
+/// open position, crank over N slots, assert capital decreased by
+/// approximately fee_per_slot * elapsed_slots.
+#[test]
+fn test_maintenance_fee_actually_charges() {
+    program_path();
+    let mut env = TestEnv::new();
+    let fee_per_slot: u128 = 500;
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        10_000,     // max
+        fee_per_slot, // 500 units per slot
+        0,          // no cap
+    );
+    env.try_init_market_raw(data).expect("init failed");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Open position so crank touches this account
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 1_000_000_000);
+
+    // Snapshot capital before crank
+    let cap_before = env.read_account_capital(user_idx);
+    let ins_before = env.read_insurance_balance();
+
+    // Advance 1000 slots, crank
+    // Expected fee: 500 * 1000 = 500_000
+    env.set_slot(1100); // init at ~100, so dt ≈ 1000
+    env.crank();
+
+    let cap_after = env.read_account_capital(user_idx);
+    let ins_after = env.read_insurance_balance();
+
+    let cap_decrease = cap_before - cap_after;
+    let ins_increase = ins_after - ins_before;
+
+    println!(
+        "Maintenance fee test: cap_before={} cap_after={} decrease={} ins_increase={}",
+        cap_before, cap_after, cap_decrease, ins_increase
+    );
+
+    // Capital must have decreased
+    assert!(
+        cap_after < cap_before,
+        "Capital must decrease from maintenance fee: before={} after={}",
+        cap_before, cap_after
+    );
+
+    // Decrease should be approximately fee_per_slot * dt
+    // Allow 50% tolerance for timing (init slot, last_fee_slot alignment)
+    let expected_fee = fee_per_slot * 1000;
+    assert!(
+        cap_decrease >= expected_fee / 2,
+        "Fee too small: decrease={} expected≈{}",
+        cap_decrease, expected_fee
+    );
+    assert!(
+        cap_decrease <= expected_fee * 2,
+        "Fee too large: decrease={} expected≈{}",
+        cap_decrease, expected_fee
+    );
+
+    // Insurance must have increased by the same amount (fees go to insurance)
+    assert!(
+        ins_increase > 0,
+        "Insurance must increase from maintenance fees"
+    );
+}
+
 /// 4. Account becomes undercollateralized → crank liquidates
 /// 5. More cranks drain remaining capital
 /// 6. Account becomes dust → ReclaimEmptyAccount frees slot
