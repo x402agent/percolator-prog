@@ -36,9 +36,11 @@ fn test_trade_inserts_both_accounts_into_buffer() {
     // Trade opens positions
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
 
-    // After trade: both should be in buffer
+    // After trade: exactly both should be in buffer
     let buf = env.read_risk_buffer();
-    assert!(buf.count >= 2, "Buffer must contain both trade participants: count={}", buf.count);
+    assert_eq!(buf.count, 2, "Buffer must contain exactly both trade participants: count={}", buf.count);
+    assert!(buf.find(user_idx).is_some(), "User must be in buffer");
+    assert!(buf.find(lp_idx).is_some(), "LP must be in buffer");
 
     // Verify the entries have nonzero notional
     for i in 0..buf.count as usize {
@@ -74,12 +76,11 @@ fn test_trade_close_removes_from_buffer() {
     env.trade(&user, &lp, lp_idx, user_idx, -1_000_000);
 
     let buf = env.read_risk_buffer();
-    // Both positions are zero now — both should be removed
-    assert!(
-        buf.count < count_after_open,
-        "Buffer count must decrease after closing positions: before={} after={}",
-        count_after_open, buf.count
-    );
+    // Both positions are zero now — both must be removed
+    assert_eq!(buf.count, 0,
+        "Buffer must be empty after closing all positions: count={}", buf.count);
+    assert!(buf.find(user_idx).is_none(), "User must be removed from buffer");
+    assert!(buf.find(lp_idx).is_none(), "LP must be removed from buffer");
 }
 
 // ============================================================================
