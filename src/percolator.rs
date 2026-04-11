@@ -4780,14 +4780,15 @@ pub mod processor {
                     let mut data = state::slab_data_mut(a_slab)?;
                     state::write_req_nonce(&mut data, req_id);
                     state::write_config(&mut data, &config);
-                    // Update risk buffer
+                    // Update risk buffer — use oracle price for notional ranking (H1/M9).
+                    // exec_price is gameable by a colluding matcher; oracle price is not.
                     let mut buf = state::read_risk_buffer(&data);
                     for &(idx, eff) in &[(user_idx, user_eff_cpi), (lp_idx, lp_eff_cpi)] {
                         if eff == 0 {
                             buf.remove(idx);
                         } else {
                             let notional = percolator::wide_math::mul_div_floor_u128(
-                                eff.unsigned_abs(), exec_price as u128, percolator::POS_SCALE,
+                                eff.unsigned_abs(), price as u128, percolator::POS_SCALE,
                             );
                             buf.upsert(idx, notional);
                         }
