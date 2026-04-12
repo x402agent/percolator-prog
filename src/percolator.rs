@@ -3785,13 +3785,11 @@ pub mod processor {
                 // All resolved operations use engine.current_slot (frozen at
                 // last pre-resolution crank) instead of clock.slot.
                 if state::is_resolved(&data) {
-                    let config = state::read_config(&data);
-                    let settlement_price = config.authority_price_e6;
-                    if settlement_price == 0 {
+                    // Use engine's authoritative resolved state, not mutable config.
+                    let engine = zc::engine_mut(&mut data)?;
+                    if engine.resolved_price == 0 {
                         return Err(ProgramError::InvalidAccountData);
                     }
-
-                    let engine = zc::engine_mut(&mut data)?;
 
                     // Resolved crank: no per-account settlement here.
                     // Accounts are settled by ForceCloseResolved / CloseAccount
@@ -4633,7 +4631,9 @@ pub mod processor {
                 let resolved = state::is_resolved(&data);
                 let clock = Clock::from_account_info(&accounts[6])?;
                 let price = if resolved {
-                    let settlement = config.authority_price_e6;
+                    // Use engine's authoritative resolved price, not mutable config.
+                    let eng = zc::engine_ref(&data)?;
+                    let settlement = eng.resolved_price;
                     if settlement == 0 {
                         return Err(ProgramError::InvalidAccountData);
                     }
@@ -4825,24 +4825,35 @@ pub mod processor {
                         return Err(PercolatorError::InvalidConfigParam.into());
                     }
 
-                    if !state::is_resolved(&data) {
+                    let resolved = state::is_resolved(&data);
+                    let engine = zc::engine_ref(&data)?;
+                    let has_accounts = engine.num_used_accounts > 0;
+
+                    if !resolved {
+                        // Live market: require both permissionless paths
                         let has_permissionless_resolve = config.permissionless_resolve_stale_slots > 0;
                         let has_permissionless_force_close = config.force_close_delay_slots > 0;
                         if !has_permissionless_resolve || !has_permissionless_force_close {
                             return Err(PercolatorError::InvalidConfigParam.into());
                         }
+                    } else if has_accounts {
+                        // Resolved market with open accounts: require permissionless
+                        // force-close so abandoned accounts can still be cleaned up.
+                        if config.force_close_delay_slots == 0 {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
                     }
+                    // Resolved + no accounts: allow unconditionally
 
                     // Clear oracle authority on burn. PushOraclePrice authorizes off
                     // config.oracle_authority, not header.admin. Without this, a
                     // "burned" market still has a privileged signer that can push
                     // prices, influence liquidations/funding, and block permissionless
                     // resolution by staying fresh.
+                    // NOTE: do NOT clear config.authority_price_e6 — it may be needed
+                    // for legacy paths. Resolved exits now use engine.resolved_price.
                     if config.oracle_authority != [0u8; 32] {
                         config.oracle_authority = [0u8; 32];
-                        // Clear stored authority price so stale pushed price
-                        // can't be used for admin resolution (which is now impossible anyway).
-                        config.authority_price_e6 = 0;
                         config.authority_timestamp = 0;
                         state::write_config(&mut data, &config);
                     }
@@ -5908,13 +5919,12 @@ pub mod processor {
                 accounts::expect_key(a_pda, &auth)?;
 
                 let clock = Clock::from_account_info(&accounts[6])?;
-                // Resolved markets use fixed settlement price.
-                let price = config.authority_price_e6;
+                // Use engine's authoritative resolved price, not mutable config.
+                let engine = zc::engine_mut(&mut data)?;
+                let price = engine.resolved_price;
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
-
-                let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, user_idx)?;
 
@@ -6378,12 +6388,12 @@ pub mod processor {
                 )?;
                 accounts::expect_key(a_pda, &auth)?;
 
-                let price = config.authority_price_e6;
+                // Use engine's authoritative resolved price, not mutable config.
+                let engine = zc::engine_mut(&mut data)?;
+                let price = engine.resolved_price;
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
-
-                let engine = zc::engine_mut(&mut data)?;
                 check_idx(engine, user_idx)?;
 
                 let owner_pubkey = Pubkey::new_from_array(
