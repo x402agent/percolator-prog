@@ -2108,6 +2108,10 @@ pub mod state {
     /// Prevents WithdrawInsuranceLimited from misinterpreting oracle
     /// timestamps as policy metadata via authority_timestamp bit patterns.
     pub const FLAG_POLICY_CONFIGURED: u8 = 1 << 1;
+    /// Flag bit: CPI is in progress (reentrancy guard for TradeCpi).
+    /// Set before matcher CPI, cleared after. Any reentrant instruction
+    /// that sees this flag must abort.
+    pub const FLAG_CPI_IN_PROGRESS: u8 = 1 << 2;
 
     /// Read market flags from _padding[0].
     pub fn read_flags(data: &[u8]) -> u8 {
@@ -2127,6 +2131,23 @@ pub mod state {
     /// Set the resolved flag.
     pub fn set_resolved(data: &mut [u8]) {
         let flags = read_flags(data) | FLAG_RESOLVED;
+        write_flags(data, flags);
+    }
+
+    /// Check if CPI is in progress (reentrancy guard).
+    pub fn is_cpi_in_progress(data: &[u8]) -> bool {
+        read_flags(data) & FLAG_CPI_IN_PROGRESS != 0
+    }
+
+    /// Set CPI-in-progress flag (call before matcher CPI).
+    pub fn set_cpi_in_progress(data: &mut [u8]) {
+        let flags = read_flags(data) | FLAG_CPI_IN_PROGRESS;
+        write_flags(data, flags);
+    }
+
+    /// Clear CPI-in-progress flag (call after matcher CPI returns).
+    pub fn clear_cpi_in_progress(data: &mut [u8]) {
+        let flags = read_flags(data) & !FLAG_CPI_IN_PROGRESS;
         write_flags(data, flags);
     }
 
@@ -4484,6 +4505,12 @@ pub mod processor {
                     if state::is_resolved(&*data) {
                         return Err(ProgramError::InvalidAccountData);
                     }
+                    // Reentrancy guard: reject if another CPI is in progress.
+                    // Prevents malicious matcher from re-entering TradeCpi during
+                    // its callback, which would execute two trades for one user signature.
+                    if state::is_cpi_in_progress(&*data) {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
 
                     let config = state::read_config(&*data);
 
@@ -4578,8 +4605,21 @@ pub mod processor {
                 let bump_arr = [bump];
                 let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
 
+                // Set reentrancy guard BEFORE CPI. Any reentrant TradeCpi will
+                // see FLAG_CPI_IN_PROGRESS and abort.
+                {
+                    let mut data = state::slab_data_mut(a_slab)?;
+                    state::set_cpi_in_progress(&mut data);
+                }
+
                 // Phase 2: Use zc helper for CPI - slab not passed to avoid ExternalAccountDataModified
                 zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, a_matcher_prog, seeds)?;
+
+                // Clear reentrancy guard after CPI returns.
+                {
+                    let mut data = state::slab_data_mut(a_slab)?;
+                    state::clear_cpi_in_progress(&mut data);
+                }
 
                 let ctx_data = a_matcher_ctx.try_borrow_data()?;
                 let ret = crate::matcher_abi::read_matcher_return(&ctx_data)?;
