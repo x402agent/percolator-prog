@@ -55,7 +55,6 @@ pub mod constants {
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
     pub const DEFAULT_FUNDING_K_BPS: u64 = 100; // 1.00x multiplier
-    pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // Funding scale factor (e6 units)
     pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500; // cap premium at 5.00%
     pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5; // cap per-slot funding
     pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000; // 1% per slot max price change for Hyperp
@@ -65,41 +64,6 @@ pub mod constants {
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
 
-    // Matcher call ABI offsets (67-byte layout)
-    // byte 0: tag (u8)
-    // 1..9: req_id (u64)
-    // 9..11: lp_idx (u16)
-    // 11..19: lp_account_id (u64)
-    // 19..27: oracle_price_e6 (u64)
-    // 27..43: req_size (i128)
-    // 43..67: reserved (must be zero)
-    pub const CALL_OFF_TAG: usize = 0;
-    pub const CALL_OFF_REQ_ID: usize = 1;
-    pub const CALL_OFF_LP_IDX: usize = 9;
-    pub const CALL_OFF_LP_ACCOUNT_ID: usize = 11;
-    pub const CALL_OFF_ORACLE_PRICE: usize = 19;
-    pub const CALL_OFF_REQ_SIZE: usize = 27;
-    pub const CALL_OFF_PADDING: usize = 43;
-
-    // Matcher return ABI offsets (64-byte prefix)
-    pub const RET_OFF_ABI_VERSION: usize = 0;
-    pub const RET_OFF_FLAGS: usize = 4;
-    pub const RET_OFF_EXEC_PRICE: usize = 8;
-    pub const RET_OFF_EXEC_SIZE: usize = 16;
-    pub const RET_OFF_REQ_ID: usize = 32;
-    pub const RET_OFF_LP_ACCOUNT_ID: usize = 40;
-    pub const RET_OFF_ORACLE_PRICE: usize = 48;
-    pub const RET_OFF_RESERVED: usize = 56;
-
-    // Default threshold parameters (used at init_market, can be changed via update_config)
-    pub const DEFAULT_THRESH_FLOOR: u128 = 0;
-    pub const DEFAULT_THRESH_RISK_BPS: u64 = 50; // 0.50%
-    pub const DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS: u64 = 10;
-    pub const DEFAULT_THRESH_STEP_BPS: u64 = 500; // 5% max step
-    pub const DEFAULT_THRESH_ALPHA_BPS: u64 = 1000; // 10% EWMA
-    pub const DEFAULT_THRESH_MIN: u128 = 0;
-    pub const DEFAULT_THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
-    pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
 }
 
 // 1b. Insurance withdraw helpers
@@ -354,12 +318,6 @@ pub mod verify {
     // Only this program can sign for the PDA (invoke_signed), so it's
     // always system-owned with zero data. Extra checks wasted CUs.
 
-    /// Oracle feed ID check: provided feed_id must match expected config feed_id.
-    #[inline]
-    pub fn oracle_feed_id_ok(expected: [u8; 32], provided: [u8; 32]) -> bool {
-        expected == provided
-    }
-
     /// Slab shape validation.
     /// Slab must be owned by this program and have correct length.
     #[derive(Clone, Copy)]
@@ -376,24 +334,6 @@ pub mod verify {
     // =========================================================================
     // Per-instruction authorization helpers
     // =========================================================================
-
-    /// Single-owner instruction authorization (Deposit, Withdraw, Close).
-    #[inline]
-    pub fn single_owner_authorized(stored_owner: [u8; 32], signer: [u8; 32]) -> bool {
-        owner_ok(stored_owner, signer)
-    }
-
-    /// Trade authorization for TradeNoCpi: both user and LP must be signers.
-    /// For TradeCpi, LP authorization uses key-equality + CPI binding instead.
-    #[inline]
-    pub fn trade_authorized(
-        user_owner: [u8; 32],
-        user_signer: [u8; 32],
-        lp_owner: [u8; 32],
-        lp_signer: [u8; 32],
-    ) -> bool {
-        owner_ok(user_owner, user_signer) && owner_ok(lp_owner, lp_signer)
-    }
 
     // =========================================================================
     // TradeCpi decision logic - models the full wrapper policy
@@ -735,70 +675,6 @@ pub mod verify {
     }
 
     // =========================================================================
-    // Unit scale conversion math (pure logic)
-    // =========================================================================
-
-    /// Convert base amount to (units, dust).
-    /// If scale == 0: returns (base, 0).
-    /// Otherwise: units = base / scale, dust = base % scale.
-    #[inline]
-    pub fn base_to_units(base: u64, scale: u32) -> (u64, u64) {
-        if scale == 0 {
-            return (base, 0);
-        }
-        let s = scale as u64;
-        (base / s, base % s)
-    }
-
-    /// Convert units to base amount (saturating).
-    /// If scale == 0: returns units.
-    /// Otherwise: returns units * scale (saturating).
-    #[inline]
-    pub fn units_to_base(units: u64, scale: u32) -> u64 {
-        if scale == 0 {
-            return units;
-        }
-        units.saturating_mul(scale as u64)
-    }
-
-    // =========================================================================
-    // Withdraw alignment check (pure logic)
-    // =========================================================================
-
-    /// Check if withdraw amount is properly aligned to unit_scale.
-    /// If scale == 0: always aligned.
-    /// Otherwise: amount must be divisible by scale.
-    #[inline]
-    pub fn withdraw_amount_aligned(amount: u64, scale: u32) -> bool {
-        if scale == 0 {
-            return true;
-        }
-        amount % (scale as u64) == 0
-    }
-
-    // =========================================================================
-    // Dust bookkeeping math (pure logic)
-    // =========================================================================
-
-    /// Accumulate dust: old_dust + added_dust (saturating).
-    #[inline]
-    pub fn accumulate_dust(old_dust: u64, added_dust: u64) -> u64 {
-        old_dust.saturating_add(added_dust)
-    }
-
-    /// Sweep dust into units: returns (units_swept, remaining_dust).
-    /// If scale == 0: returns (dust, 0) - all dust becomes units.
-    /// Otherwise: units_swept = dust / scale, remaining = dust % scale.
-    #[inline]
-    pub fn sweep_dust(dust: u64, scale: u32) -> (u64, u64) {
-        if scale == 0 {
-            return (dust, 0);
-        }
-        let s = scale as u64;
-        (dust / s, dust % s)
-    }
-
-    // =========================================================================
     // InitMarket scale validation (pure logic)
     // =========================================================================
 
@@ -809,18 +685,6 @@ pub mod verify {
     #[inline]
     pub fn init_market_scale_ok(unit_scale: u32) -> bool {
         unit_scale <= crate::constants::MAX_UNIT_SCALE
-    }
-
-    // =========================================================================
-    // WithdrawInsurance vault accounting (pure logic)
-    // =========================================================================
-
-    /// Compute vault balance after withdrawing insurance.
-    /// Returns None if insurance exceeds vault (should never happen).
-    /// Invariant: vault_after = vault_before - insurance_amount
-    #[inline]
-    pub fn withdraw_insurance_vault(vault_before: u128, insurance_amount: u128) -> Option<u128> {
-        vault_before.checked_sub(insurance_amount)
     }
 
     // =========================================================================
@@ -1197,8 +1061,6 @@ pub mod ix {
             unit_scale: u32,
             /// Initial mark price in e6 format. Required (non-zero) if Hyperp mode.
             initial_mark_price_e6: u64,
-            /// Per-market admin limit: max maintenance fee per slot
-            max_maintenance_fee_per_slot: u128,
             /// Per-market admin limit: max insurance floor
             max_insurance_floor: u128,
             /// Per-market admin limit: min oracle price cap (e2bps floor for non-zero values)
@@ -1207,8 +1069,6 @@ pub mod ix {
             insurance_withdraw_max_bps: u16,
             /// Insurance withdrawal: cooldown slots between withdrawals
             insurance_withdraw_cooldown_slots: u64,
-            /// Max insurance_floor change per day (0 = locked after init)
-            max_insurance_floor_change_per_day: u128,
             risk_params: RiskParams,
             insurance_floor: u128,
             /// Slots of oracle staleness for permissionless resolution. 0 = disabled.
@@ -1270,12 +1130,9 @@ pub mod ix {
         /// Requires: no active accounts, no vault funds, no insurance funds.
         CloseSlab,
         /// Update configurable funding parameters. Admin only.
-        /// Threshold fields are decoded for wire compatibility but ignored
-        /// (insurance_floor is immutable per spec §2.2.1).
         UpdateConfig {
             funding_horizon_slots: u64,
             funding_k_bps: u64,
-            funding_inv_scale_notional_e6: u128,
             funding_max_premium_bps: i64,
             funding_max_bps_per_slot: i64,
         },
@@ -1369,7 +1226,7 @@ pub mod ix {
                     let invert = read_u8(&mut rest)?;
                     let unit_scale = read_u32(&mut rest)?;
                     let initial_mark_price_e6 = read_u64(&mut rest)?;
-                    let max_maintenance_fee_per_slot = read_u128(&mut rest)?;
+                    let _ = read_u128(&mut rest)?; // max_maintenance_fee_per_slot (removed)
                     let max_insurance_floor = read_u128(&mut rest)?;
                     let min_oracle_price_cap_e2bps = read_u64(&mut rest)?;
                     // Insurance withdrawal limits (immutable after init)
@@ -1382,7 +1239,6 @@ pub mod ix {
                     let (
                         insurance_withdraw_max_bps,
                         insurance_withdraw_cooldown_slots,
-                        max_insurance_floor_change_per_day,
                         permissionless_resolve_stale_slots,
                         funding_horizon_slots,
                         funding_k_bps,
@@ -1392,12 +1248,12 @@ pub mod ix {
                         force_close_delay_slots,
                     ) = if rest.is_empty() {
                         // Minimal payload: all extended fields use defaults
-                        (0u16, 0u64, 0u128, 0u64, None, None, None, None, 0u64, 0u64)
+                        (0u16, 0u64, 0u64, None, None, None, None, 0u64, 0u64)
                     } else if rest.len() >= EXTENDED_TAIL_LEN {
                         // Full extended payload
                         let iwm = read_u16(&mut rest)?;
                         let iwc = read_u64(&mut rest)?;
-                        let mifc = read_u128(&mut rest)?;
+                        let _ = read_u128(&mut rest)?; // max_insurance_floor_change_per_day (removed)
                         let prs = read_u64(&mut rest)?;
                         let fh = read_u64(&mut rest)?;
                         let fk = read_u64(&mut rest)?;
@@ -1405,7 +1261,7 @@ pub mod ix {
                         let fms = read_i64(&mut rest)?;
                         let mmf = read_u64(&mut rest)?;
                         let fcd = read_u64(&mut rest)?;
-                        (iwm, iwc, mifc, prs, Some(fh), Some(fk), Some(fmp), Some(fms), mmf, fcd)
+                        (iwm, iwc, prs, Some(fh), Some(fk), Some(fmp), Some(fms), mmf, fcd)
                     } else {
                         // Partial tail: reject to prevent misparsing
                         return Err(ProgramError::InvalidInstructionData);
@@ -1425,12 +1281,10 @@ pub mod ix {
                         invert,
                         unit_scale,
                         initial_mark_price_e6,
-                        max_maintenance_fee_per_slot,
                         max_insurance_floor,
                         min_oracle_price_cap_e2bps,
                         insurance_withdraw_max_bps,
                         insurance_withdraw_cooldown_slots,
-                        max_insurance_floor_change_per_day,
                         risk_params,
                         insurance_floor,
                         permissionless_resolve_stale_slots,
@@ -1556,10 +1410,6 @@ pub mod ix {
                         limit_price_e6,
                     })
                 }
-                11 => {
-                    // SetRiskThreshold removed (I_floor immutable §2.2.1)
-                    return Err(ProgramError::InvalidInstructionData);
-                }
                 12 => {
                     // UpdateAdmin
                     let new_admin = read_pubkey(&mut rest)?;
@@ -1573,29 +1423,15 @@ pub mod ix {
                     // UpdateConfig — funding params only
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
-                    let funding_inv_scale_notional_e6 = read_u128(&mut rest)?;
+                    let _ = read_u128(&mut rest)?; // funding_inv_scale_notional_e6 (removed)
                     let funding_max_premium_bps = read_i64(&mut rest)?;
                     let funding_max_bps_per_slot = read_i64(&mut rest)?;
-                    // Threshold fields: decoded for wire compat, discarded
-                    let _ = read_u128(&mut rest)?; // thresh_floor
-                    let _ = read_u64(&mut rest)?;  // thresh_risk_bps
-                    let _ = read_u64(&mut rest)?;  // thresh_update_interval_slots
-                    let _ = read_u64(&mut rest)?;  // thresh_step_bps
-                    let _ = read_u64(&mut rest)?;  // thresh_alpha_bps
-                    let _ = read_u128(&mut rest)?; // thresh_min
-                    let _ = read_u128(&mut rest)?; // thresh_max
-                    let _ = read_u128(&mut rest)?; // thresh_min_step
                     Ok(Instruction::UpdateConfig {
                         funding_horizon_slots,
                         funding_k_bps,
-                        funding_inv_scale_notional_e6,
                         funding_max_premium_bps,
                         funding_max_bps_per_slot,
                     })
-                }
-                15 => {
-                    // SetMaintenanceFee removed (§8.2)
-                    return Err(ProgramError::InvalidInstructionData);
                 }
                 16 => {
                     // SetOracleAuthority
@@ -1825,13 +1661,6 @@ pub mod accounts {
         Ok(())
     }
 
-    pub fn expect_owner(ai: &AccountInfo, owner: &Pubkey) -> Result<(), ProgramError> {
-        if ai.owner != owner {
-            return Err(ProgramError::IllegalOwner);
-        }
-        Ok(())
-    }
-
     pub fn expect_key(ai: &AccountInfo, expected: &Pubkey) -> Result<(), ProgramError> {
         // Key check via verify helper (Kani-provable)
         if !crate::verify::pda_key_matches(expected.to_bytes(), ai.key.to_bytes()) {
@@ -1907,32 +1736,10 @@ pub mod state {
         pub funding_horizon_slots: u64,
         /// Funding rate multiplier in basis points (100 = 1.00x)
         pub funding_k_bps: u64,
-        /// Funding scale factor in e6 units (controls funding rate sensitivity)
-        pub funding_inv_scale_notional_e6: u128,
         /// Max premium in basis points (500 = 5%)
         pub funding_max_premium_bps: i64,
         /// Max funding rate per slot in basis points
         pub funding_max_bps_per_slot: i64,
-
-        // ========================================
-        // Threshold Parameters (configurable)
-        // ========================================
-        /// Floor for threshold calculation
-        pub thresh_floor: u128,
-        /// Risk coefficient in basis points (50 = 0.5%)
-        pub thresh_risk_bps: u64,
-        /// Update interval in slots
-        pub thresh_update_interval_slots: u64,
-        /// Max step size in basis points (500 = 5%)
-        pub thresh_step_bps: u64,
-        /// EWMA alpha in basis points (1000 = 10%)
-        pub thresh_alpha_bps: u64,
-        /// Minimum threshold value
-        pub thresh_min: u128,
-        /// Maximum threshold value
-        pub thresh_max: u128,
-        /// Minimum step size
-        pub thresh_min_step: u128,
 
         // ========================================
         // Oracle Authority (optional signer-based oracle)
@@ -1958,8 +1765,6 @@ pub mod state {
         // ========================================
         // Per-Market Admin Limits (set at InitMarket, immutable)
         // ========================================
-        /// Maximum maintenance fee per slot admin can set. Must be > 0 at init.
-        pub max_maintenance_fee_per_slot: u128,
         /// Maximum risk reduction threshold admin can set. Must be > 0 at init.
         pub max_insurance_floor: u128,
         /// Minimum oracle price cap (e2bps) admin can set (floor for non-zero values).
@@ -1978,9 +1783,6 @@ pub mod state {
         pub insurance_withdraw_cooldown_slots: u64,
         /// Padding for u128 alignment.
         pub _iw_padding2: u64,
-        /// Max change to insurance_floor per day (in quote-token atomic units).
-        /// 0 = insurance_floor cannot be changed after init.
-        pub max_insurance_floor_change_per_day: u128,
         /// Last slot when insurance_floor was changed (for rate-limiting).
         pub resolution_slot: u64,
         /// Padding for u128 alignment.
@@ -2062,37 +1864,6 @@ pub mod state {
         #[cfg(debug_assertions)]
         debug_assert!(HEADER_LEN >= RESERVED_OFF + 16);
         data[RESERVED_OFF..RESERVED_OFF + 8].copy_from_slice(&nonce.to_le_bytes());
-    }
-
-    /// Write market_start_slot into _reserved[8..16] at InitMarket time.
-    /// Shares storage with last_thr_update_slot — written once at creation,
-    /// then captured by rewards::init_market_rewards in the same atomic tx.
-    pub fn write_market_start_slot(data: &mut [u8], slot: u64) {
-        data[RESERVED_OFF + 8..RESERVED_OFF + 16].copy_from_slice(&slot.to_le_bytes());
-    }
-
-    /// Read market_start_slot from _reserved[8..16].
-    /// Only valid immediately after InitMarket (before any crank overwrites it).
-    pub fn read_market_start_slot(data: &[u8]) -> u64 {
-        u64::from_le_bytes(
-            data[RESERVED_OFF + 8..RESERVED_OFF + 16]
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    /// Read accumulated dust (base token remainder) from _reserved[16..24].
-    pub fn read_dust_base(data: &[u8]) -> u64 {
-        u64::from_le_bytes(
-            data[RESERVED_OFF + 16..RESERVED_OFF + 24]
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    /// Write accumulated dust (base token remainder) to _reserved[16..24].
-    pub fn write_dust_base(data: &mut [u8], dust: u64) {
-        data[RESERVED_OFF + 16..RESERVED_OFF + 24].copy_from_slice(&dust.to_le_bytes());
     }
 
     // ========================================
@@ -2207,16 +1978,6 @@ pub mod units {
         (base / s, base % s)
     }
 
-    /// Convert units to base token amount.
-    /// If scale is 0, returns units unchanged - no scaling.
-    #[inline]
-    pub fn units_to_base(units: u64, scale: u32) -> u64 {
-        if scale == 0 {
-            return units;
-        }
-        units.saturating_mul(scale as u64)
-    }
-
     /// Convert units to base token amount with overflow check.
     /// Returns None if overflow would occur.
     #[inline]
@@ -2268,7 +2029,6 @@ pub mod oracle {
     const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
                                         // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
                                         // The actual price data is stored directly at tail:
-    const CL_OFF_SLOT: usize = 200; // u64 - slot when updated
     const CL_OFF_TIMESTAMP: usize = 208; // u64 - unix timestamp (seconds)
     const CL_OFF_ANSWER: usize = 216; // i128 - price answer
 
@@ -2573,37 +2333,6 @@ pub mod oracle {
             return None;
         }
         Some(config.authority_price_e6)
-    }
-
-    /// Read oracle price, preferring authority-pushed price over Pyth/Chainlink.
-    ///
-    /// If an oracle authority is configured and has pushed a fresh price, use that.
-    /// Otherwise, fall back to reading from the provided Pyth/Chainlink account.
-    ///
-    /// The price_ai can be any account when using authority oracle - it won't be read
-    /// if the authority price is valid.
-    pub fn read_price_with_authority(
-        config: &super::state::MarketConfig,
-        price_ai: &AccountInfo,
-        now_unix_ts: i64,
-    ) -> Result<u64, ProgramError> {
-        // Try authority price first
-        if let Some(authority_price) =
-            read_authority_price(config, now_unix_ts, config.max_staleness_secs)
-        {
-            return Ok(authority_price);
-        }
-
-        // Fall back to Pyth/Chainlink
-        read_engine_price_e6(
-            price_ai,
-            &config.index_feed_id,
-            now_unix_ts,
-            config.max_staleness_secs,
-            config.conf_filter_bps,
-            config.invert,
-            config.unit_scale,
-        )
     }
 
     /// Clamp `raw_price` so it cannot move more than `max_change_e2bps` from `last_price`.
@@ -2940,14 +2669,12 @@ pub mod processor {
     use crate::{
         accounts, collateral,
         constants::{
-            CONFIG_LEN, DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            CONFIG_LEN, DEFAULT_FUNDING_HORIZON_SLOTS,
             DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
             DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_HYPERP_PRICE_CAP_E2BPS, MAX_ORACLE_PRICE_CAP_E2BPS,
             DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS, DEFAULT_INSURANCE_WITHDRAW_MAX_BPS,
             DEFAULT_INSURANCE_WITHDRAW_MIN_BASE, DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
-            DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN,
-            DEFAULT_THRESH_MIN_STEP, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS,
-            DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG,
+            MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG,
             SLAB_LEN,
         },
         error::{map_risk_error, PercolatorError},
@@ -3341,12 +3068,10 @@ pub mod processor {
                 invert,
                 unit_scale,
                 initial_mark_price_e6,
-                max_maintenance_fee_per_slot,
                 max_insurance_floor,
                 min_oracle_price_cap_e2bps,
                 insurance_withdraw_max_bps,
                 insurance_withdraw_cooldown_slots,
-                max_insurance_floor_change_per_day,
                 risk_params,
                 insurance_floor,
                 permissionless_resolve_stale_slots,
@@ -3589,6 +3314,16 @@ pub mod processor {
                     if p.new_account_fee.get() > percolator::MAX_VAULT_TVL {
                         return Err(ProgramError::InvalidInstructionData);
                     }
+                    // Warmup horizon: h_min <= h_max (engine asserts, but we pre-validate)
+                    if p.h_min > p.h_max {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    // Settlement deviation band: 0 < bps <= MAX (engine asserts)
+                    if p.resolve_price_deviation_bps == 0
+                        || p.resolve_price_deviation_bps > percolator::MAX_RESOLVE_PRICE_DEVIATION_BPS
+                    {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -3609,18 +3344,8 @@ pub mod processor {
                     // Funding parameters (custom overrides or defaults)
                     funding_horizon_slots: custom_funding_horizon.unwrap_or(DEFAULT_FUNDING_HORIZON_SLOTS),
                     funding_k_bps: custom_funding_k.unwrap_or(DEFAULT_FUNDING_K_BPS),
-                    funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
                     funding_max_premium_bps: custom_max_premium.unwrap_or(DEFAULT_FUNDING_MAX_PREMIUM_BPS),
                     funding_max_bps_per_slot: custom_max_per_slot.unwrap_or(DEFAULT_FUNDING_MAX_BPS_PER_SLOT),
-                    // Threshold parameters (defaults)
-                    thresh_floor: DEFAULT_THRESH_FLOOR,
-                    thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
-                    thresh_update_interval_slots: DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
-                    thresh_step_bps: DEFAULT_THRESH_STEP_BPS,
-                    thresh_alpha_bps: DEFAULT_THRESH_ALPHA_BPS,
-                    thresh_min: DEFAULT_THRESH_MIN,
-                    thresh_max: DEFAULT_THRESH_MAX.min(max_insurance_floor),
-                    thresh_min_step: DEFAULT_THRESH_MIN_STEP,
                     // Oracle authority (disabled by default - use Pyth/Chainlink)
                     // In Hyperp mode: authority_price_e6 = mark, last_effective_price_e6 = index
                     oracle_authority: [0u8; 32],
@@ -3638,7 +3363,6 @@ pub mod processor {
                     },
                     last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     // Per-market admin limits (immutable after init)
-                    max_maintenance_fee_per_slot,
                     max_insurance_floor,
                     min_oracle_price_cap_e2bps,
                     // Insurance withdrawal limits (immutable after init)
@@ -3646,7 +3370,6 @@ pub mod processor {
                     _iw_padding: [0u8; 6],
                     insurance_withdraw_cooldown_slots,
                     _iw_padding2: 0,
-                    max_insurance_floor_change_per_day,
                     resolution_slot: clock.slot,
                     last_hyperp_index_slot: if is_hyperp { clock.slot } else { 0 },
                     // Hyperp: stamp init slot so stale check works from genesis.
@@ -3684,9 +3407,6 @@ pub mod processor {
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
                 state::write_req_nonce(&mut data, 0);
-                // Write market_start_slot (§2.1): captures creation slot for rewards program.
-                // Shares _reserved[8..16] with last_thr_update_slot (initialized to same value).
-                state::write_market_start_slot(&mut data, clock.slot);
             }
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 6)?;
@@ -4063,36 +3783,12 @@ pub mod processor {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
-                    // Use resolution_slot (snapshotted in ResolveMarket)
-                    let frozen_slot = config.resolution_slot;
-
-                    // Dust sweep: resolved crank must also sweep dust so
-                    // CloseSlab's dust_base == 0 check can eventually pass.
-                    let dust_before = state::read_dust_base(&data);
-                    let unit_scale = config.unit_scale;
-
                     let engine = zc::engine_mut(&mut data)?;
 
                     // Resolved crank: no per-account settlement here.
                     // Accounts are settled by ForceCloseResolved / CloseAccount
                     // which call force_close_resolved_not_atomic atomically.
-                    // The resolved crank only handles dust sweep and lifecycle.
-
-                    // Sweep dust to insurance fund.
-                    // On resolved markets, also forgive sub-scale remainder
-                    // (worth < 1 engine unit, no engine accounting entry).
-                    let forgive_dust = if unit_scale > 0 {
-                        let scale = unit_scale as u64;
-                        if dust_before >= scale {
-                            let units_to_sweep = dust_before / scale;
-                            engine.top_up_insurance_fund(
-                                units_to_sweep as u128, frozen_slot,
-                            ).map_err(map_risk_error)?;
-                        }
-                        true
-                    } else {
-                        false
-                    };
+                    // The resolved crank only handles lifecycle.
 
                     // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
                     // Propagate CorruptState (real invariant violation), ignore other
@@ -4110,23 +3806,10 @@ pub mod processor {
                         Err(_) => {} // non-fatal on resolved markets
                     }
 
-                    // engine borrow ends here (last use above).
-                    // Write dust_base AFTER dropping the engine borrow to avoid
-                    // aliasing conflict with state::write_dust_base.
-                    if forgive_dust && dust_before != 0 {
-                        // Forgive any sub-scale remainder — on resolved markets
-                        // no new dust can accumulate, so this is terminal cleanup.
-                        state::write_dust_base(&mut data, 0);
-                    }
-
                     return Ok(());
                 }
 
                 let mut config = state::read_config(&data);
-
-                // Read dust before borrowing engine (for dust sweep later)
-                let dust_before = state::read_dust_base(&data);
-                let unit_scale = config.unit_scale;
 
                 let clock = Clock::from_account_info(a_clock)?;
 
@@ -4203,32 +3886,10 @@ pub mod processor {
                     sol_log_compute_units();
                 }
 
-                // Dust sweep: if accumulated dust >= unit_scale, sweep to insurance fund
-                // Done before copying stats so insurance balance reflects the sweep
-                let remaining_dust = if unit_scale > 0 {
-                    let scale = unit_scale as u64;
-                    if dust_before >= scale {
-                        let units_to_sweep = dust_before / scale;
-                        engine
-                            .top_up_insurance_fund(units_to_sweep as u128, clock.slot)
-                            .map_err(map_risk_error)?;
-                        Some(dust_before % scale)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
                 // Copy stats and drop engine mutable borrow
                 let liqs = engine.lifetime_liquidations;
                 let ins_low = engine.insurance_fund.balance.get() as u64;
                 drop(engine);
-
-                // Write remaining dust if sweep occurred
-                if let Some(dust) = remaining_dust {
-                    state::write_dust_base(&mut data, dust);
-                }
 
                 // ── RiskBuffer maintenance (engine borrow dropped) ──
                 {
@@ -4411,6 +4072,12 @@ pub mod processor {
                     // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
                     // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
                 }
+
+                // Patch engine's stored funding rate with post-EWMA value.
+                // execute_trade used pre-trade funding; now that mark_ewma changed,
+                // recompute so the next interval uses the updated rate.
+                let post_trade_funding = compute_current_funding_rate_e9(&config);
+                engine.funding_rate_e9_per_slot_last = post_trade_funding;
 
                 // Collect post-trade positions for risk buffer
                 let user_eff_nocpi = engine.effective_pos_q(user_idx as usize);
@@ -4785,11 +4452,16 @@ pub mod processor {
                     (engine.effective_pos_q(user_idx as usize),
                      engine.effective_pos_q(lp_idx as usize))
                 };
-                // Write nonce + config + risk buffer.
+                // Write nonce + config + risk buffer + patch funding rate.
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     state::write_req_nonce(&mut data, req_id);
                     state::write_config(&mut data, &config);
+                    // Patch engine's stored funding rate with post-EWMA value.
+                    let post_trade_funding = compute_current_funding_rate_e9(&config);
+                    let engine = zc::engine_mut(&mut data)?;
+                    engine.funding_rate_e9_per_slot_last = post_trade_funding;
+                    drop(engine);
                     // Update risk buffer — use oracle price for notional ranking (H1/M9).
                     // exec_price is gameable by a colluding matcher; oracle price is not.
                     let mut buf = state::read_risk_buffer(&data);
@@ -4984,6 +4656,14 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: close_account_end");
                     sol_log_compute_units();
                 }
+                // If force_close_resolved returns Ok(0), the account may still be open
+                // (deferred — position reconciled but not all accounts ready for payout).
+                // Only proceed with buffer removal and withdrawal if account was freed.
+                if amt_units == 0 && resolved && engine.is_used(user_idx as usize) {
+                    // Account still open — deferred close. No payout, no buffer removal.
+                    return Ok(());
+                }
+
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
@@ -5090,16 +4770,26 @@ pub mod processor {
                 let mut header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
 
-                // Liveness guard: block admin burn unless the market has a fallback
-                // resolution path. Without this, burning admin on a live market with
-                // permissionless_resolve_stale_slots == 0 creates an irrecoverable
-                // deadlock if the oracle later dies (no admin resolve, no permissionless
-                // resolve → market stuck forever with open positions).
+                // Liveness guard: block admin burn unless the market can fully
+                // self-recover without admin. Burning admin is irreversible and
+                // strands any funds that require admin action to recover.
+                //
+                // Requirements for burn:
+                // - Market must either be resolved with zero accounts (fully drained),
+                //   OR have BOTH permissionless resolution AND permissionless force-close
+                //   configured (so the entire lifecycle can complete without admin).
                 if new_admin.to_bytes() == [0u8; 32] {
                     let config = state::read_config(&data);
-                    let has_permissionless_resolve = config.permissionless_resolve_stale_slots > 0;
-                    if !has_permissionless_resolve && !state::is_resolved(&data) {
-                        return Err(PercolatorError::InvalidConfigParam.into());
+                    let resolved = state::is_resolved(&data);
+                    let engine = zc::engine_ref(&data)?;
+                    let fully_drained = resolved && engine.num_used_accounts == 0;
+
+                    if !fully_drained {
+                        let has_permissionless_resolve = config.permissionless_resolve_stale_slots > 0;
+                        let has_permissionless_force_close = config.force_close_delay_slots > 0;
+                        if !has_permissionless_resolve || !has_permissionless_force_close {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
                     }
                 }
 
@@ -5215,7 +4905,6 @@ pub mod processor {
             Instruction::UpdateConfig {
                 funding_horizon_slots,
                 funding_k_bps,
-                funding_inv_scale_notional_e6,
                 funding_max_premium_bps,
                 funding_max_bps_per_slot,
             } => {
@@ -5240,9 +4929,6 @@ pub mod processor {
                 if funding_horizon_slots == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                // funding_inv_scale_notional_e6: reserved for future use.
-                // Not currently read by funding computation.
-                let _ = funding_inv_scale_notional_e6;
                 // Reject negative funding bounds — reversed clamp bounds panic
                 if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0
                     || funding_bps_to_e9(funding_max_bps_per_slot) > percolator::MAX_ABS_FUNDING_E9_PER_SLOT
@@ -5294,7 +4980,6 @@ pub mod processor {
 
                 config.funding_horizon_slots = funding_horizon_slots;
                 config.funding_k_bps = funding_k_bps;
-                config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
                 // Run end-of-instruction lifecycle after accrue + config change.
@@ -6162,6 +5847,12 @@ pub mod processor {
 
                 let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                     .map_err(map_risk_error)?;
+
+                // Deferred close: account still open, no payout yet
+                if amt_units == 0 && engine.is_used(user_idx as usize) {
+                    return Ok(());
+                }
+
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
@@ -6606,6 +6297,12 @@ pub mod processor {
 
                 let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                     .map_err(map_risk_error)?;
+
+                // Deferred close: account still open, no payout yet
+                if amt_units == 0 && engine.is_used(user_idx as usize) {
+                    return Ok(());
+                }
+
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
