@@ -4656,6 +4656,12 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: close_account_end");
                     sol_log_compute_units();
                 }
+                // Phase 1 reconciliation: Ok(0) with account still open means
+                // deferred — caller must retry after all accounts reconciled.
+                if amt_units == 0 && resolved && engine.is_used(user_idx as usize) {
+                    return Ok(());
+                }
+
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
@@ -4766,22 +4772,17 @@ pub mod processor {
                 // self-recover without admin. Burning admin is irreversible and
                 // strands any funds that require admin action to recover.
                 //
-                // Requirements for burn:
-                // - Market must either be fully empty (resolved, zero accounts,
-                //   zero insurance, zero vault), OR have ALL permissionless
-                //   recovery paths configured (resolve + force-close).
-                // Without this, burning admin can permanently strand insurance,
-                // vault tokens, or rent lamports.
+                // Admin burn guard: burning admin permanently disables admin ops.
+                // This is intentional — it locks the insurance fund and proves
+                // the admin cannot extract it. The slab rent is accepted as
+                // stranded (CloseSlab requires admin).
+                //
+                // For live markets: require permissionless resolution + force-close
+                // so the market lifecycle can complete without admin.
+                // For resolved markets: allow unconditionally (admin already resolved).
                 if new_admin.to_bytes() == [0u8; 32] {
                     let config = state::read_config(&data);
-                    let resolved = state::is_resolved(&data);
-                    let engine = zc::engine_ref(&data)?;
-                    let fully_empty = resolved
-                        && engine.num_used_accounts == 0
-                        && engine.insurance_fund.balance.is_zero()
-                        && engine.vault.is_zero();
-
-                    if !fully_empty {
+                    if !state::is_resolved(&data) {
                         let has_permissionless_resolve = config.permissionless_resolve_stale_slots > 0;
                         let has_permissionless_force_close = config.force_close_delay_slots > 0;
                         if !has_permissionless_resolve || !has_permissionless_force_close {
@@ -4876,6 +4877,30 @@ pub mod processor {
                             a_dest_ata,
                             a_vault_auth,
                             stranded,
+                            &signer_seeds,
+                        )?;
+                    }
+
+                    // Close the vault token account to recover its rent.
+                    // SPL Token CloseAccount transfers remaining rent to destination.
+                    {
+                        let seed1: &[u8] = b"vault";
+                        let seed2: &[u8] = a_slab.key.as_ref();
+                        let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                        let seed3: &[u8] = &bump_arr;
+                        let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                        let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                        let close_ix = spl_token::instruction::close_account(
+                            a_token.key,
+                            a_vault.key,
+                            a_dest.key,  // rent destination
+                            a_vault_auth.key,
+                            &[],
+                        )?;
+                        solana_program::program::invoke_signed(
+                            &close_ix,
+                            &[a_vault.clone(), a_dest.clone(), a_vault_auth.clone()],
                             &signer_seeds,
                         )?;
                     }
@@ -5836,17 +5861,29 @@ pub mod processor {
 
                 check_idx(engine, user_idx)?;
 
-                // Read account owner pubkey and verify owner ATA
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
-                verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
                 let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                     .map_err(map_risk_error)?;
+
+                // Phase 1 reconciliation may return Ok(0) with account still open.
+                // Skip buffer removal and payout — caller must retry later.
+                if amt_units == 0 && engine.is_used(user_idx as usize) {
+                    return Ok(());
+                }
+
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
 
-                // Remove from risk buffer before withdraw (drop engine first)
+                // Only verify owner ATA when there's a nonzero payout.
+                // This allows reconciliation-only calls without a valid owner ATA,
+                // preventing abandoned accounts from blocking num_used_accounts cleanup.
+                if amt_units_u64 > 0 {
+                    verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
+                }
+
+                // Remove from risk buffer (drop engine first)
                 drop(engine);
                 {
                     let mut buf = state::read_risk_buffer(&data);
@@ -6204,15 +6241,21 @@ pub mod processor {
                 // Determine canonical settlement price.
                 // Hyperp: use mark EWMA (same as ResolveMarket Hyperp path).
                 // Non-Hyperp: use engine.last_oracle_price — but ONLY if the engine
-                // has seen a real oracle accrual (oracle_initialized != 0). The init
-                // sentinel price of 1 must never be used for settlement.
+                // has seen a real oracle accrual. If oracle never initialized, allow
+                // resolution only if market is empty (no positions to mis-settle).
+                // This prevents a liveness hole where deposits arrive before first
+                // crank, oracle dies, and permissionless resolve is blocked.
                 let settlement_price = if is_hyperp {
                     let mark = config.mark_ewma_e6;
                     if mark > 0 { mark } else { config.authority_price_e6 }
                 } else {
                     let engine = zc::engine_ref(&data)?;
                     if engine.oracle_initialized == 0 {
-                        return Err(PercolatorError::OracleInvalid.into());
+                        // Oracle never initialized — only safe if no positions exist.
+                        // Sentinel price 1 is harmless on an empty market (nothing to settle).
+                        if engine.num_used_accounts > 0 {
+                            return Err(PercolatorError::OracleInvalid.into());
+                        }
                     }
                     let p = engine.last_oracle_price;
                     if p == 0 {
@@ -6287,10 +6330,20 @@ pub mod processor {
                 let owner_pubkey = Pubkey::new_from_array(
                     engine.accounts[user_idx as usize].owner,
                 );
-                verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
 
                 let amt_units = engine.force_close_resolved_not_atomic(user_idx, config.resolution_slot)
                     .map_err(map_risk_error)?;
+
+                // Phase 1 reconciliation may return Ok(0) with account still open.
+                if amt_units == 0 && engine.is_used(user_idx as usize) {
+                    return Ok(());
+                }
+
+                // Only verify owner ATA when there's a nonzero payout.
+                if amt_units > 0 {
+                    verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
+                }
+
                 let amt_units_u64: u64 = amt_units
                     .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
