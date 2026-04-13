@@ -1724,7 +1724,7 @@ impl TestEnv {
         // offset of RiskEngine.used = 408 (bitmap array)
         // used is [u64; 64] = 512 bytes
         // num_used_accounts follows used at offset 408 + 512 = 920 within RiskEngine
-        pub const NUM_USED_OFFSET: usize = 584 + 1232;
+        pub const NUM_USED_OFFSET: usize = 584 + 1080;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -1818,7 +1818,7 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 440, offset of RiskEngine.used = 576 (after insurance_floor)
         // Bitmap is [u64; 64] at offset 520 + 608 = 1016
-        pub const BITMAP_OFFSET: usize = 584 + 720;
+        pub const BITMAP_OFFSET: usize = 584 + 568;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -3908,7 +3908,7 @@ impl TradeCpiTestEnv {
         //   funding_rate_bps(8) + last_crank_slot(8) + max_crank_staleness(8) +
         //   total_open_interest(16) + c_tot(16) + pnl_pos_tot(16)
         // Offset: 16+32+144+8+16+8+8+8+8+16+16 = 280
-        pub const PNL_POS_TOT_OFFSET: usize = 584 + 352;
+        pub const PNL_POS_TOT_OFFSET: usize = 584 + 216;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -3920,7 +3920,7 @@ impl TradeCpiTestEnv {
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // c_tot is at offset 264 within RiskEngine (16 bytes before pnl_pos_tot)
-        pub const C_TOT_OFFSET: usize = 584 + 336;
+        pub const C_TOT_OFFSET: usize = 584 + 200;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -4379,7 +4379,7 @@ impl TestEnv {
     /// Read c_tot aggregate from slab
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const C_TOT_OFFSET: usize = 584 + 336;
+        pub const C_TOT_OFFSET: usize = 584 + 200;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -4401,7 +4401,7 @@ impl TestEnv {
     /// Read pnl_pos_tot aggregate from slab
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const PNL_POS_TOT_OFFSET: usize = 584 + 352;
+        pub const PNL_POS_TOT_OFFSET: usize = 584 + 216;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
