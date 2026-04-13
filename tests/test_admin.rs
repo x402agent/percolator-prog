@@ -1143,7 +1143,6 @@ fn test_update_config_admin_only() {
     let result = env.try_update_config_with_params(
         &attacker,
         3600,
-        1_000_000_000_000u128,
         1000,
         0u128,
         1_000_000_000_000_000u128,

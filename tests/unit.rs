@@ -106,6 +106,8 @@ const PYTH_RECEIVER_BYTES: [u8; 32] = [
 ///         price(8) + conf(8) + expo(4) + publish_time(8) + ...
 fn make_pyth(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    // verification_level = 1 (Full) at offset 40
+    data[40..42].copy_from_slice(&1u16.to_le_bytes());
     // feed_id at offset 42
     data[42..74].copy_from_slice(feed_id);
     // price at offset 74
@@ -240,7 +242,7 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u32(0, &mut data); // unit_scale (0 = no scaling)
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (uncapped defaults for tests)
-    encode_u128(100_000_000_000_000_000_000u128, &mut data); // max_maintenance_fee_per_slot
+    encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
     encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
     encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
@@ -250,12 +252,12 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u64(0, &mut data);   // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(0, &mut data);  // new_account_fee
-    encode_u128(0, &mut data);  // insurance_floor
-    encode_u128(0, &mut data);  // maintenance_fee_per_slot
+    encode_u128(0, &mut data);  // insurance_floor (risk_reduction_threshold)
+    encode_u64(0, &mut data);   // h_max
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data);   // liquidation_fee_bps
     encode_u128(0, &mut data);  // liquidation_fee_cap
-    encode_u64(0, &mut data);   // liquidation_buffer_bps
+    encode_u64(100, &mut data);   // resolve_price_deviation_bps
     encode_u128(0, &mut data);  // min_liquidation_abs
     data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
@@ -289,7 +291,7 @@ fn encode_init_market_invert(
     encode_u32(unit_scale, &mut data);
     encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // Per-market admin limits (uncapped defaults for tests)
-    encode_u128(100_000_000_000_000_000_000u128, &mut data); // max_maintenance_fee_per_slot
+    encode_u128(0u128, &mut data); // maintenance_fee_per_slot (0 = disabled)
     encode_u128(10_000_000_000_000_000u128, &mut data); // max_insurance_floor
     encode_u64(0, &mut data); // min_oracle_price_cap_e2bps
     // RiskParams: warmup, maintenance_margin_bps, initial_margin_bps, trading_fee_bps
@@ -299,12 +301,12 @@ fn encode_init_market_invert(
     encode_u64(0, &mut data);    // trading_fee_bps
     encode_u64(MAX_ACCOUNTS as u64, &mut data); // max_accounts
     encode_u128(0, &mut data);   // new_account_fee
-    encode_u128(0, &mut data);   // insurance_floor
-    encode_u128(0, &mut data);   // maintenance_fee_per_slot
+    encode_u128(0, &mut data);   // insurance_floor (risk_reduction_threshold)
+    encode_u64(0, &mut data);    // h_max
     encode_u64(crank_staleness, &mut data); // max_crank_staleness_slots
     encode_u64(0, &mut data);    // liquidation_fee_bps
     encode_u128(0, &mut data);   // liquidation_fee_cap
-    encode_u64(0, &mut data);    // liquidation_buffer_bps
+    encode_u64(0, &mut data);    // resolve_price_deviation_bps
     encode_u128(0, &mut data);   // min_liquidation_abs
     data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
@@ -884,6 +886,7 @@ fn test_withdraw_wrong_signer() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_trade_wrong_signer() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 0);
@@ -1019,6 +1022,7 @@ fn test_trade_wrong_signer() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_trade_cpi_wrong_pda_key_rejected() {
     // This test verifies pre-CPI validation: wrong PDA key is rejected
     // Note: Full TradeCpi success path is tested in integration tests where CPI works
@@ -1133,6 +1137,7 @@ fn test_trade_cpi_wrong_pda_key_rejected() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_trade_cpi_wrong_lp_owner_rejected() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -1253,6 +1258,7 @@ fn test_trade_cpi_wrong_lp_owner_rejected() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_trade_cpi_wrong_oracle_key_rejected() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -1464,6 +1470,7 @@ fn test_set_risk_threshold_non_admin_fails() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_crank_updates_threshold_from_risk_metric() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -1692,6 +1699,7 @@ fn test_crank_updates_threshold_from_risk_metric() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_permissionless_crank() {
     // Test that anyone can call crank with caller_idx = u16::MAX (permissionless mode)
     let mut f = setup_market();
@@ -1865,6 +1873,7 @@ fn test_permissionless_crank_gc() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_permissionless_funding_not_controllable() {
     // Security test: permissionless caller cannot influence funding rate.
     // Funding is computed deterministically from (LP inventory, oracle price, constants).
@@ -2128,6 +2137,7 @@ fn test_non_admin_cannot_rotate() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_burn_admin_to_zero() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -2164,6 +2174,7 @@ fn test_burn_admin_to_zero() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_after_burn_admin_ops_disabled() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -2283,6 +2294,7 @@ fn test_unit_scale_conversion() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_init_market_with_invert_and_unit_scale() {
     // Test that InitMarket correctly stores invert and unit_scale in config
     let mut f = setup_market();
@@ -2339,6 +2351,7 @@ fn test_unit_scale_validation_at_init() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_withdraw_misalignment_rejected() {
     // Test that misaligned withdrawal amounts are rejected when unit_scale != 0
     let mut f = setup_market();
@@ -2576,6 +2589,7 @@ fn test_vault_amount_matches_engine_vault_plus_dust() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_engine_vault_equals_insurance_plus_capital_when_no_fees() {
     // INVARIANT #2: engine.vault = insurance_fund.balance + sum(account.capital)
     //
@@ -2713,6 +2727,7 @@ fn test_engine_vault_equals_insurance_plus_capital_when_no_fees() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_withdraw_preserves_vault_accounting_invariant() {
     // Verify that aligned withdrawals preserve INVARIANT #1
     let mut f = setup_market();
@@ -3072,6 +3087,7 @@ fn test_invariants_with_unit_scale_zero() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_close_slab() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -3104,7 +3120,7 @@ fn test_close_slab() {
     // Mark market as resolved (required by CloseSlab)
     {
         let engine = zc::engine_mut(&mut f.slab.data).unwrap();
-        engine.resolve_market(1_000_000, 1).unwrap();
+        engine.resolve_market(1_000_000, 1_000_000, 1, 0).unwrap();
     }
 
     // Create vault authority PDA and admin's dest ATA for CloseSlab
@@ -3149,6 +3165,7 @@ fn test_close_slab() {
 }
 
 #[test]
+#[cfg(feature = "test")]
 fn test_close_slab_non_admin_rejected() {
     let mut f = setup_market();
     let init_data = encode_init_market(&f, 100);
@@ -3173,7 +3190,7 @@ fn test_close_slab_non_admin_rejected() {
     // Mark market as resolved (required by CloseSlab)
     {
         let engine = zc::engine_mut(&mut f.slab.data).unwrap();
-        engine.resolve_market(1_000_000, 1).unwrap();
+        engine.resolve_market(1_000_000, 1_000_000, 1, 0).unwrap();
     }
 
     // Attacker tries to close

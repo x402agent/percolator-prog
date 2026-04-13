@@ -872,7 +872,7 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
             AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data: encode_update_config(
-            7200, 200, 1_000_000_000_000u128, 200i64, 10i64,
+            7200, 200, 200i64, 10i64,
             0u128, 100, 100, 100, 1000,
             0u128, 1_000_000_000_000_000u128, 1u128,
         ),

@@ -282,21 +282,15 @@ fn test_hyperp_init_market_with_valid_price() {
     );
 
     // Verify actual initialized config state, not just tx success.
-    const HEADER_MAGIC_OFF: usize = 0;
-    const CONFIG_OFF: usize = 72; // size_of::<SlabHeader>()
-    const FEED_ID_OFF: usize = CONFIG_OFF + 64;
-    const INVERT_OFF: usize = CONFIG_OFF + 107;
-    const AUTH_PRICE_OFF: usize = CONFIG_OFF + 288;
-    const ORACLE_CAP_OFF: usize = CONFIG_OFF + 304;
-    const INDEX_OFF: usize = CONFIG_OFF + 312;
-    const NUM_USED_OFF: usize = 1680;
-
     let slab_data = svm.get_account(&slab).unwrap().data;
-    let magic = u64::from_le_bytes(slab_data[HEADER_MAGIC_OFF..HEADER_MAGIC_OFF + 8].try_into().unwrap());
-    let mark = u64::from_le_bytes(slab_data[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
-    let index = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
-    let cap = u64::from_le_bytes(slab_data[ORACLE_CAP_OFF..ORACLE_CAP_OFF + 8].try_into().unwrap());
-    let used = u16::from_le_bytes(slab_data[NUM_USED_OFF..NUM_USED_OFF + 2].try_into().unwrap());
+    let magic = u64::from_le_bytes(slab_data[0..8].try_into().unwrap());
+    let config = percolator_prog::state::read_config(&slab_data);
+    let mark = config.authority_price_e6;
+    let index = config.last_effective_price_e6;
+    let cap = config.oracle_price_cap_e2bps;
+    const FEED_ID_OFF: usize = 72 + 64;
+    const INVERT_OFF: usize = 72 + 107;
+    let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
@@ -446,21 +440,15 @@ fn test_hyperp_init_market_with_inverted_price() {
     );
 
     // Verify inverted Hyperp initialization state.
-    const HEADER_MAGIC_OFF: usize = 0;
-    const CONFIG_OFF: usize = 72; // size_of::<SlabHeader>()
-    const FEED_ID_OFF: usize = CONFIG_OFF + 64;
-    const INVERT_OFF: usize = CONFIG_OFF + 107;
-    const AUTH_PRICE_OFF: usize = CONFIG_OFF + 288;
-    const ORACLE_CAP_OFF: usize = CONFIG_OFF + 304;
-    const INDEX_OFF: usize = CONFIG_OFF + 312;
-    const NUM_USED_OFF: usize = 1680;
-
     let slab_data = svm.get_account(&slab).unwrap().data;
-    let magic = u64::from_le_bytes(slab_data[HEADER_MAGIC_OFF..HEADER_MAGIC_OFF + 8].try_into().unwrap());
-    let mark = u64::from_le_bytes(slab_data[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
-    let index = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
-    let cap = u64::from_le_bytes(slab_data[ORACLE_CAP_OFF..ORACLE_CAP_OFF + 8].try_into().unwrap());
-    let used = u16::from_le_bytes(slab_data[NUM_USED_OFF..NUM_USED_OFF + 2].try_into().unwrap());
+    let magic = u64::from_le_bytes(slab_data[0..8].try_into().unwrap());
+    let config = percolator_prog::state::read_config(&slab_data);
+    let mark = config.authority_price_e6;
+    let index = config.last_effective_price_e6;
+    let cap = config.oracle_price_cap_e2bps;
+    const FEED_ID_OFF: usize = 72 + 64;
+    const INVERT_OFF: usize = 72 + 107;
+    let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
@@ -1080,7 +1068,7 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_update_config(
-                100, k_bps, 1_000_000_000_000u128,
+                100, k_bps,
                 10_000i64, 10_000i64,
                 0u128, 100, 100, 100, 1000,
                 0u128, 1_000_000_000_000_000u128, 1u128,

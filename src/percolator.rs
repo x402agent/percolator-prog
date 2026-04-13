@@ -4630,7 +4630,7 @@ pub mod processor {
                     match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
                         .map_err(map_risk_error)?
                     {
-                        percolator::ResolvedCloseResult::Deferred => {
+                        percolator::ResolvedCloseResult::ProgressOnly => {
                             // Phase 1 reconciliation only — account still open.
                             // Caller must retry after all accounts reconciled.
                             return Ok(());
@@ -5442,8 +5442,12 @@ pub mod processor {
                 // matures all PnL, zeros OI, and drains/finalizes sides.
                 // The engine validates the price deviation band against P_last internally.
                 let engine = zc::engine_mut(&mut data)?;
-                engine.resolve_market(settlement_price, clock.slot)
-                    .map_err(map_risk_error)?;
+                engine.resolve_market(
+                    settlement_price,
+                    settlement_price,
+                    clock.slot,
+                    compute_current_funding_rate_e9(&config),
+                ).map_err(map_risk_error)?;
 
                 state::write_config(&mut data, &config);
             }
@@ -5878,7 +5882,7 @@ pub mod processor {
                 let amt_units = match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
                     .map_err(map_risk_error)?
                 {
-                    percolator::ResolvedCloseResult::Deferred => return Ok(()),
+                    percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
                     percolator::ResolvedCloseResult::Closed(payout) => payout,
                 };
 
@@ -6276,8 +6280,12 @@ pub mod processor {
 
                 // Call engine resolve_market with canonical settlement price.
                 let engine = zc::engine_mut(&mut data)?;
-                engine.resolve_market(settlement_price, clock.slot)
-                    .map_err(map_risk_error)?;
+                engine.resolve_market(
+                    settlement_price,
+                    settlement_price,
+                    clock.slot,
+                    compute_current_funding_rate_e9(&config),
+                ).map_err(map_risk_error)?;
 
                 config.authority_price_e6 = settlement_price;
                 state::write_config(&mut data, &config);
@@ -6345,7 +6353,7 @@ pub mod processor {
                 let amt_units = match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
                     .map_err(map_risk_error)?
                 {
-                    percolator::ResolvedCloseResult::Deferred => return Ok(()),
+                    percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
                     percolator::ResolvedCloseResult::Closed(payout) => payout,
                 };
 
