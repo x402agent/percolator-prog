@@ -1864,12 +1864,12 @@ impl TestEnv {
         pub const ACCOUNTS_OFFSET: usize = ENGINE + 9280;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const PBQ: usize = 56;       // position_basis_q: i128 (16 bytes)
-        pub const A_BASIS: usize = 80;   // adl_a_basis: u128 (16 bytes)
-        pub const EPOCH_SNAP: usize = 128; // adl_epoch_snap: u64 (8 bytes)
-        pub const ADL_MULT_LONG: usize = ENGINE + 400;
-        pub const ADL_MULT_SHORT: usize = ENGINE + 416;
-        pub const ADL_EPOCH_LONG: usize = ENGINE + 464;
-        pub const ADL_EPOCH_SHORT: usize = ENGINE + 472;
+        pub const A_BASIS: usize = 72;   // adl_a_basis: u128 (16 bytes)
+        pub const EPOCH_SNAP: usize = 120; // adl_epoch_snap: u64 (8 bytes)
+        pub const ADL_MULT_LONG: usize = ENGINE + 256;
+        pub const ADL_MULT_SHORT: usize = ENGINE + 272;
+        pub const ADL_EPOCH_LONG: usize = ENGINE + 320;
+        pub const ADL_EPOCH_SHORT: usize = ENGINE + 328;
 
         let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
         if d.len() < acc_off + ACCOUNT_SIZE { return 0; }
@@ -3827,12 +3827,12 @@ impl TradeCpiTestEnv {
         pub const ACCOUNTS_OFFSET: usize = ENGINE + 9280;
         pub const ACCOUNT_SIZE: usize = 352;
         pub const PBQ: usize = 56;
-        pub const A_BASIS: usize = 80;
-        pub const EPOCH_SNAP: usize = 128;
-        pub const ADL_MULT_LONG: usize = ENGINE + 400;
-        pub const ADL_MULT_SHORT: usize = ENGINE + 416;
-        pub const ADL_EPOCH_LONG: usize = ENGINE + 464;
-        pub const ADL_EPOCH_SHORT: usize = ENGINE + 472;
+        pub const A_BASIS: usize = 72;
+        pub const EPOCH_SNAP: usize = 120;
+        pub const ADL_MULT_LONG: usize = ENGINE + 256;
+        pub const ADL_MULT_SHORT: usize = ENGINE + 272;
+        pub const ADL_EPOCH_LONG: usize = ENGINE + 320;
+        pub const ADL_EPOCH_SHORT: usize = ENGINE + 328;
 
         let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
         if d.len() < acc_off + ACCOUNT_SIZE { return 0; }

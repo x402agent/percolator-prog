@@ -5155,3 +5155,4 @@ fn test_trade_nocpi_allows_user_user_bilateral() {
     assert!(result.is_ok(), "User-user bilateral trade must be allowed: {:?}", result);
 }
 
+
