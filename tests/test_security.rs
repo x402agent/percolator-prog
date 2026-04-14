@@ -1338,6 +1338,7 @@ fn test_attack_deposit_after_resolution() {
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
 
+    env.crank();
     // Resolve market
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "Admin should resolve: {:?}", result);
@@ -1365,6 +1366,8 @@ fn test_attack_init_user_after_resolution() {
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
 
+    // Crank to establish real last_oracle_price before resolution
+    env.crank();
     // Resolve market
     let result = env.try_resolve_market(&admin);
     assert!(result.is_ok(), "Admin should resolve: {:?}", result);
@@ -3078,6 +3081,7 @@ fn test_attack_deposit_resolve_withdraw_sequence() {
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("market resolution setup must succeed");
 
@@ -3366,6 +3370,7 @@ fn test_attack_init_lp_after_resolution() {
         .expect("oracle authority setup must succeed");
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
+    env.crank();
     env.try_resolve_market(&admin)
         .expect("market resolution setup must succeed");
 
@@ -13532,6 +13537,7 @@ fn test_attack_resolve_rejects_stale_settlement_push() {
     // Push price at unix_timestamp = 100 (clock is at 100)
     env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
 
+    env.crank();
     // Fresh resolution should succeed
     let result_fresh = env.try_resolve_market(&admin);
     assert!(

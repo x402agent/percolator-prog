@@ -2858,12 +2858,17 @@ pub mod processor {
             correct_len: data.len() == SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
-            // Return specific error based on which check failed
             if slab.owner != program_id {
                 return Err(ProgramError::IllegalOwner);
             }
             solana_program::log::sol_log_64(SLAB_LEN as u64, data.len() as u64, 0, 0, 0);
             return Err(PercolatorError::InvalidSlabLen.into());
+        }
+        // Reentrancy guard: reject ALL instructions while a CPI is in progress.
+        // A malicious matcher can re-enter any permissionless instruction during
+        // TradeCpi's matcher CPI, manipulating engine state mid-instruction.
+        if state::is_cpi_in_progress(data) {
+            return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
     }
@@ -4627,7 +4632,7 @@ pub mod processor {
                 let amt_units = if resolved {
                     // force_close_resolved handles K-pair PnL, maintenance fees,
                     // loss settlement, and account close internally.
-                    match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
+                    match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
                         .map_err(map_risk_error)?
                     {
                         percolator::ResolvedCloseResult::ProgressOnly => {
@@ -5440,11 +5445,15 @@ pub mod processor {
                 // Call the engine's resolve_market transition.
                 // This does final accrual at settlement price, sets MarketMode::Resolved,
                 // matures all PnL, zeros OI, and drains/finalizes sides.
-                // The engine validates the price deviation band against P_last internally.
+                // The engine validates |resolved_price - live_oracle_price| <= deviation band.
+                // Pass the engine's last accrued price as live_oracle_price (P_last)
+                // so the band check is meaningful. Passing settlement_price for both
+                // would make the check vacuous (0 <= anything).
                 let engine = zc::engine_mut(&mut data)?;
+                let live_oracle = engine.last_oracle_price;
                 engine.resolve_market(
                     settlement_price,
-                    settlement_price,
+                    live_oracle,
                     clock.slot,
                     compute_current_funding_rate_e9(&config),
                 ).map_err(map_risk_error)?;
@@ -5879,7 +5888,7 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -6279,10 +6288,13 @@ pub mod processor {
                 };
 
                 // Call engine resolve_market with canonical settlement price.
+                // Pass engine.last_oracle_price as live_oracle_price for meaningful
+                // deviation band check.
                 let engine = zc::engine_mut(&mut data)?;
+                let live_oracle = engine.last_oracle_price;
                 engine.resolve_market(
                     settlement_price,
-                    settlement_price,
+                    live_oracle,
                     clock.slot,
                     compute_current_funding_rate_e9(&config),
                 ).map_err(map_risk_error)?;
@@ -6350,7 +6362,7 @@ pub mod processor {
                     engine.accounts[user_idx as usize].owner,
                 );
 
-                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, engine.resolved_context().1)
+                let amt_units = match engine.force_close_resolved_not_atomic(user_idx, clock.slot)
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
