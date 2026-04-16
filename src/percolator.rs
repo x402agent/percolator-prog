@@ -3224,7 +3224,9 @@ pub mod processor {
 
                 // max_staleness_secs: reject 0 (would brick oracle reads —
                 // any non-zero age > 0 fails the staleness check).
-                if max_staleness_secs == 0 {
+                // max_staleness_secs: reject 0 and unreasonable values.
+                // 0 would brick oracle reads. >7 days is clearly misconfigured.
+                if max_staleness_secs == 0 || max_staleness_secs > 7 * 86400 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
@@ -4482,13 +4484,18 @@ pub mod processor {
                 // happens AFTER this early return (inside the exec_size != 0 branch below).
                 // Zero-fills never touch the EWMA, so no revert is needed.
                 if ret.exec_size == 0 {
-                    // Restore the pre-oracle-read config snapshot, but preserve
-                    // last_good_oracle_slot — the oracle WAS successfully read
-                    // and its liveness proof must not be discarded. Reverting it
-                    // would falsely accelerate the permissionless-resolution window.
+                    // Restore pre-oracle config, but preserve oracle/index state
+                    // that legitimately advanced during the instruction:
+                    // - last_good_oracle_slot: liveness proof from successful read
+                    // - last_effective_price_e6: index legitimately moved toward mark
+                    // - last_hyperp_index_slot: prevents dt-accumulation attack where
+                    //   repeated zero-fills revert the index clock, then a real trade
+                    //   snaps the index with a huge accumulated dt
                     let mut data = state::slab_data_mut(a_slab)?;
                     let mut restored = config_pre_oracle;
                     restored.last_good_oracle_slot = config.last_good_oracle_slot;
+                    restored.last_effective_price_e6 = config.last_effective_price_e6;
+                    restored.last_hyperp_index_slot = config.last_hyperp_index_slot;
                     state::write_config(&mut data, &restored);
                     state::write_req_nonce(&mut data, req_id);
                     return Ok(());

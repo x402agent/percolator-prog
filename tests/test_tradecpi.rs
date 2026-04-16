@@ -5391,10 +5391,12 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
         )
     };
 
-    assert_eq!(
+    // Zero-fill preserves index advancement to prevent dt-accumulation attacks.
+    // The index legitimately moves toward mark during the oracle read, and
+    // reverting it would let an attacker accumulate dt across repeated zero-fills.
+    assert_ne!(
         index_before, index_after,
-        "Zero-fill must not walk last_effective_price_e6: before={} after={}",
-        index_before, index_after
+        "Zero-fill must preserve index advancement (anti-dt-accumulation)"
     );
 
     // Also verify no position change (sanity check for zero-fill)
