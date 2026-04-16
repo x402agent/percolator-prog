@@ -43,7 +43,7 @@ pub mod constants {
     // CRANK_REWARD_MIN_DT removed — crank discount logic removed in v12.15
     /// Progressive scan window per crank.
     pub const RISK_SCAN_WINDOW: usize = 32;
-    pub const MATCHER_ABI_VERSION: u32 = 1;
+    pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
     pub const MATCHER_CALL_TAG: u8 = 0;
@@ -1876,10 +1876,12 @@ pub mod state {
 
     /// Increment the materialization counter and return the NEW value.
     /// Each account gets a globally unique ID at creation time.
-    pub fn next_mat_counter(data: &mut [u8]) -> u64 {
-        let c = read_mat_counter(data).wrapping_add(1);
+    /// Returns None if the counter would overflow (0 is reserved as "never materialized").
+    pub fn next_mat_counter(data: &mut [u8]) -> Option<u64> {
+        let old = read_mat_counter(data);
+        let c = old.checked_add(1)?;
         write_mat_counter(data, c);
-        c
+        Some(c)
     }
 
     // ========================================
@@ -3528,7 +3530,8 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
                 drop(engine);
-                let gen = state::next_mat_counter(&mut data);
+                let gen = state::next_mat_counter(&mut data)
+                    .ok_or(PercolatorError::EngineOverflow)?;
                 state::write_account_generation(&mut data, idx, gen);
             }
             Instruction::InitLP {
@@ -3596,7 +3599,8 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
                 drop(engine);
-                let gen = state::next_mat_counter(&mut data);
+                let gen = state::next_mat_counter(&mut data)
+                    .ok_or(PercolatorError::EngineOverflow)?;
                 state::write_account_generation(&mut data, idx, gen);
             }
             Instruction::DepositCollateral { user_idx, amount } => {
@@ -4067,9 +4071,6 @@ pub mod processor {
                     read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data)?;
                 state::write_config(&mut data, &config);
 
-                // Read LP generation before engine borrow
-                let lp_gen = state::read_account_generation(&data, lp_idx);
-
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, lp_idx)?;
@@ -4107,7 +4108,7 @@ pub mod processor {
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 execute_trade_with_matcher(
                     engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
-                    funding_rate_e9, lp_gen,
+                    funding_rate_e9, 0, // NoOpMatcher ignores lp_account_id
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
@@ -4305,6 +4306,10 @@ pub mod processor {
                     // Assigned at InitLP, immutable for the lifetime of this LP instance.
                     // Different for every materialization even at the same slot.
                     let lp_instance_id = state::read_account_generation(&*data, lp_idx);
+                    // Reject generation 0 — slot was never materialized via InitLP
+                    if lp_instance_id == 0 {
+                        return Err(PercolatorError::EngineAccountNotFound.into());
+                    }
                     (
                         lp_instance_id,
                         config,
