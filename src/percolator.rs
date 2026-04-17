@@ -1591,7 +1591,11 @@ pub mod ix {
         let initial_margin_bps = read_u64(input)?;
         let trading_fee_bps = read_u64(input)?;
         let max_accounts = read_u64(input)?;
-        let new_account_fee = U128::new(read_u128(input)?);
+        // Wire-format compat: engine v12.18.1 removed new_account_fee (spec §10.2
+        // made deposit the canonical materialization path with no engine-native
+        // opening fee). We still consume 16 bytes to keep the wire format stable
+        // for existing clients, but the value is discarded.
+        let _compat_new_account_fee = read_u128(input)?;
         let insurance_floor = read_u128(input)?;
         let h_max = read_u64(input)?;
         let max_crank_staleness_slots = read_u64(input)?;
@@ -1610,7 +1614,6 @@ pub mod ix {
             initial_margin_bps,
             trading_fee_bps,
             max_accounts,
-            new_account_fee,
             max_crank_staleness_slots,
             liquidation_fee_bps,
             liquidation_fee_cap,
@@ -1622,10 +1625,14 @@ pub mod ix {
             h_min,
             h_max,
             resolve_price_deviation_bps,
-            // Envelope defaults: ADL_ONE * MAX_ORACLE_PRICE * rate * dt <= i128::MAX
+            // Envelope: ADL_ONE * MAX_ORACLE_PRICE * rate * dt <= i128::MAX
             // 1e15 * 1e12 * 1e6 * 1e5 = 1e38 < i128::MAX (1.7e38). ✓
             max_accrual_dt_slots: 100_000,
             max_abs_funding_e9_per_slot: 1_000_000,
+            // Active-positions cap per side (§1.4). Default: same as max_accounts
+            // so no extra cap above the account limit — admins can tighten via
+            // UpdateConfig in the future without changing the wire layout.
+            max_active_positions_per_side: max_accounts,
         };
         Ok((params, insurance_floor))
     }
@@ -3427,10 +3434,7 @@ pub mod processor {
                     if p.insurance_floor.get() > percolator::MAX_VAULT_TVL {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    // new_account_fee must be payable: 0 <= fee <= MAX_VAULT_TVL
-                    if p.new_account_fee.get() > percolator::MAX_VAULT_TVL {
-                        return Err(ProgramError::InvalidInstructionData);
-                    }
+                    // new_account_fee removed in engine v12.18.1 (§10.2).
                     // Warmup horizon: h_min <= h_max (engine asserts, but we pre-validate)
                     if p.h_min > p.h_max {
                         return Err(ProgramError::InvalidInstructionData);
@@ -3587,17 +3591,20 @@ pub mod processor {
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
                 let engine = zc::engine_mut(&mut data)?;
-                // Use engine's canonical materialization API (§10.3).
-                // Handles fee deduction, dust rejection, vault/insurance accounting,
-                // max_accounts bound, and materialized_account_count tracking.
-                let idx = engine.materialize_with_fee(
-                    percolator::Account::KIND_USER,
-                    units as u128,
-                    [0u8; 32], // no matcher for users
-                    [0u8; 32],
-                ).map_err(map_risk_error)?;
+                // Engine v12.18.1 (§10.2): deposit is the canonical materialization
+                // path. It materializes the account at `idx` iff not already used and
+                // amount >= min_initial_deposit. We allocate the next free slot by
+                // reading the engine's public free_head (O(1)).
+                let idx = engine.free_head;
+                if idx as usize >= percolator::MAX_ACCOUNTS {
+                    return Err(PercolatorError::EngineOverflow.into());
+                }
+                engine
+                    .deposit_not_atomic(idx, units as u128, 0, clock.slot)
+                    .map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
+                // kind defaults to KIND_USER from materialize_at — no write needed.
                 drop(engine);
                 let gen = state::next_mat_counter(&mut data)
                     .ok_or(PercolatorError::EngineOverflow)?;
@@ -3658,15 +3665,23 @@ pub mod processor {
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
                 let engine = zc::engine_mut(&mut data)?;
-                // Use engine's canonical materialization API (§10.3).
-                let idx = engine.materialize_with_fee(
-                    percolator::Account::KIND_LP,
-                    units as u128,
-                    matcher_program.to_bytes(),
-                    matcher_context.to_bytes(),
-                ).map_err(map_risk_error)?;
+                // Engine v12.18.1 (§10.2): deposit is the canonical materialization.
+                // We materialize a free slot as a User (engine default), then stamp
+                // the LP-specific fields (kind, matcher_program, matcher_context)
+                // directly via their public fields — the engine no longer exposes a
+                // combined LP-materialization method.
+                let idx = engine.free_head;
+                if idx as usize >= percolator::MAX_ACCOUNTS {
+                    return Err(PercolatorError::EngineOverflow.into());
+                }
+                engine
+                    .deposit_not_atomic(idx, units as u128, 0, clock.slot)
+                    .map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes())
                     .map_err(map_risk_error)?;
+                engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
+                engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
+                engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
                 drop(engine);
                 let gen = state::next_mat_counter(&mut data)
                     .ok_or(PercolatorError::EngineOverflow)?;
@@ -3887,18 +3902,11 @@ pub mod processor {
                     // which call force_close_resolved_not_atomic atomically.
                     // The resolved crank only handles lifecycle.
 
-                    // §10.0 steps 4-7 / §10.8 steps 9-12: end-of-instruction lifecycle.
-                    // Propagate CorruptState (real invariant violation), ignore other
-                    // errors (side-reset may fail on frozen ADL state post-resolution).
-                    // Pass zero funding rate — market is resolved, no funding accrual.
-                    let mut ctx = percolator::InstructionContext::new();
-                    match engine.run_end_of_instruction_lifecycle(&mut ctx) {
-                        Ok(()) => {}
-                        Err(percolator::RiskError::CorruptState) => {
-                            return Err(map_risk_error(percolator::RiskError::CorruptState));
-                        }
-                        Err(_) => {} // non-fatal on resolved markets
-                    }
+                    // Resolved markets are frozen: no K/F mutation, no per-account
+                    // settlement. The end-of-instruction lifecycle is a no-op here,
+                    // and engine v12.18.1 no longer exposes it publicly (it is folded
+                    // into the _not_atomic methods that actually change state).
+                    let _ = engine; // silence "unused" when no crank work runs.
 
                     return Ok(());
                 }
@@ -5314,17 +5322,11 @@ pub mod processor {
                 config.funding_k_bps = funding_k_bps;
                 config.funding_max_premium_bps = funding_max_premium_bps;
                 config.funding_max_bps_per_slot = funding_max_bps_per_slot;
-                // Run end-of-instruction lifecycle after accrue + config change.
-                // Finalizes pending resets triggered by the accrual.
-                // Propagate ALL errors — on live markets, lifecycle failures
-                // indicate real problems (partial state already committed via
-                // zero-copy mutation, so we must reject to avoid silent corruption).
-                {
-                    let engine = zc::engine_mut(&mut data)?;
-                    let mut ctx = percolator::InstructionContext::new();
-                    engine.run_end_of_instruction_lifecycle(&mut ctx)
-                        .map_err(map_risk_error)?;
-                }
+                // Engine v12.18.1: accrue_market_to only updates market-global state
+                // (K/F/slot_last). No per-account touches means no resets to
+                // schedule or finalize, so the end-of-instruction lifecycle — which
+                // the engine no longer exposes publicly — is structurally a no-op
+                // on this path.
                 state::write_config(&mut data, &config);
             }
 
@@ -5500,16 +5502,10 @@ pub mod processor {
                     // (crank/trade/withdraw) so admin can't poison it to bypass
                     // the settlement circuit breaker in ResolveMarket.
                 }
-                // Run end-of-instruction lifecycle (§5.7-5.8) after accrue_market_to.
-                // This finalizes any pending DrainOnly→ResetPending→Normal transitions
-                // triggered by the accrual. Without this, sides could stay DrainOnly
-                // with OI=0 until the next standard-lifecycle instruction.
-                if is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    let mut ctx = percolator::InstructionContext::new();
-                    engine.run_end_of_instruction_lifecycle(&mut ctx)
-                        .map_err(map_risk_error)?;
-                }
+                // Engine v12.18.1: accrue_market_to touches only market-global state.
+                // End-of-instruction lifecycle is a no-op on this path and no longer
+                // exposed publicly; next state-changing _not_atomic will finalize any
+                // pending transitions.
                 state::write_config(&mut data, &config);
             }
 
@@ -5589,14 +5585,8 @@ pub mod processor {
                 }
 
                 config.oracle_price_cap_e2bps = max_change_e2bps;
-                // Run end-of-instruction lifecycle after accrue + cap change.
-                // Propagate ALL errors on live markets.
-                if is_hyperp {
-                    let engine = zc::engine_mut(&mut data)?;
-                    let mut ctx = percolator::InstructionContext::new();
-                    engine.run_end_of_instruction_lifecycle(&mut ctx)
-                        .map_err(map_risk_error)?;
-                }
+                // Engine v12.18.1: accrue_market_to is market-global only; the
+                // end-of-instruction lifecycle is not exposed and not needed here.
                 state::write_config(&mut data, &config);
             }
 
@@ -6097,13 +6087,9 @@ pub mod processor {
                                 funding_rate_e9,
                             ).map_err(map_risk_error)?;
                         }
-                        // Run lifecycle after accrual (same as UpdateConfig/PushOraclePrice)
-                        {
-                            let engine = zc::engine_mut(&mut data)?;
-                            let mut ctx = percolator::InstructionContext::new();
-                            engine.run_end_of_instruction_lifecycle(&mut ctx)
-                                .map_err(map_risk_error)?;
-                        }
+                        // Engine v12.18.1: accrue_market_to is market-global only;
+                        // no per-account resets to finalize on this path, and the
+                        // end-of-instruction lifecycle is no longer exposed publicly.
                         if !state::is_oracle_initialized(&data) {
                             state::set_oracle_initialized(&mut data);
                         }

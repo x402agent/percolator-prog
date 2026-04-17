@@ -177,9 +177,13 @@ fn test_misaligned_withdrawal_rejected() {
 
 /// Test that fee overpayments are properly handled.
 ///
-/// Bug: If fee_payment > new_account_fee, the excess is deposited to vault
-/// but only new_account_fee is accounted in engine.vault/insurance.
+/// Obsolete under engine v12.18.1: new_account_fee was removed when deposit
+/// became the canonical materialization path (spec §10.2). There is no
+/// engine-native opening fee to over- or under-pay; the minimum deposit
+/// alone gates materialization. The scenario this test targets no longer
+/// exists.
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_bug4_fee_overpayment_should_be_handled() {
     program_path();
 
@@ -2507,8 +2511,11 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 // InitUser (tag 1) additional coverage
 // ============================================================================
 
-/// Spec: InitUser transfers new_account_fee to insurance fund.
-/// After InitUser, insurance balance must increase by exactly new_account_fee.
+/// Obsolete under engine v12.18.1: new_account_fee was removed (spec §10.2
+/// made deposit the canonical materialization path with no engine-native
+/// opening fee). Deposit amounts now credit entirely to capital; insurance
+/// is no longer debited on creation.
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 #[test]
 fn test_init_user_charges_new_account_fee() {
     program_path();

@@ -640,7 +640,7 @@ fn test_attack_trade_risk_increase_when_gated() {
     // From code analysis: BPF side_mode_long at engine offset ~488.
     // Slab absolute = 472 + 960 = 960.
     // Fallback: try the value and if the trade still works, try adjacent offsets.
-    const SIDE_MODE_LONG_OFF: usize = 472 + 552; // v12.18.1: +16 after RiskParams grew
+    const SIDE_MODE_LONG_OFF: usize = 472 + 544; // v12.18.1: RiskParams net -8 (new_account_fee removed, max_active_positions_per_side added)
     {
         let original_slab = env
             .svm

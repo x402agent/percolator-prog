@@ -1315,7 +1315,10 @@ fn test_attack_multiple_liquidations_insurance_drain() {
 
 /// ATTACK: Insurance grows correctly from new account fees.
 /// InitUser/InitLP pays a new_account_fee that goes to insurance.
+///
+/// Obsolete under engine v12.18.1: new_account_fee is gone (spec §10.2).
 #[test]
+#[ignore = "new_account_fee removed in engine v12.18.1 (spec §10.2)"]
 fn test_attack_new_account_fee_goes_to_insurance() {
     program_path();
 
