@@ -32,7 +32,7 @@ use std::path::PathBuf;
 const SLAB_LEN: usize = 19640; // MAX_ACCOUNTS=64 - native 128-bit fields
 
 #[cfg(not(feature = "test"))]
-const SLAB_LEN: usize = 1484616; // MAX_ACCOUNTS=4096, Account=352 bytes (SBF target) + gen table
+const SLAB_LEN: usize = 1484632; // MAX_ACCOUNTS=4096, Account=352 bytes (SBF target) + gen table
 
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
@@ -166,7 +166,7 @@ fn encode_init_market_with_params(
 }
 
 fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<u8> {
-    encode_init_market_with_params(admin, mint, feed_id, 0, 0)
+    encode_init_market_with_params(admin, mint, feed_id, 0, 1)
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
@@ -322,7 +322,7 @@ impl TestEnv {
     }
 
     fn init_market(&mut self) {
-        self.init_market_with_params(0, 0);
+        self.init_market_with_params(0, 1);
     }
 
     fn init_market_with_params(
@@ -1493,7 +1493,7 @@ fn benchmark_worst_case_scenarios() {
 
         let mut env = TestEnv::new();
         // threshold=0, warmup=0
-        env.init_market_with_params(0, 0);
+        env.init_market_with_params(0, 1);
 
         // Top up insurance so force_realize is OFF and liquidation path runs
         let insurance_funder = Keypair::new();

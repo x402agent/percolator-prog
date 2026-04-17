@@ -1622,6 +1622,10 @@ pub mod ix {
             h_min,
             h_max,
             resolve_price_deviation_bps,
+            // Envelope defaults: ADL_ONE * MAX_ORACLE_PRICE * rate * dt <= i128::MAX
+            // 1e15 * 1e12 * 1e6 * 1e5 = 1e38 < i128::MAX (1.7e38). ✓
+            max_accrual_dt_slots: 100_000,
+            max_abs_funding_e9_per_slot: 1_000_000,
         };
         Ok((params, insurance_floor))
     }
@@ -2914,7 +2918,8 @@ pub mod processor {
         } else {
             return Err(RiskError::Overflow);
         };
-        let h_lock = engine.params.h_min;
+        let admit_h_min = engine.params.h_min;
+        let admit_h_max = engine.params.h_max;
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -2923,7 +2928,8 @@ pub mod processor {
             abs_size,
             exec.price,
             funding_rate_e9,
-            h_lock,
+            admit_h_min,
+            admit_h_max,
         )
     }
 
@@ -3766,10 +3772,11 @@ pub mod processor {
                 let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
 
                 let withdraw_slot = clock.slot;
-                let h_lock = engine.params.h_min;
+                let admit_h_min = engine.params.h_min;
+                let admit_h_max = engine.params.h_max;
                 engine
                     .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
-                        funding_rate_e9, h_lock)
+                        funding_rate_e9, admit_h_min, admit_h_max)
                     .map_err(map_risk_error)?;
                 drop(engine);
                 if !state::is_oracle_initialized(&data) {
@@ -3921,7 +3928,8 @@ pub mod processor {
                 }
                 combined.extend_from_slice(&candidates);
 
-                let h_lock = engine.params.h_min;
+                let admit_h_min = engine.params.h_min;
+                let admit_h_max = engine.params.h_max;
                 let _outcome = engine
                     .keeper_crank_not_atomic(
                         clock.slot,
@@ -3929,7 +3937,8 @@ pub mod processor {
                         &combined,
                         percolator::LIQ_BUDGET_PER_CRANK,
                         funding_rate_e9_pre,
-                        h_lock,
+                        admit_h_min,
+                        admit_h_max,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
@@ -4695,12 +4704,14 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: liquidate_start");
                     sol_log_compute_units();
                 }
-                let h_lock = engine.params.h_min;
+                let admit_h_min = engine.params.h_min;
+                let admit_h_max = engine.params.h_max;
                 let _res = engine
                     .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
                         percolator::LiquidationPolicy::FullClose,
                         funding_rate_e9,
-                        h_lock)
+                        admit_h_min,
+                        admit_h_max)
                     .map_err(map_risk_error)?;
                 sol_log_64(_res as u64, 0, 0, 0, 4); // result
 
@@ -4819,11 +4830,13 @@ pub mod processor {
                         percolator::ResolvedCloseResult::Closed(payout) => payout,
                     }
                 } else {
-                    let h_lock = engine.params.h_min;
+                    let admit_h_min = engine.params.h_min;
+                    let admit_h_max = engine.params.h_max;
                     engine
                         .close_account_not_atomic(user_idx, clock.slot, price,
                             funding_rate_e9,
-                            h_lock)
+                            admit_h_min,
+                            admit_h_max)
                         .map_err(map_risk_error)?
                 };
                 #[cfg(feature = "cu-audit")]
@@ -6277,10 +6290,12 @@ pub mod processor {
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
-                let h_lock = engine.params.h_min;
+                let admit_h_min = engine.params.h_min;
+                let admit_h_max = engine.params.h_max;
                 engine.settle_account_not_atomic(user_idx, price, clock.slot,
                     funding_rate_e9,
-                    h_lock)
+                    admit_h_min,
+                    admit_h_max)
                     .map_err(map_risk_error)?;
                 drop(engine);
                 if !state::is_oracle_initialized(&data) {
@@ -6406,10 +6421,12 @@ pub mod processor {
                 if dust != 0 {
                     return Err(ProgramError::InvalidArgument);
                 }
-                let h_lock = engine.params.h_min;
+                let admit_h_min = engine.params.h_min;
+                let admit_h_max = engine.params.h_max;
                 engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
                     funding_rate_e9,
-                    h_lock)
+                    admit_h_min,
+                    admit_h_max)
                     .map_err(map_risk_error)?;
                 drop(engine);
                 if !state::is_oracle_initialized(&data) {
