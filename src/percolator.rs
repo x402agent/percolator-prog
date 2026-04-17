@@ -2899,17 +2899,17 @@ pub mod processor {
     /// (before materializing a new slot). The latter prevents the correctness
     /// bug where a freshly-created account inherits the global cursor and
     /// gets back-charged for the entire unswept interval — time before it
-    /// existed. By flushing fees for existing accounts and advancing the
-    /// cursor at creation time, the new account starts at parity with the
-    /// cursor (its own first fee charge is for zero slots, 0 fee).
+    /// existed. Flushing existing accounts and advancing the cursor at
+    /// creation time lets the new account start at parity with the cursor.
     ///
-    /// Pre-screening: accounts whose capital < computed fee are skipped
-    /// (no engine call, no mutation). That keeps the "cursor may advance"
-    /// invariant intact: every mutation that happens pays in full for the
-    /// whole interval exactly once. Failure modes:
-    ///   - CorruptState / Unauthorized → propagate (invariant-level error)
-    ///   - other engine Err → propagate (shouldn't be reachable under the
-    ///     pre-screen but better to surface than silently swallow)
+    /// Shortfall handling: `charge_account_fee_not_atomic` never fails with
+    /// InsufficientBalance — the engine's `charge_fee_to_insurance` pays
+    /// what's available from capital and routes the rest into fee_credits
+    /// debt (spec §8.2.2, capped at i128 headroom). Therefore we do NOT
+    /// pre-screen capital against the fee; a pre-screen would silently
+    /// undercharge low-capital accounts while the cursor advanced anyway.
+    /// Every used account is charged; any remaining errors (CorruptState,
+    /// Unauthorized) are invariant-level and propagate.
     ///
     /// No-op when maintenance_fee_per_slot == 0 or dt == 0.
     fn flush_maintenance_fees_to_slot(
@@ -2936,9 +2936,8 @@ pub mod processor {
                 if idx >= percolator::MAX_ACCOUNTS {
                     continue;
                 }
-                if engine.accounts[idx].capital.get() < fee_per_account {
-                    continue;
-                }
+                // No pre-screen on capital: engine books shortfall as
+                // fee_credits debt (§8.2.2) rather than failing.
                 match engine.charge_account_fee_not_atomic(
                     idx as u16,
                     fee_per_account,
@@ -4128,76 +4127,14 @@ pub mod processor {
                 // issues (e.g., InsufficientBalance on a drained account) are
                 // skipped — a permissionless crank must not be brickable by a
                 // single insolvent account.
-                if config.maintenance_fee_per_slot > 0 {
-                    let dt = clock.slot.saturating_sub(config.last_fee_charge_slot);
-                    if dt > 0 {
-                        let raw_fee = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
-                        let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
-                        // Work-proportional scan: iterate engine.used[] set bits.
-                        const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
-                        // Cursor policy: advance last_fee_charge_slot to clock.slot
-                        // UNCONDITIONALLY at the end of the sweep. That is only sound
-                        // if every used account either (a) paid the interval in full
-                        // or (b) was intentionally skipped without mutation. If we
-                        // called charge_account_fee_not_atomic and it returned
-                        // InsufficientBalance mid-sweep, the earlier successful
-                        // charges stayed committed while this account kept its
-                        // unpaid interval → next crank recomputed dt from the
-                        // non-advanced cursor and double-charged the successful
-                        // accounts for the same interval.
-                        //
-                        // Fix: pre-screen each account's capital against the fee.
-                        // Accounts that cannot pay are *skipped with no engine
-                        // call*, so no state is mutated for them. Accounts that
-                        // can pay are charged. Either way the cursor may advance,
-                        // because every mutation that happened accounted for the
-                        // full [cursor, clock.slot] interval exactly once.
-                        //
-                        // CorruptState / Unauthorized still propagate: they are
-                        // invariant-level errors, not per-account insolvency.
-                        for word_idx in 0..BITMAP_WORDS {
-                            let mut bits = engine.used[word_idx];
-                            while bits != 0 {
-                                let bit = bits.trailing_zeros() as usize;
-                                let idx = word_idx * 64 + bit;
-                                bits &= bits - 1; // clear lowest set bit
-                                if idx >= percolator::MAX_ACCOUNTS {
-                                    continue;
-                                }
-                                // Pre-screen: skip without engine call if the
-                                // account cannot afford the full fee. This
-                                // avoids partial-commit semantics on a failed
-                                // InsufficientBalance and keeps the cursor-
-                                // advance invariant whole.
-                                let cap = engine.accounts[idx].capital.get();
-                                if cap < fee_per_account {
-                                    continue;
-                                }
-                                match engine.charge_account_fee_not_atomic(
-                                    idx as u16,
-                                    fee_per_account,
-                                    clock.slot,
-                                ) {
-                                    Ok(()) => {}
-                                    Err(percolator::RiskError::CorruptState) => {
-                                        return Err(map_risk_error(percolator::RiskError::CorruptState));
-                                    }
-                                    Err(percolator::RiskError::Unauthorized) => {
-                                        return Err(map_risk_error(percolator::RiskError::Unauthorized));
-                                    }
-                                    Err(e) => {
-                                        // Under the pre-screen above, the only
-                                        // plausible path here is an engine-internal
-                                        // invariant violation we haven't enumerated.
-                                        // Propagate rather than mask.
-                                        return Err(map_risk_error(e));
-                                    }
-                                }
-                            }
-                        }
-                        config.last_fee_charge_slot = clock.slot;
-                    }
-                }
+                // Delegate to the shared helper so both KeeperCrank and the
+                // InitUser/InitLP flush-on-materialize paths have identical
+                // semantics: iterate the used bitmap, charge every used slot
+                // (engine books shortfall as fee-credit debt — never fails on
+                // InsufficientBalance), advance the cursor once at the end.
+                // Invariant-level errors (CorruptState / Unauthorized) still
+                // propagate.
+                flush_maintenance_fees_to_slot(engine, &mut config, clock.slot)?;
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
@@ -5921,24 +5858,50 @@ pub mod processor {
                 let engine = zc::engine_mut(&mut data)?;
                 let is_hyperp_local = oracle::is_hyperp_mode(&config);
 
-                let (live_oracle, rate_for_final_accrual): (u64, i128) =
+                let (live_oracle, rate_for_final_accrual, in_ordinary_arm): (u64, i128, bool) =
                     if let Some(fresh) = fresh_live_oracle {
                         // ORDINARY: fresh non-Hyperp oracle reading
-                        (fresh, funding_rate_e9)
+                        (fresh, funding_rate_e9, true)
                     } else if is_hyperp_local {
                         // ORDINARY: Hyperp uses the just-flushed index as its live
                         // oracle; funding accrual uses the captured rate.
-                        (config.last_effective_price_e6, funding_rate_e9)
+                        (config.last_effective_price_e6, funding_rate_e9, true)
                     } else if oracle_initialized {
                         // DEGENERATE: non-Hyperp oracle is dead. Resolve at P_last
                         // with zero funding over the signal-free interval.
-                        (engine.last_oracle_price, 0i128)
+                        (engine.last_oracle_price, 0i128, false)
                     } else {
                         // Oracle never initialized and no fresh read — cannot settle
                         // a live market from the init sentinel. Empty markets resolve
                         // via ResolvePermissionless (OI=0 safety branch).
                         return Err(PercolatorError::OracleInvalid.into());
                     };
+                // Spec §9.8 step 7 deviation-band check. The engine has the
+                // same check internally but discriminates "degenerate arm"
+                // by the *value pattern* `live == last_oracle_price && rate == 0`.
+                // That discriminator is too weak — an ordinary resolution
+                // whose fresh oracle happens to equal the stored last price
+                // with a zero captured funding rate (both plausible in a
+                // quiet market) can slip past the engine's band check. We
+                // apply the band check ourselves on the ORDINARY arm so that
+                // an out-of-band settlement_price is rejected regardless of
+                // what the engine's discriminator decides.
+                if in_ordinary_arm {
+                    let dev_bps = engine.params.resolve_price_deviation_bps as u128;
+                    let p_live = live_oracle as u128;
+                    let diff = if settlement_price >= live_oracle {
+                        (settlement_price - live_oracle) as u128
+                    } else {
+                        (live_oracle - settlement_price) as u128
+                    };
+                    let lhs = diff.checked_mul(10_000)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    let rhs = dev_bps.checked_mul(p_live)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    if lhs > rhs {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                }
                 engine.resolve_market_not_atomic(
                     settlement_price,
                     live_oracle,
