@@ -4767,4 +4767,36 @@ fn test_trade_nocpi_allows_user_user_bilateral() {
     assert!(result.is_ok(), "User-user bilateral trade must be allowed: {:?}", result);
 }
 
+// ============================================================================
+// Regression tests: TDD round-4 blockers
+// ============================================================================
+
+/// Blocker 3 regression: funding_max_bps_per_slot is compared in i128 space;
+/// huge positive inputs must NOT wrap through `as u64` into the per-market
+/// envelope. With the wrapper envelope = 1_000_000 (10 bps/slot), a value of
+/// i64::MAX bps_per_slot would yield funding_bps_to_e9 ≈ 9.2e23, which casts
+/// modulo 2^64 to a small value and used to sneak past the check.
+#[test]
+fn test_init_market_rejects_huge_funding_max_bps_per_slot_without_wrap() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Send the largest legal i64 through the custom-funding path.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 1 bps/slot is safely within the envelope (fits 1e6 e9/slot);
+        // i64::MAX would overflow the envelope by ~17 orders of magnitude.
+        env.init_market_with_funding(
+            0,     // invert
+            10_000, // min_oracle_price_cap_e2bps
+            0,     // permissionless_resolve_stale_slots
+            200,   // funding_horizon_slots
+            200,   // funding_k_bps
+            1_000, // funding_max_premium_bps
+            i64::MAX, // funding_max_bps_per_slot — MUST be rejected
+        );
+    }));
+    assert!(
+        result.is_err(),
+        "InitMarket must reject funding_max_bps_per_slot = i64::MAX (beyond per-market envelope)"
+    );
+}
 

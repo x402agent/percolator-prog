@@ -2891,6 +2891,68 @@ pub mod processor {
     /// Returns 0 if no trades yet (mark_ewma == 0) or params unset.
     /// Compute funding rate in e9-per-slot (ppb) directly.
     /// Avoids bps quantization: sub-bps rates are preserved as nonzero ppb values.
+    /// Apply pending maintenance fees for the interval
+    ///   [config.last_fee_charge_slot, now_slot]
+    /// to every currently-used account, then advance the cursor to now_slot.
+    ///
+    /// Called from both KeeperCrank (the recurring sweep) and InitUser/InitLP
+    /// (before materializing a new slot). The latter prevents the correctness
+    /// bug where a freshly-created account inherits the global cursor and
+    /// gets back-charged for the entire unswept interval — time before it
+    /// existed. By flushing fees for existing accounts and advancing the
+    /// cursor at creation time, the new account starts at parity with the
+    /// cursor (its own first fee charge is for zero slots, 0 fee).
+    ///
+    /// Pre-screening: accounts whose capital < computed fee are skipped
+    /// (no engine call, no mutation). That keeps the "cursor may advance"
+    /// invariant intact: every mutation that happens pays in full for the
+    /// whole interval exactly once. Failure modes:
+    ///   - CorruptState / Unauthorized → propagate (invariant-level error)
+    ///   - other engine Err → propagate (shouldn't be reachable under the
+    ///     pre-screen but better to surface than silently swallow)
+    ///
+    /// No-op when maintenance_fee_per_slot == 0 or dt == 0.
+    fn flush_maintenance_fees_to_slot(
+        engine: &mut RiskEngine,
+        config: &mut MarketConfig,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
+            return Ok(());
+        }
+        let dt = now_slot.saturating_sub(config.last_fee_charge_slot);
+        if dt == 0 {
+            return Ok(());
+        }
+        let raw_fee = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
+        let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
+        const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
+        for word_idx in 0..BITMAP_WORDS {
+            let mut bits = engine.used[word_idx];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let idx = word_idx * 64 + bit;
+                bits &= bits - 1;
+                if idx >= percolator::MAX_ACCOUNTS {
+                    continue;
+                }
+                if engine.accounts[idx].capital.get() < fee_per_account {
+                    continue;
+                }
+                match engine.charge_account_fee_not_atomic(
+                    idx as u16,
+                    fee_per_account,
+                    now_slot,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => return Err(map_risk_error(e)),
+                }
+            }
+        }
+        config.last_fee_charge_slot = now_slot;
+        Ok(())
+    }
+
     fn compute_current_funding_rate_e9(config: &MarketConfig) -> i128 {
         let mark = config.mark_ewma_e6;
         let index = config.last_effective_price_e6;
@@ -3363,14 +3425,15 @@ pub mod processor {
                     }
                 }
                 if let Some(ms) = custom_max_per_slot {
-                    // The wrapper's RiskParams envelope stores a per-market cap of
-                    // 1_000_000 e9/slot (see read_risk_params). Validating against the
-                    // engine's global MAX_ABS_FUNDING_E9_PER_SLOT (1e9) would accept
-                    // rates the engine later rejects at accrue time — i.e., live
-                    // markets that can be bricked by a large premium. Gate against
-                    // the stored per-market cap instead.
+                    // The wrapper's RiskParams envelope stores a per-market cap
+                    // (read_risk_params). Validate against it. Compare in i128
+                    // space — casting funding_bps_to_e9(ms) (i128) to u64 would
+                    // wrap modulo 2^64 on large inputs (e.g., ms = i64::MAX
+                    // yields ~9e23), silently admitting huge caps the engine
+                    // would later reject at accrue time.
                     if ms < 0
-                        || funding_bps_to_e9(ms) as u64 > risk_params.max_abs_funding_e9_per_slot
+                        || funding_bps_to_e9(ms)
+                            > risk_params.max_abs_funding_e9_per_slot as i128
                     {
                         return Err(PercolatorError::InvalidConfigParam.into());
                     }
@@ -3601,7 +3664,7 @@ pub mod processor {
                 if zc::engine_ref(&data)?.is_resolved() {
                     return Err(ProgramError::InvalidAccountData);
                 }
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -3628,6 +3691,17 @@ pub mod processor {
 
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
+
+                // Flush pending maintenance fees for existing accounts and
+                // advance the cursor to clock.slot BEFORE materializing the new
+                // account. Otherwise the new slot inherits the stale global
+                // cursor and gets back-charged at the next crank for time it
+                // didn't exist.
+                {
+                    let engine = zc::engine_mut(&mut data)?;
+                    flush_maintenance_fees_to_slot(engine, &mut config, clock.slot)?;
+                    state::write_config(&mut data, &config);
+                }
 
                 let engine = zc::engine_mut(&mut data)?;
                 // Engine v12.18.1 (§10.2): deposit is the canonical materialization
@@ -3675,7 +3749,7 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -3702,6 +3776,14 @@ pub mod processor {
 
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
+
+                // Flush pending maintenance fees and advance cursor BEFORE
+                // materializing the LP slot — same correctness fix as InitUser.
+                {
+                    let engine = zc::engine_mut(&mut data)?;
+                    flush_maintenance_fees_to_slot(engine, &mut config, clock.slot)?;
+                    state::write_config(&mut data, &config);
+                }
 
                 let engine = zc::engine_mut(&mut data)?;
                 // Engine v12.18.1 (§10.2): deposit is the canonical materialization.
@@ -4053,12 +4135,26 @@ pub mod processor {
                         let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
                         // Work-proportional scan: iterate engine.used[] set bits.
                         const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
-                        // Fee-cursor safety: advance last_fee_charge_slot only if
-                        // every used account was actually charged for the interval.
-                        // Swallowing a per-account error AND advancing the cursor
-                        // loses that account's interval forever; record any skip
-                        // and refuse to advance when it happens.
-                        let mut all_charged = true;
+                        // Cursor policy: advance last_fee_charge_slot to clock.slot
+                        // UNCONDITIONALLY at the end of the sweep. That is only sound
+                        // if every used account either (a) paid the interval in full
+                        // or (b) was intentionally skipped without mutation. If we
+                        // called charge_account_fee_not_atomic and it returned
+                        // InsufficientBalance mid-sweep, the earlier successful
+                        // charges stayed committed while this account kept its
+                        // unpaid interval → next crank recomputed dt from the
+                        // non-advanced cursor and double-charged the successful
+                        // accounts for the same interval.
+                        //
+                        // Fix: pre-screen each account's capital against the fee.
+                        // Accounts that cannot pay are *skipped with no engine
+                        // call*, so no state is mutated for them. Accounts that
+                        // can pay are charged. Either way the cursor may advance,
+                        // because every mutation that happened accounted for the
+                        // full [cursor, clock.slot] interval exactly once.
+                        //
+                        // CorruptState / Unauthorized still propagate: they are
+                        // invariant-level errors, not per-account insolvency.
                         for word_idx in 0..BITMAP_WORDS {
                             let mut bits = engine.used[word_idx];
                             while bits != 0 {
@@ -4066,6 +4162,15 @@ pub mod processor {
                                 let idx = word_idx * 64 + bit;
                                 bits &= bits - 1; // clear lowest set bit
                                 if idx >= percolator::MAX_ACCOUNTS {
+                                    continue;
+                                }
+                                // Pre-screen: skip without engine call if the
+                                // account cannot afford the full fee. This
+                                // avoids partial-commit semantics on a failed
+                                // InsufficientBalance and keeps the cursor-
+                                // advance invariant whole.
+                                let cap = engine.accounts[idx].capital.get();
+                                if cap < fee_per_account {
                                     continue;
                                 }
                                 match engine.charge_account_fee_not_atomic(
@@ -4080,19 +4185,17 @@ pub mod processor {
                                     Err(percolator::RiskError::Unauthorized) => {
                                         return Err(map_risk_error(percolator::RiskError::Unauthorized));
                                     }
-                                    Err(_) => {
-                                        // Per-account issue (e.g. insolvent account).
-                                        // Don't brick the crank, but also don't
-                                        // silently advance the cursor past this
-                                        // account's unpaid interval.
-                                        all_charged = false;
+                                    Err(e) => {
+                                        // Under the pre-screen above, the only
+                                        // plausible path here is an engine-internal
+                                        // invariant violation we haven't enumerated.
+                                        // Propagate rather than mask.
+                                        return Err(map_risk_error(e));
                                     }
                                 }
                             }
                         }
-                        if all_charged {
-                            config.last_fee_charge_slot = clock.slot;
-                        }
+                        config.last_fee_charge_slot = clock.slot;
                     }
                 }
 
@@ -5317,11 +5420,14 @@ pub mod processor {
                 // (params.max_abs_funding_e9_per_slot), NOT the crate-global
                 // MAX_ABS_FUNDING_E9_PER_SLOT, so UpdateConfig cannot accept a cap
                 // that the engine would later reject at accrue time.
+                // Compare in i128 space: `as u64` would wrap modulo 2^64 for
+                // huge positive inputs (e.g., i64::MAX * 1e5 ≈ 9e23) and
+                // silently pass the envelope.
                 if funding_max_premium_bps < 0 || funding_max_bps_per_slot < 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 let engine_envelope = zc::engine_ref(&data)?.params.max_abs_funding_e9_per_slot;
-                if funding_bps_to_e9(funding_max_bps_per_slot) as u64 > engine_envelope {
+                if funding_bps_to_e9(funding_max_bps_per_slot) > engine_envelope as i128 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
