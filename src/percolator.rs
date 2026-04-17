@@ -3294,6 +3294,18 @@ pub mod processor {
                 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                // Envelope compatibility: a permissionless-resolve call accrues
+                // over the interval [engine.last_market_slot, clock.slot]. The
+                // engine refuses to accrue over dt > params.max_accrual_dt_slots
+                // (Overflow). If the configured stale threshold could therefore
+                // produce an interval the engine rejects, permissionless
+                // resolution becomes unreachable exactly when it is needed most.
+                // Force the two numbers to be compatible at init time.
+                if permissionless_resolve_stale_slots > 0
+                    && permissionless_resolve_stale_slots > risk_params.max_accrual_dt_slots
+                {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 // Validate custom funding parameters (same checks as UpdateConfig).
                 // These are immutable after init for governance-free deployments.
@@ -3350,14 +3362,36 @@ pub mod processor {
                 let a_clock = &accounts[5];
                 let a_oracle = &accounts[7];
                 let clock = Clock::from_account_info(a_clock)?;
-                // Engine v12 requires init_oracle_price > 0.
-                // Hyperp: use the normalized initial mark price.
-                // Non-Hyperp: use 1 as sentinel — the real oracle price is
-                // established on the first KeeperCrank via accrue_market_to.
-                // This is safe because no trades can happen before a crank
-                // (require_fresh_crank gate in engine), and the first
-                // accrue_market_to overwrites last_oracle_price.
-                let init_price = if is_hyperp { initial_mark_price_e6 } else { 1 };
+                // Engine requires init_oracle_price > 0 (asserted in new_with_market).
+                // Hyperp: use the admin-chosen initial mark price.
+                // Non-Hyperp: REQUIRE a successful oracle read at init. The engine's
+                //   last_oracle_price must be a real economic value, not a positive
+                //   sentinel overloaded to mean "uninitialized" — per spec goal 38
+                //   (no valid positive price may encode "no price yet"). If the
+                //   oracle is unavailable at init time the admin must retry when
+                //   the feed is live; there is no sentinel path.
+                let init_price = if is_hyperp {
+                    initial_mark_price_e6
+                } else {
+                    // Read the external oracle NOW; propagate any error (stale,
+                    // wrong feed, malformed). Success seeds engine.last_oracle_price
+                    // with a real price and lets us mark the oracle-initialized
+                    // flag unconditionally — no FLAG_ORACLE_INITIALIZED gating
+                    // needed for engine reads after this point.
+                    let fresh = oracle::read_engine_price_e6(
+                        a_oracle,
+                        &index_feed_id,
+                        clock.unix_timestamp,
+                        max_staleness_secs,
+                        conf_filter_bps,
+                        invert,
+                        unit_scale,
+                    )?;
+                    if fresh == 0 || fresh > percolator::MAX_ORACLE_PRICE {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    fresh
+                };
 
                 // Prevalidate all engine RiskParams invariants to return
                 // ProgramError instead of panicking inside engine.init_in_place().
@@ -3444,7 +3478,11 @@ pub mod processor {
                         // breaker is active from genesis. 0 floor = no breaker.
                         min_oracle_price_cap_e2bps
                     },
-                    last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+                    // Seed last_effective_price_e6 with the genesis reading so the
+                    // circuit-breaker baseline is real from genesis too (not 0, which
+                    // disables the breaker on first oracle read). For non-Hyperp we
+                    // just read init_price from the feed above, so reuse it.
+                    last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { init_price },
                     // Per-market admin limits (immutable after init)
                     max_insurance_floor,
                     min_oracle_price_cap_e2bps,
@@ -3492,10 +3530,12 @@ pub mod processor {
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
                 state::write_req_nonce(&mut data, 0);
-                // Hyperp: oracle is initialized from genesis (mark IS the oracle)
-                if is_hyperp {
-                    state::set_oracle_initialized(&mut data);
-                }
+                // Oracle is now initialized from genesis in both modes:
+                //   Hyperp    — mark IS the oracle, seeded from initial_mark_price_e6.
+                //   Non-Hyperp — we performed a real oracle read above and used the
+                //                result as init_price, so last_oracle_price is a real
+                //                economic value (spec goal 38 — no sentinel).
+                state::set_oracle_initialized(&mut data);
             }
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 6)?;
@@ -3929,7 +3969,8 @@ pub mod processor {
                 combined.extend_from_slice(&candidates);
 
                 // ── Periodic maintenance fees (wrapper-owned, §8.3) ──
-                // W2: charge fees BEFORE keeper_crank_not_atomic. The crank's final
+                //
+                // Ordering: charged BEFORE keeper_crank_not_atomic. The crank's final
                 // step (run_end_of_instruction_lifecycle) performs side-mode drain
                 // detection, resets, and health reconciliation. Running fees *after*
                 // that lifecycle means a fee-induced margin dip or side-drain isn't
@@ -3937,49 +3978,40 @@ pub mod processor {
                 // neg_pnl_account_count drift. Charging before lets the same-crank
                 // lifecycle observe fee-induced state.
                 //
-                // Ordering is safe: charge_account_fee_not_atomic requires
-                // slot >= engine.current_slot; engine.current_slot is at the previous
-                // crank and clock.slot has advanced since, so the precondition holds.
-                // Per-account touch inside charge applies the engine's *stored* funding
-                // rate (from the prior crank) for the interval [account.last_touch,
-                // clock.slot], which is the correct anti-retroactivity interval.
+                // Coverage: charge EVERY used account in the slab, not just the
+                // risk-buffer+candidate subset. The fee amount per account is
+                //   maintenance_fee_per_slot * dt
+                // where dt = clock.slot - config.last_fee_charge_slot. Advancing
+                // last_fee_charge_slot is only sound if every used account was
+                // actually charged for that interval — otherwise omitted accounts
+                // escape the interval entirely. Iterate the full MAX_ACCOUNTS range
+                // and dispatch on is_used().
+                //
+                // Ordering (engine preconditions): charge_account_fee_not_atomic
+                // requires slot >= engine.current_slot; engine.current_slot is at
+                // the previous crank's slot, and clock.slot has advanced since, so
+                // the precondition holds. Per-account touch inside charge applies
+                // the engine's *stored* funding rate (from the prior crank) for
+                // the interval [account.last_touch, clock.slot].
+                //
+                // Error policy: propagate only CorruptState (real invariant
+                // violation) and Unauthorized (market mode drift). Per-account
+                // issues (e.g., InsufficientBalance on a drained account) are
+                // skipped — a permissionless crank must not be brickable by a
+                // single insolvent account.
                 if config.maintenance_fee_per_slot > 0 {
                     let dt = clock.slot.saturating_sub(config.last_fee_charge_slot);
                     if dt > 0 {
-                        // Cap fee to MAX_PROTOCOL_FEE_ABS to prevent saturating_mul
-                        // from producing values the engine rejects (N2 fix).
                         let raw_fee = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
                         let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
-                        // Deduplicate combined list to prevent double-charging accounts
-                        // that appear in both the risk buffer and caller candidates (N1/Issue 3).
-                        // Dedup via u64 bitmap words (same layout as engine.used[])
-                        const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
-                        let mut charged = [0u64; BITMAP_WORDS];
-                        for &(cidx, _) in combined.iter() {
-                            let ci = cidx as usize;
-                            if ci >= percolator::MAX_ACCOUNTS || !engine.is_used(ci) {
+                        for idx in 0..percolator::MAX_ACCOUNTS {
+                            if !engine.is_used(idx) {
                                 continue;
                             }
-                            // Skip if already charged (dedup)
-                            let word = ci >> 6;
-                            let bit = ci & 63;
-                            if word < BITMAP_WORDS {
-                                if (charged[word] >> bit) & 1 == 1 { continue; }
-                                charged[word] |= 1u64 << bit;
-                            }
-                            // W3: propagate only real invariant violations. A
-                            // permissionless crank must survive adversarial injection
-                            // of malformed candidate indices — one account's per-idx
-                            // error must not brick fee collection for the other
-                            // N−1 accounts. Under wrapper preconditions (fee capped,
-                            // slot >= current, account is_used), the only errors this
-                            // call can plausibly surface are CorruptState (slab
-                            // invariant broken) and Unauthorized (market mode drift),
-                            // both of which we surface. Every other variant is a
-                            // per-account issue that does not justify bricking the
-                            // whole crank.
                             match engine.charge_account_fee_not_atomic(
-                                cidx, fee_per_account, clock.slot,
+                                idx as u16,
+                                fee_per_account,
+                                clock.slot,
                             ) {
                                 Ok(()) => {}
                                 Err(percolator::RiskError::CorruptState) => {
@@ -3988,7 +4020,7 @@ pub mod processor {
                                 Err(percolator::RiskError::Unauthorized) => {
                                     return Err(map_risk_error(percolator::RiskError::Unauthorized));
                                 }
-                                Err(_) => {} // per-account issue — skip, continue crank
+                                Err(_) => {} // per-account issue — skip, continue
                             }
                         }
                         config.last_fee_charge_slot = clock.slot;
@@ -5696,34 +5728,47 @@ pub mod processor {
                     config.authority_price_e6
                 };
 
-                // Call the engine's resolve_market transition.
-                // This does final accrual at live_oracle_price, sets MarketMode::Resolved,
-                // matures all PnL, zeros OI, and drains/finalizes sides.
-                // Non-Hyperp: use the fresh external oracle read from above.
-                //   Falls back to engine.last_oracle_price only if oracle is dead.
-                // Hyperp: use the (just-flushed) index as live oracle.
-                // Read flag BEFORE mutable engine borrow to avoid aliasing.
+                // Resolution uses two DISJOINT branches:
+                //
+                //   ORDINARY  — live-synchronizing inputs (fresh oracle or Hyperp index):
+                //       live_oracle_price = fresh external reading (or flushed index)
+                //       funding_rate_e9   = captured pre-oracle-mutation (§5.5)
+                //
+                //   DEGENERATE — oracle is confirmed dead (non-Hyperp only):
+                //       live_oracle_price = P_last = engine.last_oracle_price
+                //       funding_rate_e9   = 0   (no live signal over the dead interval)
+                //
+                // Conflating the two would apply a stale mark-vs-index rate over
+                // a dead interval, moving funds with no economic signal backing
+                // the transfer. Branch selection is explicit and logged via the
+                // distinct arms below.
                 let oracle_initialized = state::is_oracle_initialized(&data);
                 let engine = zc::engine_mut(&mut data)?;
-                let live_oracle = if let Some(fresh) = fresh_live_oracle {
-                    fresh
-                } else if oracle::is_hyperp_mode(&config) {
-                    config.last_effective_price_e6
-                } else if oracle_initialized {
-                    // Oracle is dead — fall back to engine.last_oracle_price.
-                    // The deviation band check remains meaningful: admin-pushed
-                    // settlement must be within band of the last known engine price.
-                    // If the band is too tight for the actual price move, admin must
-                    // wait for oracle recovery or use permissionless resolution.
-                    engine.last_oracle_price
-                } else {
-                    return Err(PercolatorError::OracleInvalid.into());
-                };
+                let is_hyperp_local = oracle::is_hyperp_mode(&config);
+
+                let (live_oracle, rate_for_final_accrual): (u64, i128) =
+                    if let Some(fresh) = fresh_live_oracle {
+                        // ORDINARY: fresh non-Hyperp oracle reading
+                        (fresh, funding_rate_e9)
+                    } else if is_hyperp_local {
+                        // ORDINARY: Hyperp uses the just-flushed index as its live
+                        // oracle; funding accrual uses the captured rate.
+                        (config.last_effective_price_e6, funding_rate_e9)
+                    } else if oracle_initialized {
+                        // DEGENERATE: non-Hyperp oracle is dead. Resolve at P_last
+                        // with zero funding over the signal-free interval.
+                        (engine.last_oracle_price, 0i128)
+                    } else {
+                        // Oracle never initialized and no fresh read — cannot settle
+                        // a live market from the init sentinel. Empty markets resolve
+                        // via ResolvePermissionless (OI=0 safety branch).
+                        return Err(PercolatorError::OracleInvalid.into());
+                    };
                 engine.resolve_market_not_atomic(
                     settlement_price,
                     live_oracle,
                     clock.slot,
-                    funding_rate_e9,
+                    rate_for_final_accrual,
                 ).map_err(map_risk_error)?;
 
                 state::write_config(&mut data, &config);
@@ -6583,24 +6628,17 @@ pub mod processor {
 
                 // Determine canonical settlement price.
                 // Hyperp: use mark EWMA (same as ResolveMarket Hyperp path).
-                // Non-Hyperp: use engine.last_oracle_price — but ONLY if the engine
-                // has seen a real oracle accrual. If oracle never initialized, allow
-                // resolution only if market is empty (no positions to mis-settle).
-                // This prevents a liveness hole where deposits arrive before first
-                // crank, oracle dies, and permissionless resolve is blocked.
+                // Non-Hyperp: engine.last_oracle_price is always a real economic
+                // value — InitMarket requires a successful oracle read and seeds
+                // the engine with it (spec goal 38 — no sentinel). FLAG_ORACLE_INITIALIZED
+                // is therefore set from genesis; an uninitialized-oracle branch is
+                // structurally unreachable. We still guard against zero as a
+                // belt-and-braces check in case a future refactor re-introduces one.
                 let settlement_price = if is_hyperp {
                     let mark = config.mark_ewma_e6;
                     if mark > 0 { mark } else { config.authority_price_e6 }
                 } else {
                     let engine = zc::engine_ref(&data)?;
-                    if !state::is_oracle_initialized(&data) {
-                        // Oracle never initialized — only safe if no open positions.
-                        // Accounts may exist (deposits-only) but if OI is zero,
-                        // there is no position-dependent settlement risk.
-                        if engine.oi_eff_long_q > 0 || engine.oi_eff_short_q > 0 {
-                            return Err(PercolatorError::OracleInvalid.into());
-                        }
-                    }
                     let p = engine.last_oracle_price;
                     if p == 0 {
                         return Err(PercolatorError::OracleInvalid.into());
@@ -6608,27 +6646,26 @@ pub mod processor {
                     p
                 };
 
-                // Call engine resolve_market with canonical settlement price.
-                // Permissionless: oracle is confirmed dead, so use engine.last_oracle_price
-                // (last known good price) as live_oracle for the deviation band.
-                // Hyperp: use the (just-flushed) index as live oracle.
+                // DEGENERATE BRANCH — ResolvePermissionless is always called after
+                // the oracle has been verified dead for >= permissionless_resolve_stale_slots.
+                // By construction there is no live oracle signal over
+                //   [engine.last_market_slot, clock.slot].
+                // Both inputs to engine.resolve_market_not_atomic therefore use their
+                // degenerate values:
+                //   live_oracle_price = P_last = engine.last_oracle_price
+                //     (Hyperp: the just-flushed internal index)
+                //   funding_rate_e9 = 0        (signal-free interval)
+                // This mirrors the degenerate arm of ResolveMarket and is intentionally
+                // distinct from the ordinary self-synchronizing path.
                 let engine = zc::engine_mut(&mut data)?;
-                let live_oracle = if oracle::is_hyperp_mode(&config) {
+                let live_oracle_p_last = if oracle::is_hyperp_mode(&config) {
                     config.last_effective_price_e6
                 } else {
                     engine.last_oracle_price
                 };
-                // W1: pass zero funding rate. The interval
-                //   [engine.last_market_slot, clock.slot]
-                // is the oracle-dead interval (gated above by permissionless_resolve_stale_slots).
-                // compute_current_funding_rate_e9 would derive a rate from mark_ewma_e6 vs
-                // last_effective_price_e6 — both snapshots from *before* the oracle died.
-                // Applying that rate over a signal-free interval is an arbitrary wealth
-                // transfer proportional to how long the oracle was down. Zero is the
-                // conservative choice and matches the semantics of the staleness gate.
                 engine.resolve_market_not_atomic(
                     settlement_price,
-                    live_oracle,
+                    live_oracle_p_last,
                     clock.slot,
                     0,
                 ).map_err(map_risk_error)?;

@@ -345,7 +345,9 @@ impl TestEnv {
             )
             .unwrap();
 
-        // InitMarket now expects 9 accounts (removed pyth_index and pyth_col)
+        // InitMarket expects 9 accounts. Slot 7 is the oracle account —
+        // InitMarket now requires a successful oracle read at init (no sentinel).
+        let _ = dummy_ata;
         let ix = Instruction {
             program_id: self.program_id,
             accounts: vec![
@@ -356,7 +358,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_with_params(

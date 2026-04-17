@@ -2070,7 +2070,7 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
             AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
