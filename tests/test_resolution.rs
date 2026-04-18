@@ -1914,3 +1914,49 @@ fn test_sentinel_invariant_nonzero_oi_implies_oracle_initialized() {
         "settlement after OI>0 must always be the real oracle price"
     );
 }
+
+/// ResolvePermissionless must succeed after an oracle outage longer than
+/// `max_accrual_dt_slots`. The engine's Degenerate arm explicitly skips
+/// `accrue_market_to` and just jumps `current_slot`/`last_market_slot` to
+/// now_slot, so there's no dt envelope check on this path — even a years-
+/// long gap resolves.
+///
+/// Setup: permissionless_resolve_stale_slots = 50_000, hardcoded
+/// MAX_ACCRUAL_DT_SLOTS = 100_000. Advance clock to 500_000 (5× envelope)
+/// without a crank, kill the oracle, then resolve.
+#[test]
+fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() {
+    program_path();
+    let mut env = TestEnv::new();
+    // min_oracle_price_cap = 10_000 e2bps, perm-resolve threshold = 50_000 slots
+    env.init_market_with_cap(0, 10_000, 50_000);
+
+    // Tighten oracle staleness so clock advance → oracle death.
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    env.crank(); // seed engine.last_oracle_price with the real price
+
+    // Kill oracle, advance clock far past MAX_ACCRUAL_DT_SLOTS = 100_000.
+    env.svm.set_sysvar(&Clock {
+        slot: 500_000,
+        unix_timestamp: 500_000,
+        ..Clock::default()
+    });
+
+    // If the audit were right, the engine would reject with Overflow on the
+    // dt check and the market would be permanently stuck. The Degenerate
+    // arm does NOT call accrue_market_to, so there's no dt bound.
+    env.try_resolve_permissionless()
+        .expect("degenerate resolve must succeed past MAX_ACCRUAL_DT_SLOTS gap");
+
+    assert!(env.is_market_resolved(), "market resolved");
+    let settlement = env.read_authority_price();
+    assert_eq!(
+        settlement, 138_000_000,
+        "settlement uses engine.last_oracle_price (last known good)"
+    );
+}

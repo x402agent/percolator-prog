@@ -1883,7 +1883,12 @@ pub mod state {
         /// replaced by per-account `Account::last_fee_slot`). Same 8-byte
         /// slot, same wire offset; only u16 is meaningful.
         pub fee_sweep_cursor_word: u64,
-        pub _fee_padding: u64,
+        /// Bit position within `fee_sweep_cursor_word` at which the next sweep
+        /// resumes. Stored so the sweep can stop EXACTLY at FEE_SWEEP_BUDGET
+        /// mid-word without losing remaining set bits to budget truncation.
+        /// Only values 0..=63 are meaningful; wider values are normalized.
+        /// Repurposed from the former `_fee_padding`.
+        pub fee_sweep_cursor_bit: u64,
         /// Minimum fee (in engine units, same as insurance_fund.balance) for full mark EWMA weight.
         /// Trades with fee below this get proportionally reduced alpha.
         /// 0 = disabled (all trades get full weight, backward compat).
@@ -2130,9 +2135,30 @@ pub mod oracle {
         0x56, 0x02,
     ]);
 
-    // PriceUpdateV2 account layout offsets (134 bytes minimum)
-    // See: https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
-    // Layout: discriminator(8) + write_authority(32) + verification_level(2) + feed_id(32) + ...
+    // PriceUpdateV2 account layout offsets (134 bytes minimum).
+    // Layout: discriminator(8) + write_authority(32) + verification_level(2)
+    //         + feed_id(32) + price(i64) + conf(u64) + expo(i32) + publish_time(i64) + ...
+    //
+    // *** DEPLOYER ACTION REQUIRED ***
+    // These offsets are pinned against the Pyth SDK revision current at build
+    // time, NOT deserialized through the official pyth_solana_receiver_sdk.
+    // If Pyth ships a breaking layout change (new field insertion, enum-variant
+    // reordering, discriminator change, etc.), this parser will silently read
+    // garbage. Before deploying any non-Hyperp market that consumes Pyth:
+    //   1. Capture a real mainnet/devnet PriceUpdateV2 account for your feed
+    //      and confirm `verification_level`, `feed_id`, `price`, `conf`,
+    //      `expo`, and `publish_time` land at offsets 40, 42, 74, 82, 90, 94
+    //      respectively. See:
+    //      https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
+    //   2. Add an integration test that feeds a byte-accurate
+    //      `PriceUpdateV2 { verification_level: Full, ... }` (serialized via
+    //      the official SDK + Anchor discriminator prefix) through
+    //      read_pyth_price_e6 and asserts the parsed fields match.
+    //   3. Pin a known-good Pyth SDK commit hash alongside the deployment
+    //      record. On any SDK version bump, re-run (1) and (2).
+    // Replacement path: swap to the SDK's `PriceUpdateV2::try_deserialize` +
+    // `get_price_no_older_than_with_custom_verification_level` if you'd rather
+    // outsource the layout question entirely.
     const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
     const OFF_VERIFICATION_LEVEL: usize = 40; // u16 enum: 0=Partial, 1=Full
     const OFF_FEED_ID: usize = 42; // 32 bytes
@@ -2971,9 +2997,11 @@ pub mod processor {
     }
 
     /// Incrementally sweep maintenance fees from the current cursor position.
-    /// Scans bitmap words starting at `config.fee_sweep_cursor_word`, calling
-    /// `sync_account_fee_to_slot_not_atomic` on every set bit until the
-    /// `FEE_SWEEP_BUDGET` quota is reached OR a full bitmap cycle completes.
+    /// Scans bitmap words starting at `(fee_sweep_cursor_word,
+    /// fee_sweep_cursor_bit)`, calling `sync_account_fee_to_slot_not_atomic`
+    /// on every set bit. Stops EXACTLY at `FEE_SWEEP_BUDGET` syncs — the bit
+    /// cursor lets us pause mid-word without losing remaining set bits to
+    /// budget truncation.
     ///
     /// Correctness: the engine's per-account `last_fee_slot` is the source of
     /// truth. When the cursor reaches an account, that account's sync call
@@ -2983,14 +3011,10 @@ pub mod processor {
     /// inline on every capital-sensitive instruction (see `sync_account_fee`);
     /// the sweep handles everything that hasn't self-acted.
     ///
-    /// CU bound: at most `FEE_SWEEP_BUDGET` sync calls per crank, each ~5K CU,
-    /// plus O(BITMAP_WORDS) word reads. Constant in `max_accounts`, so a
-    /// 4096-slot market is handled the same as a 64-slot market.
-    ///
-    /// Word-completion rule: once we start scanning a word, we finish it
-    /// (drain every set bit) before advancing the cursor past it. This keeps
-    /// the cursor word-aligned and prevents losing set bits to budget
-    /// truncation mid-word.
+    /// CU bound: at most `FEE_SWEEP_BUDGET` sync calls per crank (strictly,
+    /// thanks to the bit cursor), plus O(BITMAP_WORDS) word reads. Constant
+    /// in `max_accounts`, so a 4096-slot market is handled the same as a
+    /// 64-slot market.
     fn sweep_maintenance_fees(
         engine: &mut RiskEngine,
         config: &mut MarketConfig,
@@ -3000,16 +3024,34 @@ pub mod processor {
             return Ok(());
         }
         const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
-        // Normalize cursor in case of stale/corrupt value.
+        // Normalize cursor in case of stale/corrupt values.
         let mut word_cursor = (config.fee_sweep_cursor_word as usize) % BITMAP_WORDS;
+        let mut bit_cursor = (config.fee_sweep_cursor_bit as usize) & 63;
         let mut syncs_done: usize = 0;
         let mut words_scanned: usize = 0;
-        while words_scanned < BITMAP_WORDS {
-            let mut bits = engine.used[word_cursor];
+        // Budget check is inside the inner loop so we can stop exactly at
+        // FEE_SWEEP_BUDGET, not after completing the current word.
+        'outer: while words_scanned < BITMAP_WORDS {
+            // Skip bits below bit_cursor on the resume word.
+            let resume_mask = if bit_cursor == 0 {
+                u64::MAX
+            } else {
+                // Clear bits 0..bit_cursor (they were already processed last call).
+                !((1u64 << bit_cursor).wrapping_sub(1))
+            };
+            let mut bits = engine.used[word_cursor] & resume_mask;
             while bits != 0 {
+                if syncs_done >= crate::constants::FEE_SWEEP_BUDGET {
+                    // Stop EXACTLY at budget. Save the next unprocessed bit
+                    // as the resume point for the following crank.
+                    let next_bit = bits.trailing_zeros() as usize;
+                    config.fee_sweep_cursor_word = word_cursor as u64;
+                    config.fee_sweep_cursor_bit = next_bit as u64;
+                    return Ok(());
+                }
                 let bit = bits.trailing_zeros() as usize;
-                let idx = word_cursor * 64 + bit;
                 bits &= bits - 1;
+                let idx = word_cursor * 64 + bit;
                 if idx >= percolator::MAX_ACCOUNTS {
                     continue;
                 }
@@ -3022,14 +3064,18 @@ pub mod processor {
                     .map_err(map_risk_error)?;
                 syncs_done += 1;
             }
-            // Word fully drained — safe to advance cursor past it.
+            // Word fully drained — advance to next word, reset bit cursor.
             word_cursor = (word_cursor + 1) % BITMAP_WORDS;
+            bit_cursor = 0;
             words_scanned += 1;
+            // Budget may have hit right at the end of the word — avoid one
+            // wasted iteration on the next (empty in the caller's view) word.
             if syncs_done >= crate::constants::FEE_SWEEP_BUDGET {
-                break;
+                break 'outer;
             }
         }
         config.fee_sweep_cursor_word = word_cursor as u64;
+        config.fee_sweep_cursor_bit = 0;
         Ok(())
     }
 
@@ -3713,7 +3759,7 @@ pub mod processor {
                     last_good_oracle_slot: clock.slot,
                     maintenance_fee_per_slot,
                     fee_sweep_cursor_word: 0,
-                    _fee_padding: 0,
+                    fee_sweep_cursor_bit: 0,
                     mark_min_fee,
                     force_close_delay_slots,
                 };
