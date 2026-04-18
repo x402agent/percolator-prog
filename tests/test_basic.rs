@@ -4800,3 +4800,62 @@ fn test_init_market_rejects_huge_funding_max_bps_per_slot_without_wrap() {
     );
 }
 
+// ============================================================================
+// Regression: per-account maintenance fees (engine v12.18.4)
+// ============================================================================
+
+/// Maintenance fees are realized per-account via engine.last_fee_slot. A new
+/// user joining mid-interval must NOT be back-charged for time before it was
+/// materialized: the engine seeds last_fee_slot at the materialization slot
+/// (Goal 47) and the wrapper honors that by not flushing a global cursor on
+/// init.
+///
+/// Setup: init a market with maintenance_fee_per_slot = 1_000, seed an LP
+/// that exists through the whole run, advance to slot 500, init a user at
+/// slot 1_000, crank at slot 1_500. The user must be charged for exactly
+/// 500 slots (1_500 − 1_000), NOT 1_500 or 1_000.
+#[test]
+fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot (sufficient ceiling)
+        1_000,         // maintenance_fee_per_slot (base units / slot)
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    env.set_slot(500);
+    env.crank(); // LP's last_fee_slot advances to 500
+
+    env.set_slot(1_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user); // materialized at slot 1_000
+    env.deposit(&user, user_idx, 10_000_000_000);
+    let user_cap_after_init = env.read_account_capital(user_idx);
+
+    env.set_slot(1_500);
+    env.crank(); // sweeps both accounts via sync_account_fee_to_slot_not_atomic
+    let user_cap_after_crank = env.read_account_capital(user_idx);
+
+    // Expected fee = 1_000 * (1_500 − 1_000) = 500_000. The user existed for
+    // 500 slots; back-charging for the entire [500, 1_500] = 1_000 slots would
+    // indicate the old global-cursor bug is back.
+    let expected_fee: u128 = 1_000u128 * 500u128;
+    let charged: u128 = user_cap_after_init.saturating_sub(user_cap_after_crank);
+    assert_eq!(
+        charged, expected_fee,
+        "New user must pay fees only for the interval since materialization \
+         (expected {expected_fee} for 500 slots @ 1_000 /slot, got {charged})"
+    );
+}
+
+

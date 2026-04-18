@@ -438,7 +438,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     mint: &Pubkey,
     feed_id: &[u8; 32],
     _max_maintenance_fee_per_slot: u128,
-    _maintenance_fee_per_slot: u128,
+    maintenance_fee_per_slot: u128,
     min_oracle_price_cap_e2bps: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
@@ -450,7 +450,9 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
+    // maintenance_fee_per_slot now passed through (engine v12.18.4 supports
+    // per-account fee accrual via sync_account_fee_to_slot_not_atomic).
+    data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
     data.extend_from_slice(&min_oracle_price_cap_e2bps.to_le_bytes());
     // RiskParams

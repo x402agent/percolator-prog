@@ -2891,41 +2891,55 @@ pub mod processor {
     /// Returns 0 if no trades yet (mark_ewma == 0) or params unset.
     /// Compute funding rate in e9-per-slot (ppb) directly.
     /// Avoids bps quantization: sub-bps rates are preserved as nonzero ppb values.
-    /// Apply pending maintenance fees for the interval
-    ///   [config.last_fee_charge_slot, now_slot]
-    /// to every currently-used account, then advance the cursor to now_slot.
+    /// Realize due maintenance fees for a single account up to `now_slot`.
+    /// Idempotent: the engine's per-account `last_fee_slot` cursor prevents
+    /// double-charging over the same interval, and a call at the same anchor
+    /// as the cursor is a no-op (engine v12.18.4 §4.6.1).
     ///
-    /// Called from both KeeperCrank (the recurring sweep) and InitUser/InitLP
-    /// (before materializing a new slot). The latter prevents the correctness
-    /// bug where a freshly-created account inherits the global cursor and
-    /// gets back-charged for the entire unswept interval — time before it
-    /// existed. Flushing existing accounts and advancing the cursor at
-    /// creation time lets the new account start at parity with the cursor.
+    /// Wrappers MUST call this before any health-sensitive engine operation
+    /// on the acting account when `maintenance_fee_per_slot > 0`, so that
+    /// the margin / withdrawal / close check sees post-fee capital. Between
+    /// cranks, each acting account self-realizes its share via this call;
+    /// KeeperCrank sweeps the rest.
     ///
-    /// Shortfall handling: `charge_account_fee_not_atomic` never fails with
-    /// InsufficientBalance — the engine's `charge_fee_to_insurance` pays
-    /// what's available from capital and routes the rest into fee_credits
-    /// debt (spec §8.2.2, capped at i128 headroom). Therefore we do NOT
-    /// pre-screen capital against the fee; a pre-screen would silently
-    /// undercharge low-capital accounts while the cursor advanced anyway.
-    /// Every used account is charged; any remaining errors (CorruptState,
-    /// Unauthorized) are invariant-level and propagate.
-    ///
-    /// No-op when maintenance_fee_per_slot == 0 or dt == 0.
-    fn flush_maintenance_fees_to_slot(
+    /// No-op when `maintenance_fee_per_slot == 0`.
+    fn sync_account_fee(
         engine: &mut RiskEngine,
-        config: &mut MarketConfig,
+        config: &MarketConfig,
+        idx: u16,
         now_slot: u64,
     ) -> Result<(), ProgramError> {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
-        let dt = now_slot.saturating_sub(config.last_fee_charge_slot);
-        if dt == 0 {
+        // Anchor the fee-slot at now_slot. The engine enforces
+        // last_fee_slot <= fee_slot_anchor <= current_slot on Live and
+        // <= resolved_slot on Resolved; both bounds hold here because the
+        // caller has already accrued market time to now_slot via a prior
+        // engine _not_atomic call (or, for instructions like Deposit, the
+        // deposit itself does it internally).
+        engine
+            .sync_account_fee_to_slot_not_atomic(
+                idx,
+                now_slot,
+                now_slot,
+                config.maintenance_fee_per_slot,
+            )
+            .map_err(map_risk_error)
+    }
+
+    /// Sweep maintenance fees across every used account (used by KeeperCrank
+    /// to catch accounts that haven't self-acted since the last crank).
+    /// Per-account cursor means each account pays exactly its due interval;
+    /// accounts already self-synced within this slot see a no-op.
+    fn sweep_maintenance_fees(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
-        let raw_fee = config.maintenance_fee_per_slot.saturating_mul(dt as u128);
-        let fee_per_account = core::cmp::min(raw_fee, percolator::MAX_PROTOCOL_FEE_ABS);
         const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
         for word_idx in 0..BITMAP_WORDS {
             let mut bits = engine.used[word_idx];
@@ -2936,19 +2950,16 @@ pub mod processor {
                 if idx >= percolator::MAX_ACCOUNTS {
                     continue;
                 }
-                // No pre-screen on capital: engine books shortfall as
-                // fee_credits debt (§8.2.2) rather than failing.
-                match engine.charge_account_fee_not_atomic(
-                    idx as u16,
-                    fee_per_account,
-                    now_slot,
-                ) {
-                    Ok(()) => {}
-                    Err(e) => return Err(map_risk_error(e)),
-                }
+                engine
+                    .sync_account_fee_to_slot_not_atomic(
+                        idx as u16,
+                        now_slot,
+                        now_slot,
+                        config.maintenance_fee_per_slot,
+                    )
+                    .map_err(map_risk_error)?;
             }
         }
-        config.last_fee_charge_slot = now_slot;
         Ok(())
     }
 
@@ -2993,6 +3004,7 @@ pub mod processor {
         size: i128,
         funding_rate_e9: i128,
         lp_account_id: u64,
+        maintenance_fee_per_slot: u128,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
         let exec = matcher.execute_match(
@@ -3019,6 +3031,16 @@ pub mod processor {
         };
         let admit_h_min = engine.params.h_min;
         let admit_h_max = engine.params.h_max;
+        // Realize due maintenance fees on both counterparties BEFORE the trade
+        // so margin checks see post-fee capital. No-op when fee rate is 0.
+        if maintenance_fee_per_slot > 0 {
+            engine.sync_account_fee_to_slot_not_atomic(
+                a, now_slot, now_slot, maintenance_fee_per_slot,
+            )?;
+            engine.sync_account_fee_to_slot_not_atomic(
+                b, now_slot, now_slot, maintenance_fee_per_slot,
+            )?;
+        }
         engine.execute_trade_not_atomic(
             a,
             b,
@@ -3385,21 +3407,13 @@ pub mod processor {
                 if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // Maintenance-fee feature is disabled at the admission gate.
-                // A non-zero per-slot maintenance fee is only sound when every
-                // capital-sensitive instruction realizes due fees *before* the
-                // acting account's margin/withdrawal/close check, otherwise
-                // accounts can act on stale capital or escape the fee entirely
-                // via Close/Reclaim between cranks. The current design flushes
-                // fees only on KeeperCrank / InitUser / InitLP, which is not
-                // sufficient, and the full-sweep flush is O(used accounts)
-                // anyway. Until the feature is redesigned with either
-                // engine-native per-account accrual or a per-account wrapper
-                // cursor, markets must be initialized with
-                // maintenance_fee_per_slot == 0.
-                if maintenance_fee_per_slot != 0 {
-                    return Err(PercolatorError::InvalidConfigParam.into());
-                }
+                // Maintenance-fee feature uses engine v12.18.4's per-account
+                // last_fee_slot cursor via sync_account_fee_to_slot_not_atomic.
+                // Every capital-sensitive instruction below realizes due fees
+                // on the acting account before the engine's health check, so
+                // no account can act on stale capital. New accounts are never
+                // back-charged (engine Goal 47: last_fee_slot seeded at
+                // materialization).
                 // §14.1: H_max must not exceed permissionless resolve delay.
                 // Otherwise warmup cohorts could mature after the market is already
                 // permissionlessly resolved, creating inconsistent terminal state.
@@ -3706,17 +3720,11 @@ pub mod processor {
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
-                // Flush pending maintenance fees for existing accounts and
-                // advance the cursor to clock.slot BEFORE materializing the new
-                // account. Otherwise the new slot inherits the stale global
-                // cursor and gets back-charged at the next crank for time it
-                // didn't exist.
-                {
-                    let engine = zc::engine_mut(&mut data)?;
-                    flush_maintenance_fees_to_slot(engine, &mut config, clock.slot)?;
-                    state::write_config(&mut data, &config);
-                }
-
+                // No pre-materialization flush needed. Engine v12.18.4 seeds
+                // the new account's last_fee_slot at the materialization slot
+                // (Goal 47 — new accounts never back-charged), so the per-account
+                // cursor keeps the new slot from paying fees for time before
+                // it existed.
                 let engine = zc::engine_mut(&mut data)?;
                 // Engine v12.18.1 (§10.2): deposit is the canonical materialization
                 // path. It materializes the account at `idx` iff not already used and
@@ -3791,14 +3799,8 @@ pub mod processor {
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(fee_payment, config.unit_scale);
 
-                // Flush pending maintenance fees and advance cursor BEFORE
-                // materializing the LP slot — same correctness fix as InitUser.
-                {
-                    let engine = zc::engine_mut(&mut data)?;
-                    flush_maintenance_fees_to_slot(engine, &mut config, clock.slot)?;
-                    state::write_config(&mut data, &config);
-                }
-
+                // No pre-materialization flush needed — engine v12.18.4 seeds
+                // the new LP's last_fee_slot at materialization (Goal 47).
                 let engine = zc::engine_mut(&mut data)?;
                 // Engine v12.18.1 (§10.2): deposit is the canonical materialization.
                 // We materialize a free slot as a User (engine default), then stamp
@@ -3882,6 +3884,11 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
+                // Realize due maintenance fees on the acting account before
+                // the deposit so capital reflects pre-fee reality. No-op when
+                // maintenance_fee_per_slot == 0.
+                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+
                 engine
                     .deposit_not_atomic(user_idx, units as u128, 0, clock.slot)
                     .map_err(map_risk_error)?;
@@ -3964,6 +3971,9 @@ pub mod processor {
                 let withdraw_slot = clock.slot;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Realize due maintenance fees BEFORE the withdrawal margin
+                // check, so the account can't withdraw against pre-fee capital.
+                sync_account_fee(engine, &config, user_idx, clock.slot)?;
                 engine
                     .withdraw_not_atomic(user_idx, units_requested as u128, price, withdraw_slot,
                         funding_rate_e9, admit_h_min, admit_h_max)
@@ -4113,43 +4123,22 @@ pub mod processor {
 
                 // ── Periodic maintenance fees (wrapper-owned, §8.3) ──
                 //
-                // Ordering: charged BEFORE keeper_crank_not_atomic. The crank's final
-                // step (run_end_of_instruction_lifecycle) performs side-mode drain
-                // detection, resets, and health reconciliation. Running fees *after*
-                // that lifecycle means a fee-induced margin dip or side-drain isn't
-                // handled until the *next* crank — leaving stranded bankruptcies or
-                // neg_pnl_account_count drift. Charging before lets the same-crank
-                // lifecycle observe fee-induced state.
+                // Engine v12.18.4 provides a per-account fee cursor
+                // (Account::last_fee_slot) and an idempotent public API
+                // (sync_account_fee_to_slot_not_atomic). Per-account tracking
+                // lets us correctly handle:
+                //   - New accounts joining mid-interval — seeded at the
+                //     materialization slot, so no back-charge (Goal 47).
+                //   - Self-acting accounts — realize fees in their own
+                //     instruction (via sync_account_fee below); KeeperCrank
+                //     re-visiting them is a no-op at the same anchor.
+                //   - Shortfalls — routed through charge_fee_to_insurance as
+                //     fee-credits debt; never fails with InsufficientBalance.
                 //
-                // Coverage: charge EVERY used account in the slab, not just the
-                // risk-buffer+candidate subset. The fee amount per account is
-                //   maintenance_fee_per_slot * dt
-                // where dt = clock.slot - config.last_fee_charge_slot. Advancing
-                // last_fee_charge_slot is only sound if every used account was
-                // actually charged for that interval — otherwise omitted accounts
-                // escape the interval entirely. Iterate the full MAX_ACCOUNTS range
-                // and dispatch on is_used().
-                //
-                // Ordering (engine preconditions): charge_account_fee_not_atomic
-                // requires slot >= engine.current_slot; engine.current_slot is at
-                // the previous crank's slot, and clock.slot has advanced since, so
-                // the precondition holds. Per-account touch inside charge applies
-                // the engine's *stored* funding rate (from the prior crank) for
-                // the interval [account.last_touch, clock.slot].
-                //
-                // Error policy: propagate only CorruptState (real invariant
-                // violation) and Unauthorized (market mode drift). Per-account
-                // issues (e.g., InsufficientBalance on a drained account) are
-                // skipped — a permissionless crank must not be brickable by a
-                // single insolvent account.
-                // Delegate to the shared helper so both KeeperCrank and the
-                // InitUser/InitLP flush-on-materialize paths have identical
-                // semantics: iterate the used bitmap, charge every used slot
-                // (engine books shortfall as fee-credit debt — never fails on
-                // InsufficientBalance), advance the cursor once at the end.
-                // Invariant-level errors (CorruptState / Unauthorized) still
-                // propagate.
-                flush_maintenance_fees_to_slot(engine, &mut config, clock.slot)?;
+                // Ordering: sweep BEFORE keeper_crank_not_atomic so the crank's
+                // lifecycle (side-mode drain detection / resets / health
+                // reconciliation) observes fee-induced state.
+                sweep_maintenance_fees(engine, &config, clock.slot)?;
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
@@ -4340,6 +4329,7 @@ pub mod processor {
                 execute_trade_with_matcher(
                     engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
                     funding_rate_e9, 0, // NoOpMatcher ignores lp_account_id
+                    config.maintenance_fee_per_slot,
                 ).map_err(map_risk_error)?;
 
                 // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
@@ -4761,6 +4751,7 @@ pub mod processor {
                     execute_trade_with_matcher(
                         engine, &matcher, lp_idx, user_idx, clock.slot, price, trade_size,
                         funding_rate_e9_pre, lp_account_id,
+                        config.maintenance_fee_per_slot,
                     ).map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
@@ -4903,6 +4894,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Realize due maintenance fees on the target BEFORE liquidation
+                // so the maintenance-margin check sees post-fee equity.
+                sync_account_fee(engine, &config, target_idx, clock.slot)?;
                 let _res = engine
                     .liquidate_at_oracle_not_atomic(target_idx, clock.slot, price,
                         percolator::LiquidationPolicy::FullClose,
@@ -5029,6 +5023,9 @@ pub mod processor {
                 } else {
                     let admit_h_min = engine.params.h_min;
                     let admit_h_max = engine.params.h_max;
+                    // Realize due maintenance fees BEFORE close so the account
+                    // cannot escape the unpaid interval by closing between cranks.
+                    sync_account_fee(engine, &config, user_idx, clock.slot)?;
                     engine
                         .close_account_not_atomic(user_idx, clock.slot, price,
                             funding_rate_e9,
@@ -6529,6 +6526,9 @@ pub mod processor {
                 let engine = zc::engine_mut(&mut data)?;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Realize due maintenance fees BEFORE settle so the settle's
+                // equity computation reflects post-fee capital.
+                sync_account_fee(engine, &config, user_idx, clock.slot)?;
                 engine.settle_account_not_atomic(user_idx, price, clock.slot,
                     funding_rate_e9,
                     admit_h_min,
@@ -6607,6 +6607,9 @@ pub mod processor {
                 // dust is always 0 here — rejected by `dust != 0` check in Phase 2.
 
                 let engine = zc::engine_mut(&mut data)?;
+                // Realize due maintenance fees BEFORE repaying fee debt, so
+                // the outstanding-debt check reflects every accrued slot.
+                sync_account_fee(engine, &config, user_idx, clock.slot)?;
                 engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
@@ -6660,6 +6663,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Realize due maintenance fees BEFORE conversion so the
+                // convertible-PnL bound reflects post-fee equity.
+                sync_account_fee(engine, &config, user_idx, clock.slot)?;
                 engine.convert_released_pnl_not_atomic(user_idx, units as u128, price, clock.slot,
                     funding_rate_e9,
                     admit_h_min,
