@@ -2110,3 +2110,131 @@ fn test_resolve_permissionless_stamp_cleared_by_live_observation() {
          recovery; the new dead window only just started",
     );
 }
+
+/// Regression for Finding 6: force_close_delay_slots must have a hard
+/// upper bound at init. Without it, an admin could set delay=u64::MAX and
+/// burn admin — after resolution, `resolved_slot + delay` saturates to
+/// u64::MAX and ForceCloseResolved becomes unreachable, stranding any
+/// leftover accounts. The fix caps delay at MAX_FORCE_CLOSE_DELAY_SLOTS.
+#[test]
+fn test_init_market_rejects_unbounded_force_close_delay() {
+    use crate::common::encode_init_market_with_force_close;
+    program_path();
+    let mut env = TestEnv::new();
+    // Construct an InitMarket payload with delay = u64::MAX.
+    let data = encode_init_market_with_force_close(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        u64::MAX, // far exceeds MAX_FORCE_CLOSE_DELAY_SLOTS
+    );
+    let result = env.try_init_market_raw(data);
+    assert!(
+        result.is_err(),
+        "InitMarket with force_close_delay_slots = u64::MAX must be rejected \
+         — otherwise admin burn leaves ForceCloseResolved unreachable",
+    );
+}
+
+/// Regression for Finding 7: ResolvePermissionless must also treat
+/// OracleConfTooWide as proof of oracle unusability. A feed that keeps
+/// publishing but with confidence exceeding conf_filter_bps is unusable
+/// for capital-sensitive operations; without stamping this observation, a
+/// burned-admin market would be unrecoverable in that failure mode.
+#[test]
+fn test_resolve_permissionless_treats_conf_too_wide_as_stampable() {
+    program_path();
+    let mut env = TestEnv::new();
+    // 50_000-slot delay, 10_000 e2bps price cap
+    env.init_market_with_cap(0, 10_000, 50_000);
+
+    env.crank(); // seed engine state with a clean read
+
+    // Set a tight conf_filter_bps and rewrite the oracle fixture with a
+    // very wide confidence band so every read rejects with
+    // OracleConfTooWide (publish_time stays current → NOT OracleStale).
+    const CONF_FILTER_OFF: usize = 72 + 104; // HEADER_LEN + offset_of!(MarketConfig, conf_filter_bps)
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        slab.data[CONF_FILTER_OFF..CONF_FILTER_OFF + 2]
+            .copy_from_slice(&10u16.to_le_bytes()); // 10 bps tolerance
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    // Push an oracle fixture with HIGH confidence relative to price.
+    // price=138_000_000, conf=1_400_000 → conf/price ≈ 101 bps >> 10 bps.
+    // Use set_slot semantics so publish_time updates with clock.
+    let wide_conf_at_slot = |env: &mut TestEnv, slot: u64| {
+        let effective = slot + 100;
+        env.svm.set_sysvar(&Clock {
+            slot: effective,
+            unix_timestamp: effective as i64,
+            ..Clock::default()
+        });
+        let pyth_data = crate::common::make_pyth_data(
+            &crate::common::TEST_FEED_ID,
+            138_000_000,
+            -6,
+            1_400_000, // conf ≈ 101 bps vs price — exceeds 10 bps filter
+            effective as i64,
+        );
+        env.svm
+            .set_account(env.pyth_index, solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: crate::common::PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            })
+            .unwrap();
+    };
+
+    wide_conf_at_slot(&mut env, 100_000);
+
+    // First observation: OracleConfTooWide must stamp first_observed_stale_slot.
+    env.try_resolve_permissionless_once()
+        .expect("OracleConfTooWide must be a stampable observation");
+    assert!(!env.is_market_resolved(), "not yet resolved after stamp");
+
+    // Advance past the delay and retry — stamp stays set, duration check
+    // passes, resolve succeeds even though the feed's failure mode is
+    // confidence-wide rather than staleness.
+    wide_conf_at_slot(&mut env, 100_000 + 50_001);
+    env.try_resolve_permissionless_once()
+        .expect("second call after delay must resolve when conf is too wide");
+    assert!(
+        env.is_market_resolved(),
+        "market must resolve when oracle has been unusable (conf too wide) \
+         for permissionless_resolve_stale_slots — otherwise burned-admin \
+         markets cannot recover from sustained conf-wide feeds (Finding 7)",
+    );
+}
+
+/// Regression for Finding 3: KeeperCrank must succeed after a long idle
+/// period where `clock.slot - engine.current_slot > max_accrual_dt_slots`.
+/// The wrapper now pre-chunks accrual via `catchup_accrue`, so the crank's
+/// own `accrue_market_to` sees dt ≤ max_dt. Under the pre-fix code the
+/// crank rejected with EngineOverflow, bricking every accrue-bearing path
+/// until someone called ResolvePermissionless.
+#[test]
+fn test_keeper_crank_succeeds_after_long_idle_via_catchup_accrue() {
+    program_path();
+    let mut env = TestEnv::new();
+    // permissionless_resolve_stale_slots=50_000, max_accrual_dt=100_000
+    env.init_market_with_cap(0, 10_000, 50_000);
+    env.crank(); // engine.current_slot ~ 0-100
+
+    // Idle for 250_000 slots — well past the 100_000 accrual envelope,
+    // but within CATCHUP_CHUNKS_MAX × max_dt = 10 × 100_000 = 1_000_000.
+    // Set clock + oracle together so the oracle read itself succeeds (the
+    // failure mode we're testing is the accrual envelope, not oracle
+    // staleness).
+    env.set_slot(250_000);
+
+    // Under the pre-fix code this crank would fail with EngineOverflow
+    // (dt=250_100 > max_accrual_dt_slots=100_000). With the fix, the
+    // wrapper pre-chunks accrual in up to 10 × max_dt steps, so a single
+    // call catches the engine up and completes the regular crank.
+    env.crank();
+}
+

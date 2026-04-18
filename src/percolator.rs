@@ -101,6 +101,13 @@ pub mod constants {
     pub const DEFAULT_INSURANCE_WITHDRAW_MAX_BPS: u16 = 100; // 1%
     pub const DEFAULT_INSURANCE_WITHDRAW_COOLDOWN_SLOTS: u64 = 400_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
+    /// Upper bound on `force_close_delay_slots` (Finding 6). Without a bound, an
+    /// init-time config of `u64::MAX` passes the "nonzero" liveness guard but
+    /// makes ForceCloseResolved unreachable — `resolved_slot + delay` saturates
+    /// to `u64::MAX`, stranding any accounts left on a resolved market whose
+    /// admin was burned. 10_000_000 slots is ~50 days at 2 slots/s, far beyond
+    /// any reasonable grace period but well short of the saturation regime.
+    pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
 
 }
 
@@ -3010,6 +3017,65 @@ pub mod processor {
             .map_err(map_risk_error)
     }
 
+    /// Pre-chunk market-clock advancement when the gap since the last engine
+    /// operation exceeds `params.max_accrual_dt_slots`. The engine rejects
+    /// any single call whose dt exceeds the envelope (spec §1.4), which
+    /// under long idle periods makes EVERY accrue-bearing instruction
+    /// (KeeperCrank, TradeCpi, TradeNoCpi, Withdraw, Settle, Convert,
+    /// live Insurance withdraw, etc.) fail with `Overflow` — bricking the
+    /// market unless someone calls ResolvePermissionless (Degenerate arm
+    /// bypasses `accrue_market_to`).
+    ///
+    /// This helper advances the engine in chunks of `max_accrual_dt_slots`
+    /// using the engine's stored `last_oracle_price` and funding rate 0.
+    /// Rate 0 is the signal-free convention — during an idle interval no
+    /// one has observed mark/index, so no funding has been proven. The
+    /// stored price seeds `last_oracle_price` on each chunk; the caller's
+    /// subsequent `_not_atomic` call updates it with the fresh oracle.
+    ///
+    /// Bounded to `CATCHUP_CHUNKS_MAX` iterations per call to keep CU use
+    /// finite. After that cap, if the gap is still beyond the envelope, the
+    /// caller's own accrue will reject with Overflow and the natural
+    /// recovery path is ResolvePermissionless. In practice, the cap is well
+    /// above any realistic gap — CATCHUP_CHUNKS_MAX × max_dt = many days.
+    ///
+    /// No-op when `max_dt == 0` (misconfiguration guard) or when the gap
+    /// is already within the envelope.
+    fn catchup_accrue(
+        engine: &mut RiskEngine,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        let max_dt = engine.params.max_accrual_dt_slots;
+        if max_dt == 0 {
+            return Ok(());
+        }
+        if now_slot <= engine.current_slot {
+            return Ok(());
+        }
+        const CATCHUP_CHUNKS_MAX: u32 = 10;
+        let stored_price = engine.last_oracle_price;
+        // Market never had a real oracle observation — nothing to carry over.
+        // The caller's own _not_atomic call will seed last_oracle_price.
+        if stored_price == 0 {
+            return Ok(());
+        }
+        let mut chunks: u32 = 0;
+        while now_slot.saturating_sub(engine.current_slot) > max_dt {
+            if chunks >= CATCHUP_CHUNKS_MAX {
+                // Gap exceeds CATCHUP_CHUNKS_MAX × max_dt. The caller's
+                // accrue will reject; natural recovery is permissionless
+                // resolution (Degenerate arm skips accrue).
+                return Ok(());
+            }
+            let step = engine.current_slot.saturating_add(max_dt);
+            engine
+                .accrue_market_to(step, stored_price, 0)
+                .map_err(map_risk_error)?;
+            chunks = chunks.saturating_add(1);
+        }
+        Ok(())
+    }
+
     /// Incrementally sweep maintenance fees from the current cursor position.
     /// Scans bitmap words starting at `(fee_sweep_cursor_word,
     /// fee_sweep_cursor_bit)`, calling `sync_account_fee_to_slot_not_atomic`
@@ -3535,6 +3601,16 @@ pub mod processor {
                 // also be enabled. Otherwise abandoned accounts on resolved markets
                 // with burned admin have no cleanup path.
                 if permissionless_resolve_stale_slots > 0 && force_close_delay_slots == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                // Liveness (Finding 6): cap force_close_delay_slots so the
+                // admin-burn guard's "force close is enabled" check actually
+                // implies force close is REACHABLE. Without this, an admin
+                // could init with delay=u64::MAX, pass the guard, then burn.
+                // After resolution, resolved_slot.saturating_add(delay) would
+                // saturate to u64::MAX and ForceCloseResolved would never pass
+                // the time check, permanently stranding any remaining accounts.
+                if force_close_delay_slots > crate::constants::MAX_FORCE_CLOSE_DELAY_SLOTS {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Maintenance-fee feature uses engine v12.18.4's per-account
@@ -4101,6 +4177,10 @@ pub mod processor {
                 let withdraw_slot = clock.slot;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Pre-chunk catch-up so both the fee sync envelope and
+                // withdraw_not_atomic's internal accrue see dt ≤ max_dt
+                // (Finding 3).
+                catchup_accrue(engine, clock.slot)?;
                 // Realize due maintenance fees BEFORE the withdrawal margin
                 // check, so the account can't withdraw against pre-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -4286,6 +4366,11 @@ pub mod processor {
                 // after leaves the crank's risk decisions on pre-reward state,
                 // and a caller who got liquidated inside the crank (slot no
                 // longer used) simply doesn't collect the reward.
+                // Catch the engine up in max_dt chunks BEFORE the sweep — the
+                // sweep's per-account sync also enforces the accrual envelope,
+                // so a long idle gap would otherwise brick the very crank meant
+                // to make progress (Finding 3).
+                catchup_accrue(engine, clock.slot)?;
                 let ins_before = engine.insurance_fund.balance.get();
                 sweep_maintenance_fees(engine, &mut config, clock.slot)?;
                 let sweep_delta = engine
@@ -4517,6 +4602,10 @@ pub mod processor {
                 }
 
                 // Side-mode gating is handled inside engine.execute_trade_not_atomic()
+
+                // Pre-chunk catch-up so execute_trade_not_atomic's internal
+                // accrue sees dt ≤ max_accrual_dt_slots (Finding 3).
+                catchup_accrue(engine, clock.slot)?;
 
                 // Snapshot insurance fund balance for fee-weighted EWMA.
                 // The delta after execute_trade = fees_collected - losses_absorbed.
@@ -4906,6 +4995,9 @@ pub mod processor {
                 if ret.exec_size == 0 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
+                    // Pre-chunk catch-up so the single accrue_market_to below
+                    // sees dt ≤ max_accrual_dt_slots (Finding 3).
+                    catchup_accrue(engine, clock.slot)?;
                     engine
                         .accrue_market_to(clock.slot, price, funding_rate_e9_pre)
                         .map_err(map_risk_error)?;
@@ -4960,6 +5052,10 @@ pub mod processor {
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
+
+                    // Pre-chunk catch-up so execute_trade_not_atomic's internal
+                    // accrue sees dt ≤ max_accrual_dt_slots (Finding 3).
+                    catchup_accrue(engine, clock.slot)?;
 
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
 
@@ -5124,6 +5220,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Pre-chunk catch-up so fee sync + liquidate_at_oracle_not_atomic's
+                // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
+                catchup_accrue(engine, clock.slot)?;
                 // Realize due maintenance fees on the target BEFORE liquidation
                 // so the maintenance-margin check sees post-fee equity.
                 sync_account_fee(engine, &config, target_idx, clock.slot)?;
@@ -5255,6 +5354,9 @@ pub mod processor {
                 } else {
                     let admit_h_min = engine.params.h_min;
                     let admit_h_max = engine.params.h_max;
+                    // Pre-chunk catch-up so fee sync + close_account_not_atomic's
+                    // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
+                    catchup_accrue(engine, clock.slot)?;
                     // Realize due maintenance fees BEFORE close so the account
                     // cannot escape the unpaid interval by closing between cranks.
                     sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -6151,6 +6253,13 @@ pub mod processor {
                 } else {
                     percolator::ResolveMode::Degenerate
                 };
+                // Pre-chunk catch-up (Ordinary only). Degenerate arm already
+                // bypasses accrue_market_to inside the engine, so no envelope
+                // check applies. Ordinary accrues through the final step and
+                // would otherwise hit Overflow when the gap exceeds max_dt.
+                if in_ordinary_arm {
+                    catchup_accrue(engine, clock.slot)?;
+                }
                 engine.resolve_market_not_atomic(
                     resolve_mode,
                     settlement_price,
@@ -6480,6 +6589,9 @@ pub mod processor {
                         };
                         {
                             let engine = zc::engine_mut(&mut data)?;
+                            // Pre-chunk catch-up so the single accrue below
+                            // sees dt ≤ max_accrual_dt_slots (Finding 3).
+                            catchup_accrue(engine, clock.slot)?;
                             engine.accrue_market_to(
                                 clock.slot, accrual_price,
                                 funding_rate_e9,
@@ -6760,6 +6872,9 @@ pub mod processor {
                 let engine = zc::engine_mut(&mut data)?;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Pre-chunk catch-up so fee sync + settle_account_not_atomic's
+                // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
+                catchup_accrue(engine, clock.slot)?;
                 // Realize due maintenance fees BEFORE settle so the settle's
                 // equity computation reflects post-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -6902,6 +7017,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
+                // Pre-chunk catch-up so fee sync + convert_released_pnl_not_atomic's
+                // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
+                catchup_accrue(engine, clock.slot)?;
                 // Realize due maintenance fees BEFORE conversion so the
                 // convertible-PnL bound reflects post-fee equity.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -6980,11 +7098,23 @@ pub mod processor {
                             return Ok(());
                         }
                         Err(e) => {
+                            // The oracle feed is "unusable" for the market if the
+                            // feed is stale (OracleStale) OR the reported
+                            // confidence band exceeds the configured filter
+                            // (OracleConfTooWide). Both prevent capital-sensitive
+                            // operations from reading a price, so both qualify
+                            // the market for permissionless recovery (Finding 7).
+                            // Other errors (wrong account, wrong owner, bad feed
+                            // id, corrupted data) do NOT prove the feed is dead
+                            // — they might be an attacker passing garbage — and
+                            // propagate as-is.
                             let stale_err: ProgramError = PercolatorError::OracleStale.into();
-                            if e != stale_err {
-                                return Err(e); // wrong account / bad data — propagate
+                            let conf_err: ProgramError =
+                                PercolatorError::OracleConfTooWide.into();
+                            if e != stale_err && e != conf_err {
+                                return Err(e);
                             }
-                            // Oracle is stale RIGHT NOW. On the FIRST stale
+                            // Oracle is unusable RIGHT NOW. On the FIRST
                             // observation of this dead window, stamp the slot
                             // and return Ok WITHOUT resolving. A second call
                             // after permissionless_resolve_stale_slots have
@@ -6995,8 +7125,8 @@ pub mod processor {
                                 state::write_config(&mut data, &config);
                                 return Ok(());
                             }
-                            // Repeated stale observation — fall through to the
-                            // duration check and (if window elapsed) resolve.
+                            // Repeated unusable observation — fall through to
+                            // the duration check and (if window elapsed) resolve.
                         }
                     }
                 } else {
