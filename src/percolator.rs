@@ -3142,6 +3142,44 @@ pub mod processor {
         Ok(())
     }
 
+    /// Fully advance the engine's market clock to `now_slot` before any
+    /// per-account fee sync. This is an explicit-ordering helper:
+    /// `catchup_accrue` brings the gap within the envelope, then a final
+    /// `accrue_market_to(now_slot)` closes the residual so subsequent
+    /// `sync_account_fee_to_slot_not_atomic(..., now_slot, ...)` runs
+    /// against a fully-accrued market.
+    ///
+    /// Why explicit, when the engine already self-handles it via the main
+    /// op's internal accrue? Because even though the engine uses
+    /// `last_market_slot` (not `current_slot`) for funding dt — so the
+    /// interval is never erased (see
+    /// `test_fee_sync_does_not_erase_market_accrual_interval`) — making
+    /// the ordering explicit in the wrapper removes all ambiguity and
+    /// aligns with the auditor-requested pattern:
+    /// `ensure_market_accrued_to_now; sync_account_fee; engine.<op>_not_atomic`.
+    ///
+    /// The main op's internal `accrue_market_to(now_slot, price, rate)`
+    /// then hits the same-slot + same-price no-op branch (engine §5.4
+    /// early return) — about 150 CU of redundancy, bought for ordering
+    /// clarity.
+    ///
+    /// No-op when the engine has no oracle observation yet (price=0
+    /// catchup is unsafe) or when the gap is already zero.
+    fn ensure_market_accrued_to_now(
+        engine: &mut RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        catchup_accrue(engine, now_slot, price, funding_rate_e9)?;
+        if price > 0 && now_slot > engine.last_market_slot {
+            engine
+                .accrue_market_to(now_slot, price, funding_rate_e9)
+                .map_err(map_risk_error)?;
+        }
+        Ok(())
+    }
+
     /// Incrementally sweep maintenance fees from the current cursor position.
     /// Scans bitmap words starting at `(fee_sweep_cursor_word,
     /// fee_sweep_cursor_bit)`, calling `sync_account_fee_to_slot_not_atomic`
@@ -4243,11 +4281,15 @@ pub mod processor {
                 let withdraw_slot = clock.slot;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Pre-chunk catch-up so both the fee sync envelope and
-                // withdraw_not_atomic's internal accrue see dt ≤ max_dt
-                // (Finding 3). Use the caller-supplied pre-read rate for
-                // catchup chunks — preserves anti-retroactivity (Finding 2).
-                catchup_accrue(engine, clock.slot, price, funding_rate_e9)?;
+                // Fully accrue the market to clock.slot BEFORE syncing fees.
+                // Explicit ordering — the engine already handles this via
+                // withdraw_not_atomic's internal accrue (which uses
+                // last_market_slot, not current_slot, for dt), but making
+                // the accrue→sync→op order explicit in the wrapper removes
+                // all ambiguity and aligns with the auditor-requested
+                // pattern. The main op's internal accrue then no-ops
+                // (same slot + same price, engine §5.4 early return).
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
                 // Realize due maintenance fees BEFORE the withdrawal margin
                 // check, so the account can't withdraw against pre-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -4433,12 +4475,11 @@ pub mod processor {
                 // after leaves the crank's risk decisions on pre-reward state,
                 // and a caller who got liquidated inside the crank (slot no
                 // longer used) simply doesn't collect the reward.
-                // Catch the engine up in max_dt chunks BEFORE the sweep — the
-                // sweep's per-account sync also enforces the accrual envelope,
-                // so a long idle gap would otherwise brick the very crank meant
-                // to make progress (Finding 3). Use the pre-read funding rate
-                // for catchup chunks to preserve anti-retroactivity (Finding 2).
-                catchup_accrue(engine, clock.slot, price, funding_rate_e9_pre)?;
+                // Fully accrue market to clock.slot BEFORE sweeping fees.
+                // Explicit ordering so sweep_maintenance_fees + keeper_crank
+                // run on a fully-accrued market. keeper_crank_not_atomic's
+                // internal accrue then no-ops on dt=0+same-price.
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9_pre)?;
                 let ins_before = engine.insurance_fund.balance.get();
                 sweep_maintenance_fees(engine, &mut config, clock.slot)?;
                 let sweep_delta = engine
@@ -4671,10 +4712,10 @@ pub mod processor {
 
                 // Side-mode gating is handled inside engine.execute_trade_not_atomic()
 
-                // Pre-chunk catch-up so execute_trade_not_atomic's internal
-                // accrue sees dt ≤ max_accrual_dt_slots (Finding 3). Use the
-                // pre-read funding rate for catchup chunks (Finding 2).
-                catchup_accrue(engine, clock.slot, price, funding_rate_e9)?;
+                // Fully accrue market to clock.slot BEFORE execute_trade_with
+                // _matcher, which internally syncs both counterparties' fees
+                // before the trade. Explicit accrue→sync→trade ordering.
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
 
                 // Snapshot insurance fund balance for fee-weighted EWMA.
                 // The delta after execute_trade = fees_collected - losses_absorbed.
@@ -5123,10 +5164,10 @@ pub mod processor {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Pre-chunk catch-up so execute_trade_not_atomic's internal
-                    // accrue sees dt ≤ max_accrual_dt_slots (Finding 3). Use
-                    // the pre-read funding rate for catchup (Finding 2).
-                    catchup_accrue(engine, clock.slot, price, funding_rate_e9_pre)?;
+                    // Fully accrue market to clock.slot BEFORE execute_trade
+                    // _with_matcher, which internally syncs both sides' fees
+                    // before the trade. Explicit accrue→sync→trade ordering.
+                    ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9_pre)?;
 
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
 
@@ -5291,10 +5332,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Pre-chunk catch-up so fee sync + liquidate_at_oracle_not_atomic's
-                // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
-                // Pre-read funding rate preserves anti-retroactivity (Finding 2).
-                catchup_accrue(engine, clock.slot, price, funding_rate_e9)?;
+                // Fully accrue market to clock.slot BEFORE fee sync +
+                // liquidate_at_oracle_not_atomic. Explicit accrue→sync→op.
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
                 // Realize due maintenance fees on the target BEFORE liquidation
                 // so the maintenance-margin check sees post-fee equity.
                 sync_account_fee(engine, &config, target_idx, clock.slot)?;
@@ -5426,10 +5466,9 @@ pub mod processor {
                 } else {
                     let admit_h_min = engine.params.h_min;
                     let admit_h_max = engine.params.h_max;
-                    // Pre-chunk catch-up so fee sync + close_account_not_atomic's
-                    // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
-                    // Pre-read funding rate preserves anti-retroactivity (Finding 2).
-                    catchup_accrue(engine, clock.slot, price, funding_rate_e9)?;
+                    // Fully accrue market to clock.slot BEFORE fee sync +
+                    // close_account_not_atomic. Explicit accrue→sync→op.
+                    ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
                     // Realize due maintenance fees BEFORE close so the account
                     // cannot escape the unpaid interval by closing between cranks.
                     sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -6981,10 +7020,9 @@ pub mod processor {
                 let engine = zc::engine_mut(&mut data)?;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Pre-chunk catch-up so fee sync + settle_account_not_atomic's
-                // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
-                // Pre-read funding rate for anti-retroactivity (Finding 2).
-                catchup_accrue(engine, clock.slot, price, funding_rate_e9)?;
+                // Fully accrue market to clock.slot BEFORE fee sync +
+                // settle_account_not_atomic. Explicit accrue→sync→op.
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
                 // Realize due maintenance fees BEFORE settle so the settle's
                 // equity computation reflects post-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -7127,10 +7165,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Pre-chunk catch-up so fee sync + convert_released_pnl_not_atomic's
-                // internal accrue see dt ≤ max_accrual_dt_slots (Finding 3).
-                // Pre-read funding rate for anti-retroactivity (Finding 2).
-                catchup_accrue(engine, clock.slot, price, funding_rate_e9)?;
+                // Fully accrue market to clock.slot BEFORE fee sync +
+                // convert_released_pnl_not_atomic. Explicit accrue→sync→op.
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
                 // Realize due maintenance fees BEFORE conversion so the
                 // convertible-PnL bound reflects post-fee equity.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -7495,13 +7532,34 @@ pub mod processor {
                 // advancement without attempting a main operation, so
                 // progress is never rolled back even when the total gap
                 // exceeds what a single instruction can catch up in-line.
-                // Callers invoke this as many times as needed (each call
-                // extending engine.current_slot by ≤ CATCHUP_CHUNKS_MAX
-                // chunks) until any accrue-bearing instruction can succeed.
-                accounts::expect_len(accounts, 3)?;
+                // Callers invoke this as many times as needed until any
+                // accrue-bearing instruction can succeed.
+                //
+                // Signal-free interval semantics — does NOT read the
+                // oracle and does NOT mutate config. Uses
+                // engine.last_oracle_price and rate = 0 for every chunk.
+                // Rationale: during a long idle window there is no
+                // observed mark/index signal; the "correct" funding rate
+                // is conceptually zero (same convention as the Degenerate
+                // arm of ResolvePermissionless). Reading the oracle here
+                // and persisting the observation into config while the
+                // engine can only catch up partway would retroactively
+                // apply post-observation state (index/mark) to earlier
+                // engine slots on subsequent partial calls — the exact
+                // retroactivity concern the auditor called out.
+                //
+                // For Hyperp, config.last_hyperp_index_slot is advanced
+                // to match engine.current_slot after catchup. This keeps
+                // the dt-accumulation defense intact on the next real
+                // operation (clamp_toward_with_dt uses dt measured from
+                // last_hyperp_index_slot — if we left it stale through
+                // a long catchup, a subsequent push could exploit the
+                // accumulated dt).
+                //
+                // Takes slab + clock. No oracle account, no user signer.
+                accounts::expect_len(accounts, 2)?;
                 let a_slab = &accounts[0];
                 let a_clock = &accounts[1];
-                let a_oracle = &accounts[2];
 
                 accounts::expect_writable(a_slab)?;
 
@@ -7516,41 +7574,26 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                let mut config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
-                // Anti-retroactivity: capture funding rate BEFORE any oracle
-                // mutation (§5.5). This is the rate that was in effect up to
-                // this instruction; catchup chunks use it.
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
-
-                // Oracle read. For Hyperp this advances the internal index
-                // via clamp_toward_with_dt; for non-Hyperp it returns the
-                // clamped external price and stamps last_good_oracle_slot.
-                // If the oracle is dead, return a clear error — caller
-                // should use ResolvePermissionless (Degenerate arm bypasses
-                // accrue entirely) instead of CatchupAccrue.
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let price = if is_hyperp {
-                    let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
-                    oracle::get_engine_oracle_price_e6(
-                        last_slot, clock.slot, clock.unix_timestamp,
-                        &mut config, a_oracle,
-                    )?
-                } else {
-                    read_price_and_stamp(
-                        &mut config, a_oracle, clock.unix_timestamp, clock.slot, &mut data,
-                    )?
-                };
-                state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
+                // Engine has no oracle observation yet → nothing to
+                // "advance past". This matches catchup_accrue's own
+                // same-case return; also avoids a price=0 accrue that
+                // would overflow on zero.
+                if engine.last_oracle_price == 0 {
+                    return Ok(());
+                }
+                // Use stored P_last as the chunk price and rate=0 (signal
+                // free). Mechanical time advance only — no observation
+                // persisted to config.
+                let chunk_price = engine.last_oracle_price;
+                let chunk_rate: i128 = 0;
 
-                // Do catchup, but CAP THE DESIRED TARGET to
-                // engine.current_slot + CATCHUP_CHUNKS_MAX × max_dt so we
-                // never raise CatchupRequired here — the whole point of
-                // this instruction is to commit partial progress even when
-                // the full gap can't be closed in one call.
+                // Cap the target to engine.current_slot +
+                // CATCHUP_CHUNKS_MAX × max_dt so this call commits
+                // partial progress even when the full gap can't be
+                // closed in one instruction.
                 let max_dt = engine.params.max_accrual_dt_slots;
                 let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64)
                     .saturating_mul(max_dt);
@@ -7559,39 +7602,40 @@ pub mod processor {
                     engine.current_slot.saturating_add(max_step_per_call),
                 );
                 if target > engine.current_slot {
-                    // Use the fresh oracle price and pre-read funding rate
-                    // for the chunks, same policy as the in-line catchups.
-                    catchup_accrue(engine, target, price, funding_rate_e9)?;
-
-                    // catchup_accrue's loop exits when the remaining gap to
-                    // `target` is ≤ max_dt, so the engine can be as much as
-                    // `max_dt` slots short of `target`. Close that residual
-                    // here so one CatchupAccrue call advances the FULL
-                    // CATCHUP_CHUNKS_MAX × max_dt per call (previously the
-                    // residual was silently abandoned, losing one chunk per
-                    // invocation on large gaps).
+                    catchup_accrue(engine, target, chunk_price, chunk_rate)?;
+                    // Close the residual to `target` so this call advances
+                    // by FULL CATCHUP_CHUNKS_MAX × max_dt chunks.
                     if target > engine.current_slot {
                         engine
-                            .accrue_market_to(target, price, funding_rate_e9)
+                            .accrue_market_to(target, chunk_price, chunk_rate)
                             .map_err(map_risk_error)?;
                     }
-
                     // If the full clock.slot is now within envelope, close
-                    // the last short residual to clock.slot so last_market
-                    // _slot / last_oracle_price reflect the freshest read.
-                    // Otherwise leave engine at `target` — subsequent
-                    // CatchupAccrue calls will close the remainder.
+                    // the last short residual to clock.slot. Otherwise
+                    // leave engine at `target` — subsequent CatchupAccrue
+                    // calls close the remainder.
                     if clock.slot > engine.current_slot
                         && clock.slot.saturating_sub(engine.current_slot) <= max_dt
                     {
                         engine
-                            .accrue_market_to(clock.slot, price, funding_rate_e9)
+                            .accrue_market_to(clock.slot, chunk_price, chunk_rate)
                             .map_err(map_risk_error)?;
                     }
-                }
 
-                if !state::is_oracle_initialized(&data) {
-                    state::set_oracle_initialized(&mut data);
+                    // Advance the Hyperp index clock to match the engine.
+                    // Keeps clamp_toward_with_dt's dt bounded on the next
+                    // real Hyperp observation — otherwise a long catchup
+                    // would leave a stale last_hyperp_index_slot and let
+                    // the next push move the index much further than
+                    // oracle_price_cap_e2bps allows per slot.
+                    let advanced_to = engine.current_slot;
+                    let mut config = state::read_config(&data);
+                    if oracle::is_hyperp_mode(&config)
+                        && advanced_to > config.last_hyperp_index_slot
+                    {
+                        config.last_hyperp_index_slot = advanced_to;
+                        state::write_config(&mut data, &config);
+                    }
                 }
             }
         }
