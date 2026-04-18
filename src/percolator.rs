@@ -43,6 +43,15 @@ pub mod constants {
     // CRANK_REWARD_MIN_DT removed — crank discount logic removed in v12.15
     /// Progressive scan window per crank.
     pub const RISK_SCAN_WINDOW: usize = 32;
+    /// Crank reward: fraction of the fees swept in a KeeperCrank that is paid
+    /// back to the (non-permissionless) caller as compensation for cranking.
+    /// 5_000 bps = 50 %.
+    pub const CRANK_REWARD_BPS: u128 = 5_000;
+    /// Crank reward cap expressed as "N accounts' worth of one-slot fees":
+    ///   cap = CRANK_REWARD_ACCOUNT_CAP * maintenance_fee_per_slot
+    /// Bounds the absolute payout so a crank over a long interval or a huge
+    /// used-account bitmap cannot drain insurance in a single call.
+    pub const CRANK_REWARD_ACCOUNT_CAP: u128 = 16;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     // MATCHER_CONTEXT_PREFIX_LEN removed — validation uses MATCHER_CONTEXT_LEN directly
     pub const MATCHER_CONTEXT_LEN: usize = 320;
@@ -4138,7 +4147,43 @@ pub mod processor {
                 // Ordering: sweep BEFORE keeper_crank_not_atomic so the crank's
                 // lifecycle (side-mode drain detection / resets / health
                 // reconciliation) observes fee-induced state.
+                //
+                // Crank reward: measure the insurance delta the sweep produced,
+                // pay CRANK_REWARD_BPS (50 %) of it back to the non-permissionless
+                // caller as capital, capped at CRANK_REWARD_ACCOUNT_CAP accounts'
+                // worth of one-slot fees. All other protocol fees (trading,
+                // liquidation, resolution) continue to flow only to insurance.
+                let ins_before = engine.insurance_fund.balance.get();
                 sweep_maintenance_fees(engine, &config, clock.slot)?;
+                if !permissionless && config.maintenance_fee_per_slot > 0 {
+                    let ins_after = engine.insurance_fund.balance.get();
+                    let delta = ins_after.saturating_sub(ins_before);
+                    // reward_raw = delta * bps / 10_000 in wide math.
+                    let mut reward = delta
+                        .saturating_mul(crate::constants::CRANK_REWARD_BPS)
+                        / 10_000u128;
+                    // Absolute cap: N accounts' worth of one-slot fees.
+                    let cap = crate::constants::CRANK_REWARD_ACCOUNT_CAP
+                        .saturating_mul(config.maintenance_fee_per_slot);
+                    if reward > cap { reward = cap; }
+                    // Never pay out more than insurance currently holds.
+                    if reward > ins_after { reward = ins_after; }
+                    if reward > 0 {
+                        // caller_idx is a validated used account (checked_idx +
+                        // owner_ok fired above when !permissionless), so direct
+                        // field writes here are safe.
+                        // Conservation: insurance −r, caller.capital +r, c_tot +r
+                        // keeps the `vault >= c_tot + insurance + net_pnl`
+                        // invariant whole.
+                        engine.insurance_fund.balance = U128::new(ins_after - reward);
+                        let ci = caller_idx as usize;
+                        let cap_prev = engine.accounts[ci].capital.get();
+                        let cap_next = cap_prev.saturating_add(reward);
+                        engine.accounts[ci].capital = U128::new(cap_next);
+                        let c_tot_prev = engine.c_tot.get();
+                        engine.c_tot = U128::new(c_tot_prev.saturating_add(reward));
+                    }
+                }
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
@@ -5895,33 +5940,19 @@ pub mod processor {
                         // via ResolvePermissionless (OI=0 safety branch).
                         return Err(PercolatorError::OracleInvalid.into());
                     };
-                // Spec §9.8 step 7 deviation-band check. The engine has the
-                // same check internally but discriminates "degenerate arm"
-                // by the *value pattern* `live == last_oracle_price && rate == 0`.
-                // That discriminator is too weak — an ordinary resolution
-                // whose fresh oracle happens to equal the stored last price
-                // with a zero captured funding rate (both plausible in a
-                // quiet market) can slip past the engine's band check. We
-                // apply the band check ourselves on the ORDINARY arm so that
-                // an out-of-band settlement_price is rejected regardless of
-                // what the engine's discriminator decides.
-                if in_ordinary_arm {
-                    let dev_bps = engine.params.resolve_price_deviation_bps as u128;
-                    let p_live = live_oracle as u128;
-                    let diff = if settlement_price >= live_oracle {
-                        (settlement_price - live_oracle) as u128
-                    } else {
-                        (live_oracle - settlement_price) as u128
-                    };
-                    let lhs = diff.checked_mul(10_000)
-                        .ok_or(ProgramError::ArithmeticOverflow)?;
-                    let rhs = dev_bps.checked_mul(p_live)
-                        .ok_or(ProgramError::ArithmeticOverflow)?;
-                    if lhs > rhs {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                }
+                // Engine v12.18.5+: resolve_market_not_atomic takes an explicit
+                // ResolveMode selector (Goal 51). The wrapper tells the engine
+                // which arm to run; the engine enforces that Degenerate carries
+                // `live == P_last && rate == 0`. A separate wrapper-side band
+                // check is no longer required because the engine's band check
+                // now runs unconditionally on Ordinary.
+                let resolve_mode = if in_ordinary_arm {
+                    percolator::ResolveMode::Ordinary
+                } else {
+                    percolator::ResolveMode::Degenerate
+                };
                 engine.resolve_market_not_atomic(
+                    resolve_mode,
                     settlement_price,
                     live_oracle,
                     clock.slot,
@@ -6832,7 +6863,10 @@ pub mod processor {
                 } else {
                     engine.last_oracle_price
                 };
+                // ResolvePermissionless is always the Degenerate arm by design
+                // (engine's Goal 51 explicit selector).
                 engine.resolve_market_not_atomic(
+                    percolator::ResolveMode::Degenerate,
                     settlement_price,
                     live_oracle_p_last,
                     clock.slot,

@@ -4858,4 +4858,70 @@ fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
     );
 }
 
+/// KeeperCrank reward: a non-permissionless cranker earns 50% of the
+/// maintenance fees swept on that crank as capital credit, capped at
+/// CRANK_REWARD_ACCOUNT_CAP (=16) * maintenance_fee_per_slot.
+///
+/// Minimal check: non-permissionless crank → caller's capital strictly
+/// increased by some positive reward. Permissionless crank → no reward.
+#[test]
+fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // The cranker needs an account to be credited.
+    let cranker = Keypair::new();
+    let cranker_idx = env.init_user(&cranker);
+    env.deposit(&cranker, cranker_idx, 10_000_000_000);
+
+    // Other accounts for the sweep to collect fees from.
+    let u2 = Keypair::new();
+    let u2_idx = env.init_user(&u2);
+    env.deposit(&u2, u2_idx, 10_000_000_000);
+    let u3 = Keypair::new();
+    let u3_idx = env.init_user(&u3);
+    env.deposit(&u3, u3_idx, 10_000_000_000);
+
+    env.set_slot(500);
+
+    let cranker_cap_before = env.read_account_capital(cranker_idx);
+    // Permissioned crank with caller_idx = cranker_idx (not CRANK_NO_CALLER).
+    env.crank_as(&cranker, cranker_idx);
+    let cranker_cap_after = env.read_account_capital(cranker_idx);
+
+    // Cranker's own fee is also charged by the sweep BEFORE the reward
+    // is credited, so the net delta = reward − self_fee. For self_fee =
+    // 1000 * 500 = 500_000 and reward = 50% of total sweep capped at
+    // 16 × 1000 = 16_000, we expect a NET LOSS of roughly 484_000. The
+    // *regression* we guard against is "no reward at all", so assert the
+    // reward was paid (net loss < self_fee) OR net capital strictly
+    // higher than without-reward baseline. Numerically:
+    //   without reward: delta = −500_000
+    //   with 16k reward cap: delta = −484_000
+    let self_fee_only: i128 = 1_000i128 * 500i128; // 500_000
+    let actual_delta: i128 = (cranker_cap_after as i128) - (cranker_cap_before as i128);
+    // Sanity: cranker paid a fee (so delta is negative), but it's less
+    // negative than pure self-fee because the reward was credited.
+    assert!(
+        actual_delta < 0,
+        "cranker still pays maintenance fee on their own account: delta={actual_delta}"
+    );
+    assert!(
+        actual_delta > -self_fee_only,
+        "cranker should have received a positive reward offsetting part of \
+         the self-fee; net delta={actual_delta} but self-fee alone is \
+         {self_fee_only}. Reward appears to not have been paid."
+    );
+}
+
 

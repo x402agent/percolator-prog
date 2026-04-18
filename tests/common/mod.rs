@@ -1250,6 +1250,33 @@ impl TestEnv {
         self.svm.send_transaction(tx).expect("crank failed");
     }
 
+    /// Permissioned crank: caller is a real account on the market (`caller_idx`
+    /// must be their slot). Required for the crank-reward path, which pays
+    /// the reward only when `caller_idx != CRANK_NO_CALLER`.
+    pub fn crank_as(&mut self, caller: &Keypair, caller_idx: u16) {
+        let mut data = vec![5u8]; // Tag 5: KeeperCrank
+        data.extend_from_slice(&caller_idx.to_le_bytes());
+        data.push(1u8); // format_version = 1
+        // No candidates — sweep visits every used account via the bitmap.
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data,
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[caller],
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("crank_as failed");
+    }
+
     pub fn try_crank(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
