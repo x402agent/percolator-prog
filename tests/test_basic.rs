@@ -4859,11 +4859,14 @@ fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
 }
 
 /// KeeperCrank reward: a non-permissionless cranker earns 50% of the
-/// maintenance fees swept on that crank as capital credit, capped at
-/// CRANK_REWARD_ACCOUNT_CAP (=16) * maintenance_fee_per_slot.
+/// maintenance fees swept on that crank as capital credit, the other
+/// 50% stays in insurance. No additional cap — the sweep itself is the
+/// bound (FEE_SWEEP_BUDGET accounts per crank).
 ///
-/// Minimal check: non-permissionless crank → caller's capital strictly
-/// increased by some positive reward. Permissionless crank → no reward.
+/// Setup: 3 accounts at slot 0, advance to slot 500, permissioned crank.
+/// Per-account fee = 1_000 × 500 = 500_000. Total sweep = 3 × 500_000.
+/// Cranker's own sync charges 500_000, then reward credits 50% × 3 × 500_000
+/// = 750_000 back to cranker. Net: cranker +250_000, insurance +750_000.
 #[test]
 fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller() {
     program_path();
@@ -4879,7 +4882,7 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.top_up_insurance(&admin, 100_000_000_000);
 
-    // The cranker needs an account to be credited.
+    // Cranker needs an account to be credited.
     let cranker = Keypair::new();
     let cranker_idx = env.init_user(&cranker);
     env.deposit(&cranker, cranker_idx, 10_000_000_000);
@@ -4895,32 +4898,67 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     env.set_slot(500);
 
     let cranker_cap_before = env.read_account_capital(cranker_idx);
-    // Permissioned crank with caller_idx = cranker_idx (not CRANK_NO_CALLER).
-    env.crank_as(&cranker, cranker_idx);
-    let cranker_cap_after = env.read_account_capital(cranker_idx);
+    let ins_before = env.read_insurance_balance();
 
-    // Cranker's own fee is also charged by the sweep BEFORE the reward
-    // is credited, so the net delta = reward − self_fee. For self_fee =
-    // 1000 * 500 = 500_000 and reward = 50% of total sweep capped at
-    // 16 × 1000 = 16_000, we expect a NET LOSS of roughly 484_000. The
-    // *regression* we guard against is "no reward at all", so assert the
-    // reward was paid (net loss < self_fee) OR net capital strictly
-    // higher than without-reward baseline. Numerically:
-    //   without reward: delta = −500_000
-    //   with 16k reward cap: delta = −484_000
-    let self_fee_only: i128 = 1_000i128 * 500i128; // 500_000
-    let actual_delta: i128 = (cranker_cap_after as i128) - (cranker_cap_before as i128);
-    // Sanity: cranker paid a fee (so delta is negative), but it's less
-    // negative than pure self-fee because the reward was credited.
-    assert!(
-        actual_delta < 0,
-        "cranker still pays maintenance fee on their own account: delta={actual_delta}"
+    env.crank_as(&cranker, cranker_idx);
+
+    let cranker_cap_after = env.read_account_capital(cranker_idx);
+    let ins_after = env.read_insurance_balance();
+
+    // Each of the 3 accounts owed 1_000 × 500 = 500_000.
+    let per_account_fee: i128 = 1_000 * 500;
+    let total_sweep: i128 = per_account_fee * 3;
+    let reward: i128 = total_sweep / 2;        // 750_000 → cranker
+    let insurance_share: i128 = total_sweep / 2; // 750_000 → insurance
+
+    let cranker_delta: i128 =
+        (cranker_cap_after as i128) - (cranker_cap_before as i128);
+    let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
+
+    // Cranker's net = reward received − own fee paid = +250_000
+    let expected_cranker_delta = reward - per_account_fee;
+    assert_eq!(
+        cranker_delta, expected_cranker_delta,
+        "cranker net = reward − own self-fee; expected {expected_cranker_delta}, got {cranker_delta}"
     );
-    assert!(
-        actual_delta > -self_fee_only,
-        "cranker should have received a positive reward offsetting part of \
-         the self-fee; net delta={actual_delta} but self-fee alone is \
-         {self_fee_only}. Reward appears to not have been paid."
+    assert_eq!(
+        ins_delta, insurance_share,
+        "insurance keeps exactly 50% of the sweep; expected {insurance_share}, got {ins_delta}"
+    );
+}
+
+/// Permissionless crank must not pay a reward — the caller has no account.
+#[test]
+fn test_keeper_crank_permissionless_pays_no_reward() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let u1 = Keypair::new();
+    let u1_idx = env.init_user(&u1);
+    env.deposit(&u1, u1_idx, 10_000_000_000);
+
+    env.set_slot(500);
+
+    let ins_before = env.read_insurance_balance();
+    env.crank(); // permissionless (caller_idx = u16::MAX)
+    let ins_after = env.read_insurance_balance();
+
+    // All swept fees (1 account × 500 × 1000 = 500_000) stay with insurance.
+    let expected_ins_delta: i128 = 500_000;
+    let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
+    assert_eq!(
+        ins_delta, expected_ins_delta,
+        "permissionless crank: 100% of sweep → insurance; expected {expected_ins_delta}, got {ins_delta}"
     );
 }
 

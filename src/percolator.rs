@@ -43,15 +43,21 @@ pub mod constants {
     // CRANK_REWARD_MIN_DT removed — crank discount logic removed in v12.15
     /// Progressive scan window per crank.
     pub const RISK_SCAN_WINDOW: usize = 32;
-    /// Crank reward: fraction of the fees swept in a KeeperCrank that is paid
-    /// back to the (non-permissionless) caller as compensation for cranking.
-    /// 5_000 bps = 50 %.
+    /// Crank reward: fraction of the maintenance-fee sweep that is paid to
+    /// a non-permissionless caller. 5_000 bps = 50 %. The remaining 50 %
+    /// stays in the insurance fund. Only bounded by insurance balance post-
+    /// crank; the sweep itself is the natural cap (≤ FEE_SWEEP_BUDGET
+    /// accounts × per-account dt × fee_rate per call).
     pub const CRANK_REWARD_BPS: u128 = 5_000;
-    /// Crank reward cap expressed as "N accounts' worth of one-slot fees":
-    ///   cap = CRANK_REWARD_ACCOUNT_CAP * maintenance_fee_per_slot
-    /// Bounds the absolute payout so a crank over a long interval or a huge
-    /// used-account bitmap cannot drain insurance in a single call.
-    pub const CRANK_REWARD_ACCOUNT_CAP: u128 = 16;
+
+    /// Max accounts whose fees get realized in a single KeeperCrank call.
+    /// Keeps CU bounded regardless of `max_accounts` / total live-account
+    /// count: at ~5K CU per `sync_account_fee_to_slot_not_atomic` call,
+    /// 128 syncs ≈ 640K CU — room for liquidation/lifecycle in the same
+    /// transaction. Per-account `Account::last_fee_slot` keeps the sweep
+    /// correct across multiple cranks — when the cursor reaches an account,
+    /// it pays for its full elapsed interval in one charge.
+    pub const FEE_SWEEP_BUDGET: usize = 128;
 
     // ── Engine envelope constants (wrapper-owned, immutable per deployment) ──
     //
@@ -1862,11 +1868,21 @@ pub mod state {
         // Fee-Weighted EWMA
         // ========================================
         /// Periodic maintenance fee per slot per account (engine units).
-        /// Wrapper charges via engine.charge_account_fee_not_atomic during KeeperCrank.
+        /// Wrapper charges via engine.sync_account_fee_to_slot_not_atomic.
         /// 0 = disabled. Set at InitMarket, immutable.
         pub maintenance_fee_per_slot: u128,
-        /// Last slot when maintenance fees were globally charged.
-        pub last_fee_charge_slot: u64,
+        /// Incremental fee-sweep cursor: next bitmap word to scan on the
+        /// next KeeperCrank. Per-account `last_fee_slot` on the engine side
+        /// keeps the sweep correct across cranks — each account pays for
+        /// its full elapsed interval the first time the cursor reaches it.
+        /// Scanning is O(FEE_SWEEP_BUDGET) per crank regardless of
+        /// max_accounts, so a 4096-account market doesn't blow the CU
+        /// budget on a single crank.
+        ///
+        /// Repurposed from the former `last_fee_charge_slot` (now dead —
+        /// replaced by per-account `Account::last_fee_slot`). Same 8-byte
+        /// slot, same wire offset; only u16 is meaningful.
+        pub fee_sweep_cursor_word: u64,
         pub _fee_padding: u64,
         /// Minimum fee (in engine units, same as insurance_fund.balance) for full mark EWMA weight.
         /// Trades with fee below this get proportionally reduced alpha.
@@ -2954,24 +2970,45 @@ pub mod processor {
             .map_err(map_risk_error)
     }
 
-    /// Sweep maintenance fees across every used account (used by KeeperCrank
-    /// to catch accounts that haven't self-acted since the last crank).
-    /// Per-account cursor means each account pays exactly its due interval;
-    /// accounts already self-synced within this slot see a no-op.
+    /// Incrementally sweep maintenance fees from the current cursor position.
+    /// Scans bitmap words starting at `config.fee_sweep_cursor_word`, calling
+    /// `sync_account_fee_to_slot_not_atomic` on every set bit until the
+    /// `FEE_SWEEP_BUDGET` quota is reached OR a full bitmap cycle completes.
+    ///
+    /// Correctness: the engine's per-account `last_fee_slot` is the source of
+    /// truth. When the cursor reaches an account, that account's sync call
+    /// realizes fees for the *entire* elapsed interval
+    /// `[account.last_fee_slot, now_slot]` in one charge — no fees are lost
+    /// between cursor visits. Self-acting accounts realize their own fees
+    /// inline on every capital-sensitive instruction (see `sync_account_fee`);
+    /// the sweep handles everything that hasn't self-acted.
+    ///
+    /// CU bound: at most `FEE_SWEEP_BUDGET` sync calls per crank, each ~5K CU,
+    /// plus O(BITMAP_WORDS) word reads. Constant in `max_accounts`, so a
+    /// 4096-slot market is handled the same as a 64-slot market.
+    ///
+    /// Word-completion rule: once we start scanning a word, we finish it
+    /// (drain every set bit) before advancing the cursor past it. This keeps
+    /// the cursor word-aligned and prevents losing set bits to budget
+    /// truncation mid-word.
     fn sweep_maintenance_fees(
         engine: &mut RiskEngine,
-        config: &MarketConfig,
+        config: &mut MarketConfig,
         now_slot: u64,
     ) -> Result<(), ProgramError> {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
         const BITMAP_WORDS: usize = (percolator::MAX_ACCOUNTS + 63) / 64;
-        for word_idx in 0..BITMAP_WORDS {
-            let mut bits = engine.used[word_idx];
+        // Normalize cursor in case of stale/corrupt value.
+        let mut word_cursor = (config.fee_sweep_cursor_word as usize) % BITMAP_WORDS;
+        let mut syncs_done: usize = 0;
+        let mut words_scanned: usize = 0;
+        while words_scanned < BITMAP_WORDS {
+            let mut bits = engine.used[word_cursor];
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
-                let idx = word_idx * 64 + bit;
+                let idx = word_cursor * 64 + bit;
                 bits &= bits - 1;
                 if idx >= percolator::MAX_ACCOUNTS {
                     continue;
@@ -2983,8 +3020,16 @@ pub mod processor {
                         config.maintenance_fee_per_slot,
                     )
                     .map_err(map_risk_error)?;
+                syncs_done += 1;
+            }
+            // Word fully drained — safe to advance cursor past it.
+            word_cursor = (word_cursor + 1) % BITMAP_WORDS;
+            words_scanned += 1;
+            if syncs_done >= crate::constants::FEE_SWEEP_BUDGET {
+                break;
             }
         }
+        config.fee_sweep_cursor_word = word_cursor as u64;
         Ok(())
     }
 
@@ -3667,7 +3712,7 @@ pub mod processor {
                     // if the oracle happens to be down during market creation).
                     last_good_oracle_slot: clock.slot,
                     maintenance_fee_per_slot,
-                    last_fee_charge_slot: clock.slot,
+                    fee_sweep_cursor_word: 0,
                     _fee_padding: 0,
                     mark_min_fee,
                     force_close_delay_slots,
@@ -4166,11 +4211,13 @@ pub mod processor {
                 //
                 // Crank reward: pay CRANK_REWARD_BPS (50 %) of the maintenance-
                 // fee sweep delta back to the non-permissionless caller as
-                // capital, capped at CRANK_REWARD_ACCOUNT_CAP accounts' worth
-                // of one-slot fees. Trading, liquidation, and resolution fees
-                // continue to flow only to insurance (sweep_delta is captured
-                // BEFORE keeper_crank_not_atomic so those fees don't inflate
-                // the reward).
+                // capital. The remaining 50% stays in insurance. No additional
+                // account-count cap — the sweep itself is the bound (at most
+                // FEE_SWEEP_BUDGET accounts per crank, and each contribution
+                // is `fee_per_slot × dt_that_account_owed`). Trading,
+                // liquidation, and resolution fees are NOT shared with the
+                // cranker — sweep_delta is captured BEFORE keeper_crank_not_atomic
+                // so those fees don't inflate the reward.
                 //
                 // Reward is paid AFTER keeper_crank_not_atomic. Paying it
                 // before would let a borderline caller self-rescue: the capital
@@ -4180,7 +4227,7 @@ pub mod processor {
                 // and a caller who got liquidated inside the crank (slot no
                 // longer used) simply doesn't collect the reward.
                 let ins_before = engine.insurance_fund.balance.get();
-                sweep_maintenance_fees(engine, &config, clock.slot)?;
+                sweep_maintenance_fees(engine, &mut config, clock.slot)?;
                 let sweep_delta = engine
                     .insurance_fund
                     .balance
@@ -4223,14 +4270,12 @@ pub mod processor {
                     && sweep_delta > 0
                     && engine.is_used(caller_idx as usize)
                 {
+                    // 50 / 50 split: half to caller, half stays in insurance.
                     let mut reward = sweep_delta
                         .saturating_mul(crate::constants::CRANK_REWARD_BPS)
                         / 10_000u128;
-                    let cap = crate::constants::CRANK_REWARD_ACCOUNT_CAP
-                        .saturating_mul(config.maintenance_fee_per_slot);
-                    if reward > cap {
-                        reward = cap;
-                    }
+                    // Never pay out more than insurance currently holds (post-
+                    // crank balance, since liquidation may have drained it).
                     let ins_now = engine.insurance_fund.balance.get();
                     if reward > ins_now {
                         reward = ins_now;
