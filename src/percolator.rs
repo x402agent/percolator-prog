@@ -3213,6 +3213,25 @@ pub mod processor {
         if engine.last_oracle_price == 0 {
             return Ok(());
         }
+        // Mirror the engine's own envelope predicate (§5.5 clause 6, v12.19):
+        // accrue_market_to only enforces `total_dt > max_dt` Overflow when
+        // funding would actually accumulate — i.e., rate != 0 AND both
+        // sides have OI AND fund_px_last > 0. When funding is INACTIVE,
+        // the engine will happily jump any dt in one call. If the wrapper
+        // chunks anyway, it can raise CatchupRequired on paths where the
+        // engine would legally advance directly — e.g.:
+        //   - Dead-oracle UpdateConfig degenerate arm (rate = 0)
+        //   - InitUser / InitLP / no-OI markets
+        //   - ResolveMarket Degenerate (rate = 0)
+        // Skip the chunking loop entirely when funding is inactive; the
+        // caller's final accrue_market_to handles any dt in one shot.
+        let funding_active = funding_rate_e9 != 0
+            && engine.oi_eff_long_q != 0
+            && engine.oi_eff_short_q != 0
+            && engine.fund_px_last > 0;
+        if !funding_active {
+            return Ok(());
+        }
         // Catchup chunks use the engine's STORED last_oracle_price, not the
         // caller's fresh `price`. Rationale: accrue_market_to's funding math
         // (engine §5.5) uses `fund_px_last` (the price at call entry) for
@@ -3896,8 +3915,16 @@ pub mod processor {
                         return Err(PercolatorError::InvalidConfigParam.into());
                     }
                 }
-                // mark_min_fee upper bound: prevent setting so high that EWMA never updates
-                if mark_min_fee > percolator::MAX_PROTOCOL_FEE_ABS as u64 {
+                // mark_min_fee upper bound: prevent setting so high that
+                // EWMA never updates. Compare in u128 — MAX_PROTOCOL_FEE
+                // _ABS is 10^36, casting to u64 wraps modulo 2^64 and
+                // yields a meaningless threshold. mark_min_fee is u64
+                // so under the 10^36 ceiling this check is effectively
+                // "always passes", which matches the spec (no tighter
+                // per-market cap today). If a tighter cap is desired in
+                // the future (e.g., MAX_VAULT_TVL-scaled), replace the
+                // ceiling here.
+                if (mark_min_fee as u128) > percolator::MAX_PROTOCOL_FEE_ABS {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
@@ -4748,7 +4775,7 @@ pub mod processor {
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                let _outcome = engine
+                let outcome = engine
                     .keeper_crank_not_atomic(
                         clock.slot,
                         price,
@@ -4841,8 +4868,10 @@ pub mod processor {
                     }
                 }
 
-                // Copy stats and drop engine mutable borrow
-                let liqs = 0u64;
+                // Copy stats and drop engine mutable borrow.
+                // Use the actual crank outcome so observability/telemetry
+                // reflects real liquidations, not a hard-coded zero.
+                let liqs = outcome.num_liquidations as u64;
                 let ins_low = engine.insurance_fund.balance.get() as u64;
                 drop(engine);
 
@@ -8164,12 +8193,23 @@ pub mod processor {
                 }
 
                 // Decide COMPLETE vs PARTIAL based on whether one call can
-                // close the full gap.
+                // close the full gap. If funding is inactive (rate == 0
+                // OR one side has no OI OR fund_px_last == 0), the engine
+                // doesn't enforce the dt envelope — accrue_market_to can
+                // jump the full gap in one call. Treat as can_finish
+                // regardless of gap size. This matches the engine's own
+                // §5.5 clause-6 predicate and prevents CatchupAccrue from
+                // gratuitously stepping partial targets on empty/inactive
+                // markets.
                 let max_dt = engine.params.max_accrual_dt_slots;
                 let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64)
                     .saturating_mul(max_dt);
                 let gap = clock.slot.saturating_sub(engine.last_market_slot);
-                let can_finish = gap <= max_step_per_call;
+                let funding_active = funding_rate_e9_pre != 0
+                    && engine.oi_eff_long_q != 0
+                    && engine.oi_eff_short_q != 0
+                    && engine.fund_px_last > 0;
+                let can_finish = !funding_active || gap <= max_step_per_call;
 
                 if can_finish {
                     // COMPLETE: chunk to clock.slot using stored P_last
