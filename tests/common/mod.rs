@@ -2796,8 +2796,9 @@ impl TestEnv {
     }
 
     /// Tag 31: permissionless CatchupAccrue. Commits up to
-    /// CATCHUP_CHUNKS_MAX chunks of market-clock advancement.
-    /// Signal-free — no oracle account, no config mutation, rate=0.
+    /// CATCHUP_CHUNKS_MAX chunks of market-clock advancement. Requires
+    /// a live oracle (proves market is live; dead oracles must use
+    /// ResolvePermissionless instead).
     pub fn try_catchup_accrue(&mut self) -> Result<(), String> {
         let caller = Keypair::new();
         self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
@@ -2806,6 +2807,7 @@ impl TestEnv {
             accounts: vec![
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data: encode_catchup_accrue(),
         };
