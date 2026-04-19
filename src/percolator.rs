@@ -1926,15 +1926,15 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// First slot on which ResolvePermissionless observed the external oracle
-        /// as stale (non-Hyperp only). 0 = not currently observing staleness.
-        /// Cleared on every successful external oracle read so a live-but-idle
-        /// market cannot be prematurely resolved after a short oracle hiccup.
-        /// Stamped on the first stale observation, so continuous-death duration
-        /// is measured from that observation (not from the last-good stamp,
-        /// which only advances when some instruction reads the oracle).
-        /// Repurposed from the former `_liw_padding` (same 8-byte slot, same
-        /// wire offset). Legacy zero initialization is the correct sentinel.
+        /// LEGACY TELEMETRY (not load-bearing): slot on which a prior
+        /// two-phase ResolvePermissionless design first observed the
+        /// external oracle as stale. Under the current STRICT HARD-
+        /// TIMEOUT model the gate is `clock.slot - last_good_oracle
+        /// _slot >= permissionless_resolve_stale_slots`, so this field
+        /// no longer affects eligibility. Still maintained by
+        /// read_price_clamped_with_external's external-Ok branch (clears
+        /// to 0) for operators inspecting the slab via external tools.
+        /// Layout-preserved for on-chain state compatibility.
         pub first_observed_stale_slot: u64,
 
         // ========================================
@@ -1956,8 +1956,14 @@ pub mod state {
         /// 0 = disabled (admin-only resolution). Set at InitMarket, immutable.
         pub permissionless_resolve_stale_slots: u64,
         /// Slot of last successful external oracle read (non-Hyperp only).
-        /// Used by ResolvePermissionless to measure oracle-death duration.
-        /// Stamped by read_price_clamped wrapper on every successful read.
+        /// Under the STRICT HARD-TIMEOUT model, this is the authoritative
+        /// liveness signal: `clock.slot - last_good_oracle_slot >=
+        /// permissionless_resolve_stale_slots` makes the market stale
+        /// and eligible for ResolvePermissionless, and also causes
+        /// read_price_and_stamp to reject further price-taking ops.
+        /// Stamped in read_price_and_stamp ONLY when the external
+        /// oracle read returned Ok — authority fallback does NOT
+        /// advance this field. Seeded to clock.slot at InitMarket.
         pub last_good_oracle_slot: u64,
 
         // ========================================
@@ -2673,18 +2679,24 @@ pub mod oracle {
         //
         // Authority is always clamped against last_effective_price_e6
         // (the last FRESHLY observed external price). That baseline
-        // advances only on successful external reads, so during a long
+        // advances only on successful external reads, so during an
         // external outage the authority price stays pinned within one
-        // cap-width of the last known external price. That is a
-        // deliberate "short-outage fallback" semantic, not an
-        // independent long-outage oracle — a sufficiently long external
-        // outage matures the permissionless-resolve stale window
-        // regardless of authority state.
+        // cap-width of the last known external price.
         //
-        // Every successful price-source read (external Ok or authority
-        // fallback Ok) clears first_observed_stale_slot so the
-        // continuous-death window only measures UNINTERRUPTED
-        // staleness.
+        // Under the STRICT HARD-TIMEOUT policy, authority fallback is a
+        // short-outage convenience during the window between external
+        // going dark and ResolvePermissionless maturing. It does NOT
+        // extend the market's oracle life:
+        //   - Authority fallback does NOT advance last_good_oracle_slot
+        //     (only external Ok does, in read_price_and_stamp).
+        //   - Authority fallback does NOT clear first_observed_stale
+        //     _slot (that field is legacy telemetry only under the
+        //     hard-timeout model).
+        //   - Once clock.slot - last_good_oracle_slot >=
+        //     permissionless_resolve_stale_slots, read_price_and_stamp
+        //     rejects even if authority is fresh — live price-taking
+        //     ops can no longer continue through authority fallback
+        //     once the hard timeout has matured.
         //
         // SetOracleAuthority / SetOraclePriceCap / UpdateAdmin (burn) /
         // PushOraclePrice enforce the invariant that non-Hyperp markets
@@ -2745,6 +2757,43 @@ pub mod oracle {
         config.index_feed_id == [0u8; 32]
     }
 
+    /// Hard-timeout predicate: has the market's configured oracle been
+    /// stale for >= permissionless_resolve_stale_slots?
+    ///
+    /// Returns false when permissionless_resolve_stale_slots == 0
+    /// (feature disabled — admin-only resolution).
+    ///
+    /// "Liveness slot" is:
+    ///   non-Hyperp → config.last_good_oracle_slot (advances on successful
+    ///                external reads only; NOT on authority fallback)
+    ///   Hyperp     → max(mark_ewma_last_slot, last_mark_push_slot)
+    ///                (advances on trades that update the EWMA, and on
+    ///                 PushOraclePrice that updates the mark)
+    ///
+    /// Once this returns true, the market is DEAD: ResolvePermissionless
+    /// may be called, and every price-taking live instruction
+    /// (read_price_and_stamp for non-Hyperp, get_engine_oracle_price_e6
+    /// for Hyperp) rejects further price reads to prevent state drift
+    /// before terminal resolution.
+    pub fn permissionless_stale_matured(
+        config: &super::state::MarketConfig,
+        clock_slot: u64,
+    ) -> bool {
+        if config.permissionless_resolve_stale_slots == 0 {
+            return false;
+        }
+        let last_live_slot = if is_hyperp_mode(config) {
+            core::cmp::max(
+                config.mark_ewma_last_slot,
+                config.last_mark_push_slot as u64,
+            )
+        } else {
+            config.last_good_oracle_slot
+        };
+        clock_slot.saturating_sub(last_live_slot)
+            >= config.permissionless_resolve_stale_slots
+    }
+
     /// Move `index` toward `mark`, but clamp movement by cap_e2bps * dt_slots.
     /// cap_e2bps units: 1_000_000 = 100.00%
     /// Returns the new index value.
@@ -2789,6 +2838,13 @@ pub mod oracle {
         config: &mut super::state::MarketConfig,
         a_oracle: &AccountInfo,
     ) -> Result<u64, ProgramError> {
+        // Strict hard-timeout gate (applies to both Hyperp and non-Hyperp):
+        // once the oracle has been stale for >=
+        // permissionless_resolve_stale_slots, no price read succeeds.
+        // The market must be resolved before any further price-taking op.
+        if permissionless_stale_matured(config, now_slot) {
+            return Err(super::error::PercolatorError::OracleStale.into());
+        }
         // Hyperp mode: index_feed_id == 0
         if is_hyperp_mode(config) {
             // Mark source: prefer trade-derived EWMA, fall back to authority push
@@ -3021,6 +3077,15 @@ pub mod processor {
     /// ONLY when the external oracle read succeeds. Authority-fallback success
     /// does NOT stamp the field — it measures external-oracle liveness only.
     ///
+    /// STRICT HARD-TIMEOUT GATE: if the hard stale window has matured
+    /// (clock.slot - last_good_oracle_slot >= permissionless_resolve
+    /// _stale_slots), this function rejects with OracleStale regardless
+    /// of authority-fallback freshness. That prevents price-taking
+    /// instructions (Trade, Withdraw, Crank, Settle, Convert, Catchup)
+    /// from continuing to drift the engine price through authority
+    /// fallback after the market is terminally stale — they must route
+    /// to ResolvePermissionless instead.
+    ///
     /// Probes external oracle separately to detect liveness. This doubles the
     /// oracle parse (~2K CU) but is necessary because read_price_clamped can
     /// succeed via authority fallback without a live external oracle, and
@@ -3046,6 +3111,20 @@ pub mod processor {
             config.unit_scale,
         );
         let external_ok = external.is_ok();
+
+        // Hard-timeout gate: if external is NOT usable right now AND
+        // the hard-timeout window has matured, reject. A FRESH external
+        // read proves the oracle is live and clears any matured-stale
+        // condition — only caller paths trying to coast through
+        // authority fallback after the window matured are blocked
+        // here. This closes the "keep trading via authority fallback
+        // after N slots" drift channel while still allowing fresh
+        // keeper updates to revive an idle market.
+        if !external_ok
+            && oracle::permissionless_stale_matured(config, clock_slot)
+        {
+            return Err(PercolatorError::OracleStale.into());
+        }
 
         let price = oracle::read_price_clamped_with_external(
             config, external, clock_unix_ts,
@@ -7840,12 +7919,36 @@ pub mod processor {
             }
 
             Instruction::ResolvePermissionless => {
-                // Permissionless resolution when oracle is actually dead.
-                // Anyone can call. Requires oracle account to prove staleness.
-                accounts::expect_len(accounts, 3)?;
+                // STRICT HARD-TIMEOUT POLICY:
+                //
+                //   clock.slot - last_live_slot >= permissionless_resolve_stale_slots
+                //     → market is stale, anyone resolves at engine.last_oracle_price
+                //
+                //   last_live_slot is:
+                //     non-Hyperp → config.last_good_oracle_slot
+                //                  (advances ONLY on successful external oracle
+                //                  reads; authority fallback does NOT advance it)
+                //     Hyperp     → max(mark_ewma_last_slot, last_mark_push_slot)
+                //                  (advances on trades and mark pushes)
+                //
+                // No challenge window, no first-observation stamp, no oracle
+                // account submitted at resolve time. The timer is purely
+                // "slots since last accepted fresh oracle update for this
+                // market". If no one has fed the market a fresh oracle for
+                // N slots, it's dead. Period.
+                //
+                // Settlement is at engine.last_oracle_price (the last price
+                // the engine actually accrued against), for both Hyperp and
+                // non-Hyperp. Authority-fallback drift during the stale
+                // window IS reflected here — trades and cranks that ran on
+                // authority fallback fed into the engine — but once the
+                // window matures, all price-taking live instructions also
+                // reject (see permissionless_stale_matured() check in
+                // read_price_and_stamp and the Hyperp price path), so there
+                // is no further drift from the point of maturity onward.
+                accounts::expect_len(accounts, 2)?;
                 let a_slab = &accounts[0];
                 let a_clock = &accounts[1];
-                let a_oracle = &accounts[2];
 
                 accounts::expect_writable(a_slab)?;
 
@@ -7865,235 +7968,33 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
 
-                // Unified stale-oracle policy: the market's CONFIGURED
-                // oracle (external Pyth Pull, Chainlink, or Hyperp
-                // internal mark) is the authoritative liveness signal.
-                // Oracle authority is a bounded short-outage fallback
-                // that fills in individual price reads while external
-                // is momentarily unusable — it does NOT extend the
-                // oracle's life. If the configured oracle is stale past
-                // max_staleness_secs (non-Hyperp) or the mark-staleness
-                // horizon (Hyperp) AND no one clears the observation
-                // within permissionless_resolve_stale_slots, the market
-                // freezes at last_effective_price_e6 and everyone exits
-                // via resolution — regardless of authority state.
-                //
-                // This removes the previous carve-out where a fresh
-                // authority would block permissionless resolve. That
-                // carve-out produced "pinned theater": during a long
-                // external outage, authority-clamped price stays within
-                // one cap-width of the stale baseline (because the
-                // authority clamp base is last_effective_price_e6,
-                // which only advances on external Ok), yet resolve was
-                // blocked indefinitely. Dropping the carve-out makes
-                // the defined-oracle-is-stale → market-resolves rule
-                // actually hold.
-                //
-                // Two-phase design: the first stale observation STAMPS
-                // first_observed_stale_slot and returns Ok with NO market
-                // state change. The caller must re-invoke after the
-                // configured delay to actually resolve. This guarantees
-                // continuous unusability over the window — a single
-                // observation only proves "stale now", not "stale
-                // throughout the required window". Returning Ok on the
-                // stamp call is essential (returning Err would roll back
-                // the stamp and leave the market unresolvable).
-                //
-                // CHALLENGE WINDOW (not a cryptographic proof of feed
-                // death for Pyth-Pull): the submitted PriceUpdateV2 is
-                // CALLER-SELECTED. A stale submission proves only that
-                // THIS account is stale, not that no fresher update
-                // exists elsewhere. The two-phase observation is
-                // therefore an on-chain CHALLENGE WINDOW: if no honest
-                // party refreshes the market with a fresh update for
-                // `permissionless_resolve_stale_slots` slots, the
-                // market is deemed undefended and resolves at the last
-                // effective price. This is an ECONOMIC liveness policy
-                // (governed by operator choice of delay and
-                // max_staleness_secs), not an oracle-death proof.
-                // Chainlink markets use a FIXED OCR2 transmissions
-                // account that the caller cannot substitute, so the
-                // stale observation there does constitute a feed-death
-                // signal. Hyperp markets use internal mark staleness
-                // measured in slots (see the Hyperp branch below),
-                // which is similarly non-caller-selectable.
-                //
-                // Operator guidance: for Pyth-Pull markets with few
-                // active users, set `permissionless_resolve_stale_slots`
-                // long enough that honest keepers can plausibly submit
-                // a fresh update during the window, OR configure an
-                // independent oracle authority to keep the market
-                // pricing through read_price_clamped_with_external's
-                // fallback branch (the authority fallback is used when
-                // external is OracleStale/OracleConfTooWide, which
-                // includes the stale PriceUpdateV2 case — a fresh
-                // authority push would make the authority fallback
-                // succeed and clear the stamp via the standard read
-                // path).
-                //
-                // Callers detect resolution via is_resolved() on the slab;
-                // a successful ResolvePermissionless call may or may not
-                // have caused resolution depending on phase.
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                if !is_hyperp {
-                    let oracle_result = oracle::read_engine_price_e6(
-                        a_oracle, &config.index_feed_id,
-                        clock.unix_timestamp, config.max_staleness_secs,
-                        config.conf_filter_bps, config.invert, config.unit_scale,
-                    );
-                    match oracle_result {
-                        Ok(_) => {
-                            // Oracle is live right now: the market is healthy.
-                            // Clear any prior stale stamp — the continuous-death
-                            // window must measure UNINTERRUPTED staleness only.
-                            // Return Ok so the observation (live-clear) persists.
-                            if config.first_observed_stale_slot != 0 {
-                                config.first_observed_stale_slot = 0;
-                                state::write_config(&mut data, &config);
-                            }
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            // The oracle feed is "unusable" for the market if the
-                            // feed is stale (OracleStale) OR the reported
-                            // confidence band exceeds the configured filter
-                            // (OracleConfTooWide). Both prevent capital-sensitive
-                            // operations from reading a price, so both qualify
-                            // the market for permissionless recovery (Finding 7).
-                            // Other errors (wrong account, wrong owner, bad feed
-                            // id, corrupted data) do NOT prove the feed is dead
-                            // — they might be an attacker passing garbage — and
-                            // propagate as-is.
-                            let stale_err: ProgramError = PercolatorError::OracleStale.into();
-                            let conf_err: ProgramError =
-                                PercolatorError::OracleConfTooWide.into();
-                            if e != stale_err && e != conf_err {
-                                return Err(e);
-                            }
-                            // Oracle is unusable RIGHT NOW. On the FIRST
-                            // observation of this dead window, stamp the slot
-                            // and return Ok WITHOUT resolving. A second call
-                            // after permissionless_resolve_stale_slots have
-                            // elapsed will see the stamp, pass the duration
-                            // check, and perform the actual resolution.
-                            if config.first_observed_stale_slot == 0 {
-                                config.first_observed_stale_slot = clock.slot;
-                                state::write_config(&mut data, &config);
-                                return Ok(());
-                            }
-                            // Repeated unusable observation — fall through to
-                            // the duration check and (if window elapsed) resolve.
-                        }
-                    }
-                } else {
-                    // Hyperp: check mark staleness (last trade or push).
-                    // The reference slot (mark_ewma_last_slot / last_mark_push_slot)
-                    // already tracks continuous mark-liveness on-chain, so no
-                    // two-phase observation is needed — a single check suffices.
-                    let last_update = core::cmp::max(
-                        config.mark_ewma_last_slot,
-                        config.last_mark_push_slot as u64,
-                    );
-                    let staleness = clock.slot.saturating_sub(last_update);
-                    if staleness < config.permissionless_resolve_stale_slots {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
+                if !oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
                 }
 
-                // Authority freshness was already rejected at the top of the
-                // instruction (Finding 5). Reaching this point means either
-                // no authority is configured, or the authority has been stale
-                // for at least max_staleness_secs — the market has no live
-                // price source and qualifies for permissionless recovery.
-
-                // Require oracle/mark has been dead for the configured delay.
-                // Non-Hyperp: measure from first_observed_stale_slot. That field
-                //   was just stamped if this is the first stale observation (in
-                //   which case we already returned above) or was stamped by a
-                //   prior ResolvePermissionless call. Any successful external
-                //   read since then would have cleared it via
-                //   read_price_clamped_with_external, so a non-zero value here
-                //   proves continuous staleness over
-                //     [first_observed_stale_slot, clock.slot].
-                //   This fixes the prior bug where last_good_oracle_slot (only
-                //   advanced on a successful read) could show a huge dead window
-                //   after a long idle period even when the oracle had been live.
-                // Hyperp: use max(mark_ewma_last_slot, last_mark_push_slot) — the
-                //   same signal used for the mark staleness check above, so both
-                //   checks use consistent liveness information.
-                {
-                    let oracle_dead_duration = if !is_hyperp {
-                        // Non-zero by construction (we stamped and returned above
-                        // if it was zero), but saturating_sub is belt-and-braces.
-                        clock.slot.saturating_sub(config.first_observed_stale_slot)
-                    } else {
-                        let reference_slot = core::cmp::max(
-                            config.mark_ewma_last_slot,
-                            config.last_mark_push_slot as u64,
-                        );
-                        clock.slot.saturating_sub(reference_slot)
-                    };
-                    if oracle_dead_duration < config.permissionless_resolve_stale_slots {
-                        return Err(PercolatorError::OracleStale.into());
-                    }
-                }
-
-                // Flush Hyperp index toward mark before resolution.
-                // Hyperp index-flush REMOVED from the permissionless path.
-                // Engine v12.18.5+ Degenerate arm enforces
-                //     live_oracle_price == engine.last_oracle_price   (spec §9.8)
-                // Advancing config.last_effective_price_e6 via clamp_toward_with_dt
-                // and then passing that new value as live_oracle would violate
-                // that equality, so the engine would reject with Overflow.
-                // Permissionless resolution is by construction the
-                // "signal-free interval" branch: we feed the engine its own
-                // stored P_last and no new information. (Admin ResolveMarket
-                // still flushes the index on its own path, where the ORDINARY
-                // branch accrues through the new index.)
-
-                // Determine canonical settlement price.
-                // Hyperp: use mark EWMA (same as ResolveMarket Hyperp path).
-                // Non-Hyperp: engine.last_oracle_price is always a real economic
-                // value — InitMarket requires a successful oracle read and seeds
-                // the engine with it (spec goal 38 — no sentinel). FLAG_ORACLE_INITIALIZED
-                // is therefore set from genesis; an uninitialized-oracle branch is
-                // structurally unreachable. We still guard against zero as a
-                // belt-and-braces check in case a future refactor re-introduces one.
-                let settlement_price = if is_hyperp {
-                    let mark = config.mark_ewma_e6;
-                    if mark > 0 { mark } else { config.authority_price_e6 }
-                } else {
-                    let engine = zc::engine_ref(&data)?;
-                    let p = engine.last_oracle_price;
-                    if p == 0 {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                    p
-                };
-
-                // DEGENERATE BRANCH — ResolvePermissionless is always called after
-                // the oracle has been verified dead for >= permissionless_resolve_stale_slots.
-                // By construction there is no live oracle signal over
-                //   [engine.last_market_slot, clock.slot].
-                // Both inputs to engine.resolve_market_not_atomic therefore use their
-                // degenerate values:
-                //   live_oracle_price = P_last = engine.last_oracle_price
-                //     (same value for Hyperp and non-Hyperp — the engine's stored
-                //      last price, NOT the flushed config index)
-                //   funding_rate_e9 = 0        (signal-free interval)
+                // Degenerate resolve at engine.last_oracle_price. Both
+                // settlement_price and live_oracle_price use P_last (the
+                // engine's stored last-accrued price) — the engine's
+                // Degenerate arm requires equality between the two.
                 let engine = zc::engine_mut(&mut data)?;
-                let live_oracle_p_last = engine.last_oracle_price;
-                // ResolvePermissionless is always the Degenerate arm by design
-                // (engine's Goal 51 explicit selector).
+                let p_last = engine.last_oracle_price;
+                if p_last == 0 {
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
                 engine.resolve_market_not_atomic(
                     percolator::ResolveMode::Degenerate,
-                    settlement_price,
-                    live_oracle_p_last,
+                    p_last,
+                    p_last,
                     clock.slot,
                     0,
                 ).map_err(map_risk_error)?;
 
-                config.authority_price_e6 = settlement_price;
+                config.authority_price_e6 = p_last;
+                // first_observed_stale_slot is no longer load-bearing in
+                // the hard-timeout model. Clear any legacy stamp on
+                // resolve so the field reads 0 post-resolution (keeps
+                // telemetry clean; safe because the market is terminal).
+                config.first_observed_stale_slot = 0;
                 state::write_config(&mut data, &config);
             }
 

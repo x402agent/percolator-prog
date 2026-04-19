@@ -4470,6 +4470,13 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         // Alternate trade direction to avoid position limits
         let size = if i % 2 == 0 { 1i128 } else { -1i128 };
         let _ = env.try_trade(&user, &lp, lp_idx, user_idx, size);
+        // Strict hard-timeout: keep last_good_oracle_slot fresh by
+        // cranking every iteration. Without this, if dust trades fail
+        // (size-1 trades may reject on position limits etc.), no
+        // successful read advances last_good_oracle_slot and the market
+        // matures into the stale state mid-loop. The crank's oracle
+        // read advances the field regardless of trade success.
+        env.crank();
     }
     let ewma_after_dust_attack = env.read_mark_ewma();
     let dust_drift_bps = ((ewma_after_dust_attack as i128 - ewma_seed as i128).unsigned_abs() * 10_000) / ewma_seed as u128;
@@ -4479,13 +4486,16 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         dust_drift_bps
     );
 
-    // Organic trade restores mark
-    env.set_slot(300);
+    // Organic trade restores the mark. Use a small slot advance so the
+    // crank stays within the hard-timeout window
+    // (permissionless_resolve_stale_slots = 100 slots). Last trade/
+    // crank was at effective slot ~260; stay under +99 from there.
+    env.set_slot(230); // effective 330 → age from 260 ≈ 70 < 100
     env.crank();
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000); // large trade
 
-    // Oracle dies → permissionless resolution (unified stale-oracle
-    // policy: any stale oracle + no clear within delay → resolve).
+    // Oracle dies → permissionless resolution (strict hard-timeout
+    // policy: last_good_oracle_slot + N ≤ clock.slot → resolve).
     env.svm.set_sysvar(&Clock {
         slot: 700,
         unix_timestamp: 700,
