@@ -925,15 +925,11 @@ pub mod zc {
         program::invoke_signed,
     };
 
-    /// Invoke the matcher program via CPI with proper lifetime coercion.
-    ///
-    /// This is the ONLY place where unsafe lifetime transmute is allowed.
-    /// The transmute is sound because:
-    /// - We are shortening lifetime from 'a (caller) to local scope
-    /// - The AccountInfo is only used for the duration of invoke_signed
-    /// - We don't hold references past the function call
+    /// Invoke the matcher program via CPI. The AccountInfo clones satisfy
+    /// solana_program::program::invoke_signed's ownership requirement
+    /// without relying on lifetime transmutes (the earlier transmute-
+    /// based version has been removed).
     #[inline]
-    #[allow(unsafe_code)]
     pub fn invoke_signed_trade<'a>(
         ix: &SolInstruction,
         a_lp_pda: &AccountInfo<'a>,
@@ -2604,10 +2600,12 @@ pub mod oracle {
     /// returned effective price but do NOT contaminate the baseline. This
     /// prevents the admin from ratcheting the baseline via push+crank interleaving.
     ///
-    /// When the circuit breaker is configured (min_oracle_price_cap_e2bps > 0),
-    /// the external oracle read MUST succeed whenever authority pricing is used.
-    /// This prevents callers from bypassing the fresh external anchor by
-    /// supplying a bad/stale oracle account.
+    /// Authority fallback is gated on content-based external errors only
+    /// (OracleStale / OracleConfTooWide). Caller-shaped errors
+    /// (OracleInvalid for wrong owner / wrong feed / malformed data)
+    /// propagate unchanged — otherwise a caller could force authority
+    /// pricing by supplying a garbage oracle account. See
+    /// read_price_clamped_with_external for the full policy table.
     pub fn read_price_clamped(
         config: &mut super::state::MarketConfig,
         price_ai: &AccountInfo,
@@ -2630,33 +2628,67 @@ pub mod oracle {
     /// external Ok/Err signal and the clamped price share a single Pyth parse
     /// (saves ~2K CU on hot paths like TradeNoCpi / WithdrawCollateral /
     /// KeeperCrank that previously parsed the oracle twice).
+    /// Authority fallback only kicks in when the external oracle is
+    /// genuinely UNUSABLE — i.e., OracleStale (feed past max_staleness_secs)
+    /// or OracleConfTooWide (confidence band exceeds conf_filter_bps).
+    /// Both signals come from the oracle's own content and cannot be
+    /// manufactured by the caller.
+    ///
+    /// Other errors (OracleInvalid for wrong owner / wrong feed id /
+    /// malformed data / bad account) DO NOT prove oracle unavailability:
+    /// they just mean the caller supplied a bad account. Under the
+    /// previous (buggy) policy, those errors would silently fall back
+    /// to authority pricing, letting the caller pick between
+    /// "authority clamped against a freshly advanced baseline" and
+    /// "authority clamped against the stale baseline" by choosing
+    /// whether to pass a valid oracle account. That gave the caller a
+    /// full cap-step of control over the effective price on every
+    /// instruction that reads the oracle. The predicate below closes
+    /// that hole.
+    #[inline]
+    fn external_err_allows_authority_fallback(e: &ProgramError) -> bool {
+        let stale_err: ProgramError = PercolatorError::OracleStale.into();
+        let conf_err: ProgramError = PercolatorError::OracleConfTooWide.into();
+        *e == stale_err || *e == conf_err
+    }
+
     pub fn read_price_clamped_with_external(
         config: &mut super::state::MarketConfig,
         external: Result<u64, ProgramError>,
         now_unix_ts: i64,
     ) -> Result<u64, ProgramError> {
-        // Oracle authority is a SEPARATE, WEAKER role than admin. It may
-        // outlive admin burn (Model 1) and serves as a bounded fallback
-        // price source. Rules encoded here:
+        // Oracle authority is a SEPARATE, WEAKER role than admin and may
+        // outlive admin burn (Model 1). It acts as a bounded FALLBACK
+        // price source — used only when the external oracle is genuinely
+        // unusable. External primary, authority fallback:
         //
-        //   external Ok                     -> update baseline, clear stale stamp
-        //   external Err, authority fresh   -> return clamped authority price
-        //                                      (bounded by cap against last baseline;
-        //                                      cap == 0 means full fallback)
-        //   external Err, no/stale authority -> propagate external error
+        //   external Ok                                -> return external
+        //   external Err(OracleStale | ConfTooWide):
+        //       authority fresh                        -> return clamped
+        //                                                 authority price
+        //       else                                   -> propagate external err
+        //   external Err(other)                        -> propagate (caller-
+        //                                                 chosen errors do
+        //                                                 not justify fallback)
         //
-        // When the circuit breaker is active (cap != 0), authority is
-        // still usable — but its effect is bounded by the cap. This keeps
-        // the market priceable under short external hiccups (no freeze
-        // state), while preventing a rogue authority from moving the
-        // effective price more than the cap per push.
+        // Authority is always clamped against last_effective_price_e6
+        // (the last FRESHLY observed external price). That baseline
+        // advances only on successful external reads, so during a long
+        // external outage the authority price stays pinned within one
+        // cap-width of the last known external price. That is a
+        // deliberate "short-outage fallback" semantic, not an
+        // independent long-outage oracle — a sufficiently long external
+        // outage matures the permissionless-resolve stale window
+        // regardless of authority state.
         //
-        // SetOracleAuthority / SetOraclePriceCap / UpdateAdmin (burn)
-        // enforce the invariant that non-Hyperp markets with a
-        // configured authority also have a non-zero cap (see their
-        // guards). If that invariant is ever broken, authority still
-        // works as a full fallback (cap == 0 branch); the cap invariant
-        // is defense-in-depth.
+        // Every successful price-source read (external Ok or authority
+        // fallback Ok) clears first_observed_stale_slot so the
+        // continuous-death window only measures UNINTERRUPTED
+        // staleness.
+        //
+        // SetOracleAuthority / SetOraclePriceCap / UpdateAdmin (burn) /
+        // PushOraclePrice enforce the invariant that non-Hyperp markets
+        // with a configured authority also have a non-zero cap.
         if let Ok(ext_price) = external.as_ref() {
             let clamped_ext = clamp_oracle_price(
                 config.last_effective_price_e6,
@@ -2664,43 +2696,42 @@ pub mod oracle {
                 config.oracle_price_cap_e2bps,
             );
             config.last_effective_price_e6 = clamped_ext;
-            // Any successful external read proves the oracle is currently live,
-            // so reset the permissionless-resolve staleness observation. The
-            // continuous-death window only starts from the first in-window
-            // stale observation, not the last successful read.
             config.first_observed_stale_slot = 0;
+            return Ok(clamped_ext);
+        }
+
+        // External failed. Only fall back to authority on content-based
+        // unusability (stale / conf-too-wide); propagate caller-shaped
+        // errors unchanged.
+        let ext_err = match external {
+            Ok(_) => unreachable!("external Ok handled above"),
+            Err(e) => e,
+        };
+        if !external_err_allows_authority_fallback(&ext_err) {
+            return Err(ext_err);
         }
 
         if let Some(auth_price) =
             read_authority_price(config, now_unix_ts, config.max_staleness_secs)
         {
-            // Authority is fresh. Clamp against the stored baseline so a
-            // rogue authority cannot jump the effective price by more
-            // than the configured cap. When cap == 0, authority returns
-            // the raw stored price (full fallback — acceptable for
-            // deployments that consciously disable the cap).
-            //
-            // Special case: cap != 0 but last_effective_price_e6 == 0
-            // (no external read has ever succeeded since genesis).
-            // clamp_oracle_price treats last_price == 0 as "first-time"
-            // and returns raw_price unclamped, which would let authority
-            // seed a fresh market. That's acceptable because init_market
-            // stamps last_effective_price_e6 with the genesis oracle
-            // read, so this branch is only reachable on Hyperp or
-            // unusual reinit paths.
             let clamped_auth = clamp_oracle_price(
                 config.last_effective_price_e6,
                 auth_price,
                 config.oracle_price_cap_e2bps,
             );
+            // Deliberately DO NOT clear first_observed_stale_slot here.
+            // The stamp tracks continuous unusability of the defined
+            // external oracle, not the authority fallback. Authority
+            // fallback serves individual price reads during the delay
+            // window but doesn't extend the external oracle's life —
+            // clearing the stamp on fallback would block
+            // ResolvePermissionless from ever maturing while authority
+            // remains live, which is the "pinned theater" state the
+            // unified policy fixes.
             return Ok(clamped_auth);
         }
 
-        // No usable authority: use external price (already clamped above)
-        match external {
-            Ok(_) => Ok(config.last_effective_price_e6),
-            Err(e) => Err(e),
-        }
+        Err(ext_err)
     }
 
     // =========================================================================
@@ -2980,7 +3011,7 @@ pub mod processor {
         zc,
     };
     use percolator::{
-        RiskEngine, RiskError, U128, ADL_ONE, MAX_ACCOUNTS,
+        RiskEngine, RiskError, U128, MAX_ACCOUNTS,
     };
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
@@ -6443,6 +6474,18 @@ pub mod processor {
                 if config.oracle_authority != a_authority.key.to_bytes() {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
+                // Defense-in-depth: weaker-authority invariant checked
+                // locally at the dangerous op. Even if a legacy slab or
+                // migration produced a non-Hyperp state with authority
+                // set but oracle_price_cap_e2bps == 0 (which
+                // SetOracleAuthority / SetOraclePriceCap / UpdateAdmin
+                // all reject), PushOraclePrice itself also refuses to
+                // operate in that configuration — authority is ONLY
+                // weaker than admin when its price effect is
+                // cap-bounded.
+                if !is_hyperp && config.oracle_price_cap_e2bps == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
 
                 // Validate price (must be positive)
                 if price_e6 == 0 {
@@ -6510,6 +6553,25 @@ pub mod processor {
                 // Non-Hyperp: clamp against last_effective_price_e6 baseline.
                 // Accrue to boundary using engine's already-stored rate.
                 // Do NOT overwrite funding_rate_bps_per_slot_last before accrual.
+                //
+                // Hyperp stale-recovery policy (deliberate):
+                //   If mark liveness has been lost beyond the catchup
+                //   envelope while funding is active, the catchup_accrue
+                //   call below can return CatchupRequired — the engine
+                //   refuses to jump dt past max_accrual_dt_slots when
+                //   funding is non-zero with OI on both sides, and the
+                //   dedicated CatchupAccrue path cannot close the gap
+                //   either because get_engine_oracle_price_e6 rejects
+                //   the stored stale mark. Such a market is
+                //   RESOLVE-ONLY: recovery is via ResolvePermissionless
+                //   (the mark-staleness branch below, triggered by
+                //   clock.slot - max(mark_ewma_last_slot,
+                //   last_mark_push_slot) exceeding
+                //   permissionless_resolve_stale_slots) or pre-burn
+                //   admin ResolveMarket. Operators who want revivable
+                //   Hyperp markets must ensure authority pushes happen
+                //   frequently enough to stay within the catchup
+                //   envelope while funding is active.
                 if is_hyperp {
                     let push_clock2 = Clock::get()
                         .map_err(|_| ProgramError::UnsupportedSysvar)?;
@@ -6526,19 +6588,24 @@ pub mod processor {
                     ).map_err(map_risk_error)?;
                 }
 
-                // A successful, FRESH authority push proves the market has
-                // a live price source right now, so clear any prior
-                // stale-oracle observation. The freshness check just above
-                // rejects pushes with timestamp older than
-                // max_staleness_secs; combined with the bounded-fallback
-                // semantics in read_price_clamped_with_external (authority
-                // is usable even when external is stale, clamped by cap),
-                // this clear only happens when downstream price reads
-                // would also accept the authority fallback — no more
-                // "fresh push ⇒ clear stamp BUT reads still fail" freeze.
-                if config.first_observed_stale_slot != 0 {
-                    config.first_observed_stale_slot = 0;
-                }
+                // Under the unified stale-oracle policy,
+                // first_observed_stale_slot tracks continuous
+                // unusability of the market's DEFINED oracle (external
+                // Pyth/Chainlink or Hyperp internal mark), not the
+                // optional authority fallback. An authority push does
+                // not prove the defined oracle is live; only a
+                // successful external read (non-Hyperp) or a non-stale
+                // mark (Hyperp, tracked via last_mark_push_slot/
+                // mark_ewma_last_slot) does. Therefore PushOraclePrice
+                // DOES NOT clear first_observed_stale_slot — otherwise
+                // a stale external feed + a live authority would block
+                // permissionless resolve forever, re-introducing the
+                // "pinned theater" state the unified policy fixes.
+                //
+                // Natural clearing still happens: any keeper/trade/
+                // withdraw that submits a FRESH external oracle goes
+                // through read_price_clamped_with_external's Ok branch,
+                // which clears the stamp.
 
                 let clamp_base = config.last_effective_price_e6;
                 let clamped = oracle::clamp_oracle_price(
@@ -7798,69 +7865,71 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
 
-                // Weaker-authority model (Model 1): oracle authority is a
-                // bounded fallback price source that remains valid even
-                // when the external oracle is stale — read_price_clamped
-                // _with_external returns the clamped authority price in
-                // that case. Therefore a FRESH authority is sufficient
-                // proof that the market is priceable, regardless of
-                // external oracle liveness or the cap setting. Block
-                // permissionless resolution when authority is fresh and
-                // clear any pending stale stamp.
+                // Unified stale-oracle policy: the market's CONFIGURED
+                // oracle (external Pyth Pull, Chainlink, or Hyperp
+                // internal mark) is the authoritative liveness signal.
+                // Oracle authority is a bounded short-outage fallback
+                // that fills in individual price reads while external
+                // is momentarily unusable — it does NOT extend the
+                // oracle's life. If the configured oracle is stale past
+                // max_staleness_secs (non-Hyperp) or the mark-staleness
+                // horizon (Hyperp) AND no one clears the observation
+                // within permissionless_resolve_stale_slots, the market
+                // freezes at last_effective_price_e6 and everyone exits
+                // via resolution — regardless of authority state.
                 //
-                // Freshness boundary matches read_authority_price:
-                // `age <= max_staleness_secs` is usable, anything larger
-                // is treated as stale.
-                let authority_is_fresh = config.oracle_authority != [0u8; 32]
-                    && config.authority_timestamp > 0
-                    && {
-                        let age = clock.unix_timestamp
-                            .saturating_sub(config.authority_timestamp);
-                        age >= 0 && (age as u64) <= config.max_staleness_secs
-                    };
-                if authority_is_fresh {
-                    if config.first_observed_stale_slot != 0 {
-                        config.first_observed_stale_slot = 0;
-                        state::write_config(&mut data, &config);
-                    }
-                    return Ok(());
-                }
-                // Authority is stale or absent. Fall through to the
-                // oracle-death observation flow: stamp on first stale
-                // observation, resolve after the configured delay on a
-                // second call that sees continuous staleness.
-
-                // Unified stale-oracle policy: whatever oracle kind is
-                // configured for the market (Pyth Pull, Chainlink, Hyperp
-                // mark, or oracle authority), if it is stale past
-                // max_staleness_secs / the market's mark-staleness
-                // horizon AND no one clears the observation within the
-                // configured delay, the market freezes at the last
-                // effective price and everyone exits via resolution.
+                // This removes the previous carve-out where a fresh
+                // authority would block permissionless resolve. That
+                // carve-out produced "pinned theater": during a long
+                // external outage, authority-clamped price stays within
+                // one cap-width of the stale baseline (because the
+                // authority clamp base is last_effective_price_e6,
+                // which only advances on external Ok), yet resolve was
+                // blocked indefinitely. Dropping the carve-out makes
+                // the defined-oracle-is-stale → market-resolves rule
+                // actually hold.
                 //
                 // Two-phase design: the first stale observation STAMPS
                 // first_observed_stale_slot and returns Ok with NO market
                 // state change. The caller must re-invoke after the
                 // configured delay to actually resolve. This guarantees
-                // the continuous-death window was observed on-chain — a
-                // single observation only proves "stale now", not "stale
+                // continuous unusability over the window — a single
+                // observation only proves "stale now", not "stale
                 // throughout the required window". Returning Ok on the
                 // stamp call is essential (returning Err would roll back
                 // the stamp and leave the market unresolvable).
                 //
-                // Pyth-Pull note: the Pyth-Pull stale-proof is caller-
-                // selected (anyone can submit an old verified
-                // PriceUpdateV2 for the target feed). Under the unified
-                // policy, that's not a vulnerability: during the delay
-                // window, any normal operation (keeper/trade/withdraw)
-                // that submits a FRESH update goes through
-                // read_price_clamped_with_external and clears the stamp.
-                // Markets with expected activity under a short delay are
-                // protected by that natural clearing; operators who want
-                // extra protection tune permissionless_resolve_stale_
-                // slots longer. Low-volume markets that nobody is
-                // willing to keep fresh during the delay window are
-                // effectively dead — resolution is the correct outcome.
+                // CHALLENGE WINDOW (not a cryptographic proof of feed
+                // death for Pyth-Pull): the submitted PriceUpdateV2 is
+                // CALLER-SELECTED. A stale submission proves only that
+                // THIS account is stale, not that no fresher update
+                // exists elsewhere. The two-phase observation is
+                // therefore an on-chain CHALLENGE WINDOW: if no honest
+                // party refreshes the market with a fresh update for
+                // `permissionless_resolve_stale_slots` slots, the
+                // market is deemed undefended and resolves at the last
+                // effective price. This is an ECONOMIC liveness policy
+                // (governed by operator choice of delay and
+                // max_staleness_secs), not an oracle-death proof.
+                // Chainlink markets use a FIXED OCR2 transmissions
+                // account that the caller cannot substitute, so the
+                // stale observation there does constitute a feed-death
+                // signal. Hyperp markets use internal mark staleness
+                // measured in slots (see the Hyperp branch below),
+                // which is similarly non-caller-selectable.
+                //
+                // Operator guidance: for Pyth-Pull markets with few
+                // active users, set `permissionless_resolve_stale_slots`
+                // long enough that honest keepers can plausibly submit
+                // a fresh update during the window, OR configure an
+                // independent oracle authority to keep the market
+                // pricing through read_price_clamped_with_external's
+                // fallback branch (the authority fallback is used when
+                // external is OracleStale/OracleConfTooWide, which
+                // includes the stale PriceUpdateV2 case — a fresh
+                // authority push would make the authority fallback
+                // succeed and clear the stamp via the standard read
+                // path).
                 //
                 // Callers detect resolution via is_resolved() on the slab;
                 // a successful ResolvePermissionless call may or may not

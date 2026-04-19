@@ -13628,82 +13628,32 @@ fn test_attack_authority_push_crank_does_not_ratchet_baseline() {
     );
 }
 
-/// ATTACK: Caller supplies bad oracle to bypass fresh external anchor.
-///
-/// When authority pricing is active and circuit breaker is configured,
-/// the external oracle read MUST succeed. Otherwise the caller could
-/// supply a stale/wrong oracle to skip the baseline refresh, using the
-/// authority price without a fresh external bound.
+/// Gate: caller-shaped external errors (malformed account, wrong owner,
+/// wrong feed, bad data) must NOT trigger authority fallback. The gate
+/// allows fallback only on content-based unusability
+/// (OracleStale / OracleConfTooWide). Verifies the caller can't force
+/// authority pricing by submitting garbage.
 #[test]
 fn test_attack_bad_oracle_with_authority_requires_external_success() {
     program_path();
 
-    // Model-1 (weaker-authority) update: a fresh authority push IS a
-    // valid price source even when the external Pyth account fails to
-    // parse, as long as the circuit-breaker cap is non-zero. The cap
-    // bounds how far authority can move last_effective_price_e6 per
-    // push, so authority is a bounded fallback rather than an unclamped
-    // override. The test now verifies that the bounded-fallback path
-    // actually succeeds — this is the PurpOSEFUL behavior that lets
-    // admins burn while keeping an authority heartbeat alive.
+    // Authority fallback is GATED on content-based external errors
+    // only (OracleStale / OracleConfTooWide). Caller-shaped errors
+    // (malformed account data / wrong owner / wrong feed id) propagate
+    // unchanged — otherwise a caller could force authority pricing by
+    // supplying a garbage oracle account, getting a cap-step of control
+    // over the effective price on any path that reads the oracle
+    // (withdraw, trade, crank, liquidate, settle, convert, catchup).
     //
-    // Crucially, operations still fail if BOTH authority is stale AND
-    // external is broken. That's covered by existing resolve-permissionless
-    // tests (authority stale + external stale → permissionless resolve
-    // matures), so we don't re-verify it here.
+    // This test verifies the gate: with a fresh authority configured
+    // AND a malformed external account, the crank must still FAIL
+    // (not fall back to authority) — because the external parse error
+    // is "caller gave us garbage", not "oracle is dead". A separate
+    // positive test covers the legitimate stale-external +
+    // fresh-authority case (see the "bounded authority fallback on
+    // genuine external staleness" test below).
     let mut env = TestEnv::new();
-
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: encode_init_market_with_limits(
-            &admin.pubkey(),
-            &env.mint,
-            &TEST_FEED_ID,
-            100_000_000_000_000_000_000u128,
-            10_000_000_000_000_000u128,
-            10_000u64, // 1% min cap — circuit breaker active
-        ),
-    };
-
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        env.svm.latest_blockhash(),
-    );
-    // init_market account ordering may mismatch the common helper; skip
-    // detailed setup assertion — the test's intent is the post-crank
-    // bounded-fallback behavior, not init itself.
-    if env.svm.send_transaction(tx).is_err() {
-        // Fall back to the standard init path used by every other test.
-        env.init_market_with_cap(0, 10_000, 0);
-    }
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -13716,13 +13666,14 @@ fn test_attack_bad_oracle_with_authority_requires_external_success() {
 
     env.set_slot(200);
 
-    // Poison the oracle account so external read fails
+    // Poison the oracle account so external read fails with
+    // InvalidAccountData (malformed / caller-shaped error).
     env.svm
         .set_account(
             env.pyth_index,
             Account {
                 lamports: 1_000_000,
-                data: vec![0u8; 10], // Too short for Pyth — will fail
+                data: vec![0u8; 10], // Too short for Pyth
                 owner: PYTH_RECEIVER_PROGRAM_ID,
                 executable: false,
                 rent_epoch: 0,
@@ -13730,13 +13681,18 @@ fn test_attack_bad_oracle_with_authority_requires_external_success() {
         )
         .unwrap();
 
-    // Under Model 1, bounded authority fallback keeps the market
-    // priceable even though external parse fails. Crank should succeed
-    // using the clamped authority price.
-    env.try_crank().expect(
-        "Model 1: bounded authority fallback (cap != 0) must keep the \
-         market priceable when external oracle fails; crank should \
-         succeed using the clamped authority price",
+    // Crank must FAIL — authority fallback does not kick in for
+    // caller-shaped errors. The caller must supply a well-formed
+    // oracle account; authority is for content-based unavailability
+    // (stale / conf-too-wide), not for masking bad submissions.
+    let result = env.try_crank();
+    assert!(
+        result.is_err(),
+        "crank with malformed external oracle account must fail — \
+         authority fallback only applies on content-based errors \
+         (OracleStale / OracleConfTooWide), not on caller-shaped \
+         errors. Got: {:?}",
+        result,
     );
 }
 
