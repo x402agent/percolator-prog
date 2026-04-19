@@ -484,9 +484,14 @@ pub fn encode_init_market_with_force_close(
     feed_id: &[u8; 32],
     force_close_delay_slots: u64,
 ) -> Vec<u8> {
-    // Build base with cap + permissionless resolve (full 82-byte tail)
+    // Build base with cap + permissionless resolve (full 82-byte tail).
+    // Strict hard-timeout model: use a wide permissionless_resolve
+    // _stale_slots (1000) so tests that advance the clock for their
+    // OWN purposes (trade → crank → resolve sequences) stay within the
+    // live window. The 100-slot default that was fine under the old
+    // challenge-window model trips the hard gate mid-sequence.
     let mut data = encode_init_market_with_cap(
-        admin, mint, feed_id, 0, 10_000, 100,
+        admin, mint, feed_id, 0, 10_000, 1000,
     );
     // Truncate default force_close_delay_slots (last 8 bytes), replace with custom
     data.truncate(data.len() - 8);

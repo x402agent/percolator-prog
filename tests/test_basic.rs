@@ -4400,7 +4400,12 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-        data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
+        // Strict hard-timeout model: permissionless_resolve_stale_slots is the
+        // hard upper bound on "slots since last accepted oracle read before
+        // market is dead". 100 was tight for this test's 60+ slot dust-wash
+        // sequence + the preceding trade gap; bump to 500 so the test stays
+        // within the live window.
+        data.extend_from_slice(&500u64.to_le_bytes()); // permissionless_resolve = 500
         // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_k_bps (2x)

@@ -1176,7 +1176,12 @@ fn test_governance_free_full_lifecycle() {
     env.init_market_with_funding(
         0,      // invert=0 (direct, e.g., BTC/USD)
         10_000, // min_oracle_price_cap_e2bps = 1% per slot
-        100,    // permissionless_resolve_stale_slots
+        // permissionless_resolve_stale_slots: bumped to 1000 under the
+        // strict hard-timeout model so the test's natural slot
+        // advances (init → 200 → 300 → 600) stay within the live
+        // window. The original 100 tripped the gate mid-sequence
+        // under strict policy.
+        1000,
         200,    // funding_horizon_slots (custom, not default 500)
         200,    // funding_k_bps (2x, not default 1x)
         1000,   // funding_max_premium_bps (10%, not default 5%)
@@ -1257,7 +1262,7 @@ fn test_governance_free_full_lifecycle_inverted() {
     env.init_market_with_funding(
         1,      // invert=1
         10_000, // 1% cap
-        100,    // permissionless resolve
+        1000,   // permissionless resolve (strict model: wider window)
         300,    // custom horizon
         150,    // 1.5x k
         800,    // 8% max premium
@@ -1404,7 +1409,7 @@ fn test_resolve_permissionless_inverted_settlement_price() {
 fn test_resolve_permissionless_inverted_with_positions() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(1, 10_000, 50);
+    env.init_market_with_cap(1, 10_000, 1000);
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -2159,8 +2164,13 @@ fn test_resolve_permissionless_treats_conf_too_wide_as_stampable() {
 fn test_keeper_crank_succeeds_after_long_idle_via_catchup_accrue() {
     program_path();
     let mut env = TestEnv::new();
-    // permissionless_resolve_stale_slots=50_000, max_accrual_dt=100_000
-    env.init_market_with_cap(0, 10_000, 50_000);
+    // This test exercises the accrual-envelope recovery, not
+    // permissionless resolution. Disable the hard-timeout feature
+    // entirely (perm_resolve_stale_slots=0) so the 250_000-slot idle
+    // period doesn't trip the stale gate — the engine-level constraint
+    // perm_resolve_stale_slots <= max_accrual_dt_slots (100_000) makes
+    // it impossible to set a window wider than the idle period.
+    env.init_market_with_cap(0, 10_000, 0);
     env.crank(); // engine.current_slot ~ 0-100
 
     // Idle for 250_000 slots — well past the 100_000 accrual envelope,
@@ -2188,8 +2198,12 @@ fn test_keeper_crank_succeeds_after_long_idle_via_catchup_accrue() {
 fn test_catchup_accrue_commits_progress_past_in_line_cap() {
     program_path();
     let mut env = TestEnv::new();
-    // max_accrual_dt=100_000, CATCHUP_CHUNKS_MAX=20 → 2M slots per call.
-    env.init_market_with_cap(0, 10_000, 50_000);
+    // Disable permissionless resolution for this test — the idle
+    // period (3M slots) exceeds the engine-level constraint
+    // perm_resolve_stale_slots <= max_accrual_dt_slots (100_000).
+    // The scenario under test is the accrual-envelope recovery, not
+    // the stale-oracle resolve.
+    env.init_market_with_cap(0, 10_000, 0);
     env.crank(); // seed engine state
 
     // Advance far beyond CATCHUP_CHUNKS_MAX × max_dt. 3M slots > 2M cap.
@@ -2359,21 +2373,102 @@ fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
         unix_timestamp: 200_000,
         ..Clock::default()
     });
-    // Refresh the authority push right before the resolve so the
-    // authority is UNAMBIGUOUSLY fresh at call time — this is the
-    // scenario that used to block resolve under the old carve-out.
-    env.try_push_oracle_price(&admin, 138_100_000, 199_999).unwrap();
 
-    // Single-call resolve under the strict model. Fresh authority
-    // no longer blocks — last_good_oracle_slot has not been advanced
-    // by a successful external read for >= N slots, so the market
-    // is stale.
+    // Under the strict model, even an earlier-set authority cannot
+    // save the market. Once clock.slot - last_good_oracle_slot >= N,
+    // the market is terminally dead. ResolvePermissionless succeeds
+    // in a single call regardless of whether an authority was ever
+    // configured. (Attempting to push a fresh authority price at
+    // this point would ALSO be rejected by PushOraclePrice's own
+    // hard-timeout gate — the strict model closes every revival
+    // channel.)
     env.try_resolve_permissionless_once()
         .expect("strict model: stale timer matured, resolve must succeed");
     assert!(
         env.is_market_resolved(),
-        "fresh authority MUST NOT block permissionless resolve once \
-         last_good_oracle_slot has been idle past the delay",
+        "prior authority configuration MUST NOT block permissionless \
+         resolve once last_good_oracle_slot has been idle past the delay",
+    );
+}
+
+/// Strict hard-timeout regression: after the window matures, admin
+/// ResolveMarket settles at engine.last_oracle_price via the same
+/// Degenerate arm ResolvePermissionless uses — NOT at
+/// authority_price_e6. This closes the admin-revive channel where a
+/// rogue admin could PushOraclePrice past maturity and then settle at
+/// the pushed price. (PushOraclePrice itself now also rejects past
+/// maturity, but the admin-resolve Degenerate path is the safety net.)
+#[test]
+fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Small perm window so we can warp past it quickly.
+    env.init_market_with_cap(0, 10_000, 50);
+    env.crank(); // seed engine.last_oracle_price via successful read
+
+    // Record engine.last_oracle_price as the expected settlement anchor.
+    // Use the read_engine_last_price helper by reading the slab directly:
+    // the engine struct starts at ENGINE_OFF = 472 and last_oracle_price
+    // is an early field. We only need the value shape; read it via the
+    // authority_price_e6 post-resolve assertion indirectly.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Warp clock far past the maturity window.
+    env.svm.set_sysvar(&Clock {
+        slot: 10_000,
+        unix_timestamp: 10_000,
+        ..Clock::default()
+    });
+
+    // Admin ResolveMarket must succeed via the Degenerate branch —
+    // authority_price_e6 == 0 (never pushed), so the old path would
+    // return InvalidAccountData, but the new Degenerate fast-path
+    // runs first and succeeds at engine.last_oracle_price.
+    env.try_resolve_market(&admin)
+        .expect("admin ResolveMarket past maturity must succeed via Degenerate arm");
+    assert!(env.is_market_resolved(), "market resolved");
+
+    // Settlement anchor: engine.last_oracle_price (seeded by crank at
+    // init, = 138_000_000 by TestEnv fixture).
+    let settlement = env.read_authority_price();
+    assert_eq!(
+        settlement, 138_000_000,
+        "matured admin resolve must settle at engine.last_oracle_price \
+         (the last FRESHLY accrued price), not at a later authority push",
+    );
+}
+
+/// Strict hard-timeout regression: DepositCollateral must reject once
+/// the market has matured, even before the market is formally resolved.
+/// Users should exit via resolved-market close paths, not feed more
+/// collateral into a dead market.
+#[test]
+fn test_deposit_rejected_after_hard_timeout_matures() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 50);
+    env.crank();
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    // Seed initial deposit while the market is still live.
+    env.deposit(&user, user_idx, 100_000_000);
+
+    // Warp past the hard-timeout window.
+    env.svm.set_sysvar(&Clock {
+        slot: 10_000,
+        unix_timestamp: 10_000,
+        ..Clock::default()
+    });
+
+    // Deposit must reject before moving tokens into the dead market.
+    let err = env
+        .try_deposit(&user, user_idx, 50_000_000)
+        .expect_err("deposit past hard timeout must reject");
+    assert!(
+        err.contains("custom program error: 0x6"), // OracleStale = 6
+        "expected OracleStale (hard-timeout gate), got: {}",
+        err,
     );
 }
 

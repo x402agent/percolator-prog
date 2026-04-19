@@ -3097,10 +3097,20 @@ pub mod processor {
         clock_slot: u64,
         slab_data: &mut [u8],
     ) -> Result<u64, ProgramError> {
+        // Hard-timeout gate: once `clock.slot - last_good_oracle_slot
+        // >= permissionless_resolve_stale_slots`, the market is
+        // TERMINALLY dead. No price read succeeds, even if the caller
+        // now submits a fresh external oracle update. The only
+        // allowed path forward is ResolvePermissionless. This
+        // enforces "after N slots, dead means dead" uniformly — no
+        // late keeper revival, no authority-fallback drift.
+        if oracle::permissionless_stale_matured(config, clock_slot) {
+            return Err(PercolatorError::OracleStale.into());
+        }
+
         // Single Pyth/Chainlink parse shared between the "did the external read
         // succeed?" signal (used to stamp last_good_oracle_slot) and the clamped
-        // price computation. Previously this called read_engine_price_e6 twice:
-        // once directly, then again inside read_price_clamped.
+        // price computation.
         let external = oracle::read_engine_price_e6(
             a_oracle,
             &config.index_feed_id,
@@ -3111,20 +3121,6 @@ pub mod processor {
             config.unit_scale,
         );
         let external_ok = external.is_ok();
-
-        // Hard-timeout gate: if external is NOT usable right now AND
-        // the hard-timeout window has matured, reject. A FRESH external
-        // read proves the oracle is live and clears any matured-stale
-        // condition — only caller paths trying to coast through
-        // authority fallback after the window matured are blocked
-        // here. This closes the "keep trading via authority fallback
-        // after N slots" drift channel while still allowing fresh
-        // keeper updates to revive an idle market.
-        if !external_ok
-            && oracle::permissionless_stale_matured(config, clock_slot)
-        {
-            return Err(PercolatorError::OracleStale.into());
-        }
 
         let price = oracle::read_price_clamped_with_external(
             config, external, clock_unix_ts,
@@ -4507,6 +4503,17 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
+
+                // Hard-timeout gate: once the market has been oracle-stale
+                // for >= permissionless_resolve_stale_slots, it is
+                // terminally dead. No live mutations — including
+                // no-oracle deposits — should proceed. Users must exit
+                // via ResolvePermissionless + resolved-market close
+                // paths. Rejecting BEFORE the SPL transfer so funds
+                // are not moved into a dead market.
+                if oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
 
                 // Reject misaligned deposits — dust would be silently donated
                 let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
@@ -6050,6 +6057,13 @@ pub mod processor {
                 )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+                let clock = Clock::from_account_info(a_clock)?;
+                // Hard-timeout gate: reject before moving tokens into a
+                // terminally-stale market.
+                if oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+
                 // Reject misaligned deposits — dust would be silently donated
                 let (_units_check, dust_check) = crate::units::base_to_units(amount, config.unit_scale);
                 if dust_check != 0 {
@@ -6061,8 +6075,6 @@ pub mod processor {
 
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
-
-                let clock = Clock::from_account_info(a_clock)?;
                 let engine = zc::engine_mut(&mut data)?;
                 // No-oracle path: cap at last_market_slot. top_up_insurance
                 // _fund self-advances current_slot; unbounded advance would
@@ -6119,17 +6131,20 @@ pub mod processor {
                 //       also enforced at SetOracleAuthority /
                 //       SetOraclePriceCap / InitMarket (defense in depth).
                 //
-                // Unified stale-oracle recovery: once admin is burned,
-                // any market (Pyth Pull / Chainlink / Hyperp) freezes at
-                // the last effective price if its oracle goes stale past
-                // the configured delay, and anyone can resolve it via
-                // ResolvePermissionless. There is no oracle-kind-specific
-                // authority requirement at burn time — the caller-
-                // selected stale-proof concern on Pyth-Pull is addressed
-                // by the two-phase observation window, during which any
-                // fresh keeper submission clears the stamp. Operators
-                // tune permissionless_resolve_stale_slots to suit their
-                // expected activity level.
+                // Unified hard-timeout stale-oracle recovery: once admin
+                // is burned, any market (Pyth Pull / Chainlink / Hyperp)
+                // becomes TERMINALLY dead once
+                //   clock.slot - last_good_oracle_slot (non-Hyperp) or
+                //   clock.slot - max(mark_ewma_last_slot,
+                //                    last_mark_push_slot) (Hyperp)
+                // reaches permissionless_resolve_stale_slots. Anyone
+                // can then resolve via ResolvePermissionless at
+                // engine.last_oracle_price. All live mutators reject
+                // past the hard timeout (no deposits, no top-ups, no
+                // pushes, no trades, no config updates), so users can
+                // only exit via resolved-market close paths. Operators
+                // pick permissionless_resolve_stale_slots to match
+                // their market's expected activity.
                 if new_admin.to_bytes() == [0u8; 32] {
                     let config = state::read_config(&data);
 
@@ -6360,8 +6375,17 @@ pub mod processor {
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
 
-                // Flush Hyperp index WITHOUT staleness check (admin recovery path).
                 let clock = Clock::from_account_info(a_clock)?;
+                // Hard-timeout gate: UpdateConfig must not mutate a
+                // terminally-stale market. Admin has no "emergency
+                // reconfigure" path past the hard timeout — the market
+                // is dead, users exit via ResolvePermissionless.
+                if oracle::permissionless_stale_matured(&config, clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+                // Flush Hyperp index WITHOUT external staleness check
+                // (admin recovery path; the hard-timeout gate above
+                // handles the terminal case).
                 if oracle::is_hyperp_mode(&config) {
                     let prev_index = config.last_effective_price_e6;
                     let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
@@ -6529,10 +6553,25 @@ pub mod processor {
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
-                // Hyperp: flush index WITHOUT staleness check.
+                // Hard-timeout gate (applies to both Hyperp and non-Hyperp):
+                // once clock.slot - last_live_slot >=
+                // permissionless_resolve_stale_slots, the market is
+                // TERMINALLY dead. PushOraclePrice would otherwise
+                // write mark_ewma_last_slot / last_mark_push_slot
+                // (Hyperp) or authority_timestamp (non-Hyperp),
+                // either of which can reset the timer and revive a
+                // market that users are already entitled to exit
+                // from. Reject before any mutation. Run it early,
+                // before the Hyperp pre-push index flush, since even
+                // that flush is a live-market price mutation.
+                let push_clock = Clock::get()
+                    .map_err(|_| ProgramError::UnsupportedSysvar)?;
+                if oracle::permissionless_stale_matured(&config, push_clock.slot) {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+                // Hyperp: flush index WITHOUT external staleness check
+                // (the hard-timeout gate above covers mark staleness).
                 if is_hyperp {
-                    let push_clock = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     let prev_index = config.last_effective_price_e6;
                     let mark = if config.mark_ewma_e6 > 0 { config.mark_ewma_e6 } else { config.authority_price_e6 };
                     if mark > 0 && prev_index > 0 {
@@ -6599,8 +6638,6 @@ pub mod processor {
                 // pushes keeps the "successful push ⇒ market priceable"
                 // invariant that the stale-stamp clear below relies on.
                 if !is_hyperp {
-                    let push_clock = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     // Strict monotonicity: reject equal timestamps
                     if config.authority_timestamp != 0
                         && timestamp <= config.authority_timestamp
@@ -6652,17 +6689,15 @@ pub mod processor {
                 //   frequently enough to stay within the catchup
                 //   envelope while funding is active.
                 if is_hyperp {
-                    let push_clock2 = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     let engine = zc::engine_mut(&mut data)?;
                     // Pre-chunk catch-up so the accrue below sees
                     // dt ≤ max_accrual_dt_slots (Finding 4).
                     catchup_accrue(
-                        engine, push_clock2.slot, config.last_effective_price_e6,
+                        engine, push_clock.slot, config.last_effective_price_e6,
                         funding_rate_e9,
                     )?;
                     engine.accrue_market_to(
-                        push_clock2.slot, config.last_effective_price_e6,
+                        push_clock.slot, config.last_effective_price_e6,
                         funding_rate_e9,
                     ).map_err(map_risk_error)?;
                 }
@@ -6694,8 +6729,6 @@ pub mod processor {
                 );
                 config.authority_price_e6 = clamped;
                 if is_hyperp {
-                    let push_clock = Clock::get()
-                        .map_err(|_| ProgramError::UnsupportedSysvar)?;
                     config.last_mark_push_slot = push_clock.slot as u128;
                     // Admin push feeds through EWMA like trades do.
                     // Direct overwrite was removed — it would let a single push
@@ -6850,14 +6883,43 @@ pub mod processor {
                 let mut config = state::read_config(&data);
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+
+                // Hard-timeout terminal path: once the market has been
+                // oracle-stale for >= permissionless_resolve_stale_slots,
+                // admin no longer settles at authority_price_e6 / mark
+                // EWMA — the market resolves at engine.last_oracle_price
+                // via the same Degenerate arm used by
+                // ResolvePermissionless. This unifies the settlement
+                // rule across both paths so admin can't revive the
+                // market by pushing a fresh authority price after
+                // maturity and then resolving at that pushed value.
+                let clock_gate = Clock::from_account_info(a_clock)?;
+                if oracle::permissionless_stale_matured(&config, clock_gate.slot) {
+                    let engine = zc::engine_mut(&mut data)?;
+                    let p_last = engine.last_oracle_price;
+                    if p_last == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    engine.resolve_market_not_atomic(
+                        percolator::ResolveMode::Degenerate,
+                        p_last,
+                        p_last,
+                        clock_gate.slot,
+                        0,
+                    ).map_err(map_risk_error)?;
+                    config.authority_price_e6 = p_last;
+                    config.first_observed_stale_slot = 0;
+                    state::write_config(&mut data, &config);
+                    return Ok(());
+                }
+
                 if config.authority_price_e6 == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 // Non-Hyperp: require the settlement push to be fresh.
                 // Prevents parking an old price in state and resolving later.
                 if !oracle::is_hyperp_mode(&config) {
-                    let clock_fresh = Clock::from_account_info(a_clock)?;
-                    let push_age = clock_fresh.unix_timestamp
+                    let push_age = clock_gate.unix_timestamp
                         .saturating_sub(config.authority_timestamp);
                     if push_age < 0 || push_age as u64 > config.max_staleness_secs {
                         return Err(PercolatorError::OracleStale.into());
@@ -7804,6 +7866,11 @@ pub mod processor {
                         &Pubkey::new_from_array(cfg.vault_pubkey))?;
                     verify_token_account(a_user_ata, a_user.key, &mint)?;
                     let clock = Clock::from_account_info(a_clock)?;
+                    // Hard-timeout gate: no fee-credit deposits into a
+                    // terminally-stale market. Users exit via resolve.
+                    if oracle::permissionless_stale_matured(&cfg, clock.slot) {
+                        return Err(PercolatorError::OracleStale.into());
+                    }
 
                     let engine = zc::engine_mut(&mut data)?;
                     check_idx(engine, user_idx)?;
