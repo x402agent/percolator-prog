@@ -6009,14 +6009,17 @@ pub mod processor {
                 //       also enforced at SetOracleAuthority /
                 //       SetOraclePriceCap / InitMarket (defense in depth).
                 //
-                // Trade-off for Pyth-Pull markets: ResolvePermissionless
-                // rejects Pyth-Pull without a configured authority (a
-                // caller-selected stale PriceUpdateV2 is an unsound proof
-                // of feed death). Operators deploying a governance-free
-                // Pyth-Pull market MUST configure an authority heartbeat
-                // before burning admin; otherwise the market can only be
-                // recovered via pre-burn admin ResolveMarket. Chainlink
-                // and Hyperp markets do not require an authority to burn.
+                // Unified stale-oracle recovery: once admin is burned,
+                // any market (Pyth Pull / Chainlink / Hyperp) freezes at
+                // the last effective price if its oracle goes stale past
+                // the configured delay, and anyone can resolve it via
+                // ResolvePermissionless. There is no oracle-kind-specific
+                // authority requirement at burn time — the caller-
+                // selected stale-proof concern on Pyth-Pull is addressed
+                // by the two-phase observation window, during which any
+                // fresh keeper submission clears the stamp. Operators
+                // tune permissionless_resolve_stale_slots to suit their
+                // expected activity level.
                 if new_admin.to_bytes() == [0u8; 32] {
                     let config = state::read_config(&data);
 
@@ -7827,54 +7830,43 @@ pub mod processor {
                 // observation, resolve after the configured delay on a
                 // second call that sees continuous staleness.
 
-                // Verify oracle is actually stale RIGHT NOW by trying to read it.
-                // Only OracleStale / OracleConfTooWide prove the oracle is
-                // unusable. Other errors (wrong account, bad data) don't prove
-                // death — they could be an attacker passing garbage.
+                // Unified stale-oracle policy: whatever oracle kind is
+                // configured for the market (Pyth Pull, Chainlink, Hyperp
+                // mark, or oracle authority), if it is stale past
+                // max_staleness_secs / the market's mark-staleness
+                // horizon AND no one clears the observation within the
+                // configured delay, the market freezes at the last
+                // effective price and everyone exits via resolution.
                 //
-                // Two-phase design (non-Hyperp): the first stale observation
-                // STAMPS first_observed_stale_slot and returns Ok with NO
-                // market state change. The caller must re-invoke after the
-                // configured delay to actually resolve. This guarantees the
-                // continuous-death window was observed on-chain (a single
-                // observation only proves "stale now", not "stale throughout
-                // the required window"). Returning Ok on the stamp call is
-                // essential — returning Err would roll back the stamp and
-                // leave the market unresolvable.
+                // Two-phase design: the first stale observation STAMPS
+                // first_observed_stale_slot and returns Ok with NO market
+                // state change. The caller must re-invoke after the
+                // configured delay to actually resolve. This guarantees
+                // the continuous-death window was observed on-chain — a
+                // single observation only proves "stale now", not "stale
+                // throughout the required window". Returning Ok on the
+                // stamp call is essential (returning Err would roll back
+                // the stamp and leave the market unresolvable).
                 //
-                // Callers detect resolution via is_resolved() on the slab; a
-                // successful ResolvePermissionless call may or may not have
-                // caused resolution depending on phase.
+                // Pyth-Pull note: the Pyth-Pull stale-proof is caller-
+                // selected (anyone can submit an old verified
+                // PriceUpdateV2 for the target feed). Under the unified
+                // policy, that's not a vulnerability: during the delay
+                // window, any normal operation (keeper/trade/withdraw)
+                // that submits a FRESH update goes through
+                // read_price_clamped_with_external and clears the stamp.
+                // Markets with expected activity under a short delay are
+                // protected by that natural clearing; operators who want
+                // extra protection tune permissionless_resolve_stale_
+                // slots longer. Low-volume markets that nobody is
+                // willing to keep fresh during the delay window are
+                // effectively dead — resolution is the correct outcome.
+                //
+                // Callers detect resolution via is_resolved() on the slab;
+                // a successful ResolvePermissionless call may or may not
+                // have caused resolution depending on phase.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 if !is_hyperp {
-                    // Pyth Pull (PriceUpdateV2) is CALLER-SELECTED: a stale
-                    // submission proves only that THIS submitted account
-                    // is stale, not that no fresh update exists elsewhere.
-                    // An attacker could submit an old verified
-                    // PriceUpdateV2 with the right feed_id, get
-                    // OracleStale, stamp first_observed_stale_slot, wait
-                    // the delay, and terminally resolve a live market.
-                    //
-                    // Mitigation: require an oracle AUTHORITY for Pyth
-                    // Pull permissionless resolution. A configured
-                    // authority acts as the external liveness beacon —
-                    // the earlier authority-fresh branch returns Ok
-                    // without stamping when the authority has pushed
-                    // recently, so a stale-Pyth attack is only reachable
-                    // once the authority has ALSO gone silent. Without
-                    // an authority, a stale Pyth account is the sole
-                    // "proof" of feed death, which is unsound.
-                    //
-                    // Pyth-pull markets that want governance-free
-                    // recovery MUST therefore configure an authority
-                    // (SetOracleAuthority before burning admin).
-                    // Markets without authority can still recover via
-                    // admin ResolveMarket before admin is burned.
-                    let pyth_pull = *a_oracle.owner == oracle::PYTH_RECEIVER_PROGRAM_ID;
-                    let authority_configured = config.oracle_authority != [0u8; 32];
-                    if pyth_pull && !authority_configured {
-                        return Err(PercolatorError::InvalidConfigParam.into());
-                    }
                     let oracle_result = oracle::read_engine_price_e6(
                         a_oracle, &config.index_feed_id,
                         clock.unix_timestamp, config.max_staleness_secs,

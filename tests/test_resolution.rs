@@ -2392,3 +2392,60 @@ fn test_resolve_permissionless_fresh_authority_does_not_stamp() {
     );
 }
 
+/// Unified stale-oracle policy regression: a Pyth-Pull market with NO
+/// oracle authority configured can still be resolved permissionlessly
+/// once the Pyth feed goes stale past the configured delay. The prior
+/// policy rejected this path (Pyth-Pull needed an authority heartbeat
+/// to prove feed death); the unified policy says any stale oracle +
+/// no clear within delay = everyone exits at the last price. This test
+/// documents the simplified behavior: if the oracle you configured is
+/// stale, the market freezes and resolves. Full stop, no oracle-kind-
+/// specific carve-outs.
+#[test]
+fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Pyth-Pull market (TEST_FEED_ID resolves to the Pyth-owned fixture
+    // account created by TestEnv::new). min_cap=10_000 to satisfy other
+    // invariants; permissionless_resolve_stale_slots=50 so the test
+    // doesn't need to warp far.
+    env.init_market_with_cap(0, 10_000, 50);
+
+    // No SetOracleAuthority call — the market has oracle_authority==0.
+    // Under the old policy this would make ResolvePermissionless reject
+    // on Pyth-Pull; under the unified policy it's irrelevant. Read via
+    // the config helper so we don't depend on hard-coded field offsets.
+    {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        let config = percolator_prog::state::read_config(&slab.data);
+        assert_eq!(
+            config.oracle_authority, [0u8; 32],
+            "precondition: market has no oracle authority configured",
+        );
+    }
+
+    // Kill the Pyth feed by advancing the clock far beyond the
+    // fixture's published_time (TestEnv's fixture uses clock slot 0;
+    // max_staleness_secs default is 86_400). Moving unix_timestamp by
+    // 200_000 seconds guarantees a stale observation.
+    env.svm.set_sysvar(&Clock {
+        slot: 500,
+        unix_timestamp: 200_000,
+        ..Clock::default()
+    });
+
+    // Unified policy: stale feed + no authority + delay elapsed →
+    // resolution succeeds.
+    env.try_resolve_permissionless().expect(
+        "Unified stale-oracle policy: a stale Pyth-Pull market with no \
+         oracle authority MUST resolve permissionlessly once the stale \
+         window has matured. Under the previous policy this rejected \
+         because Pyth-Pull required an authority heartbeat; the unified \
+         policy removes that carve-out.",
+    );
+    assert!(
+        env.is_market_resolved(),
+        "market must be resolved after stale window matures",
+    );
+}
+
