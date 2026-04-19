@@ -475,8 +475,8 @@ fn test_limited_insurance_withdraw_default_min_floor_respects_unit_scale() {
 
     // Sanity-check resolved config state for default-policy path.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const UNIT_SCALE_OFF: usize = 180; // header(72) + unit_scale(108)
-    const AUTH_TS_OFF: usize = 368; // header(72) + authority_timestamp(296)
+    const UNIT_SCALE_OFF: usize = 244; // header(136) + unit_scale(108)
+    const AUTH_TS_OFF: usize = 432; // header(136) + authority_timestamp(296)
     let unit_scale = u32::from_le_bytes(
         slab_data[UNIT_SCALE_OFF..UNIT_SCALE_OFF + 4]
             .try_into()

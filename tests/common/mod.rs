@@ -19,7 +19,7 @@ pub use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-pub const SLAB_LEN: usize = 1525592; // v12.18.x: adds RiskParams::min_funding_lifetime_slots (+8 bytes)
+pub const SLAB_LEN: usize = 1525656; // 4-way-auth: SlabHeader +64 (insurance_authority + close_authority)
 pub const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -1776,7 +1776,7 @@ impl TestEnv {
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 472, num_used_accounts at engine offset 1224
-        pub const NUM_USED_OFFSET: usize = 472 + 1240;
+        pub const NUM_USED_OFFSET: usize = 536 + 1240;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -1853,7 +1853,7 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 440, offset of RiskEngine.used = 576 (after insurance_floor)
         // Bitmap is [u64; 64] at offset 520 + 608 = 1016
-        pub const BITMAP_OFFSET: usize = 472 + 728;
+        pub const BITMAP_OFFSET: usize = 536 + 728;
         let word_idx = (idx as usize) >> 6; // idx / 64
         let bit_idx = (idx as usize) & 63; // idx % 64
         let word_offset = BITMAP_OFFSET + word_idx * 8;
@@ -1873,7 +1873,7 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 472, accounts array at offset 9376 within RiskEngine
         // Account size = 280 bytes, capital at offset 8 within Account (after account_id u64)
-        pub const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0; // After account_id (u64)
         let account_offset =
@@ -1895,7 +1895,7 @@ impl TestEnv {
     /// v12.15: position_basis_q is i128 (not I256), at offset 64 in Account.
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ENGINE: usize = 472;
+        pub const ENGINE: usize = 536;
         pub const ACCOUNTS_OFFSET: usize = ENGINE + 17632;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PBQ: usize = 56;       // position_basis_q: i128 (16 bytes)
@@ -2509,6 +2509,19 @@ pub fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
     data
 }
 
+// 4-way authority split constants (must match src/percolator.rs)
+pub const AUTHORITY_ADMIN: u8 = 0;
+pub const AUTHORITY_ORACLE: u8 = 1;
+pub const AUTHORITY_INSURANCE: u8 = 2;
+pub const AUTHORITY_CLOSE: u8 = 3;
+
+pub fn encode_update_authority(kind: u8, new_pubkey: &Pubkey) -> Vec<u8> {
+    let mut data = vec![32u8]; // Tag 32: UpdateAuthority
+    data.push(kind);
+    data.extend_from_slice(new_pubkey.as_ref());
+    data
+}
+
 pub fn encode_push_oracle_price(price_e6: u64, timestamp: i64) -> Vec<u8> {
     let mut data = vec![17u8]; // Tag 17: PushOraclePrice
     data.extend_from_slice(&price_e6.to_le_bytes());
@@ -2575,6 +2588,52 @@ impl TestEnv {
             &[cu_ix(), ix],
             Some(&signer.pubkey()),
             &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Try UpdateAuthority (tag 32): 4-way split.
+    ///
+    /// Accounts: [current_authority, new_authority, slab]
+    /// - When new_kp is Some, both keys sign (two-sig handover).
+    /// - When new_kp is None, the instruction is a burn (new_pubkey
+    ///   defaults to zero); only current_authority signs.
+    pub fn try_update_authority(
+        &mut self,
+        current: &Keypair,
+        kind: u8,
+        new_kp: Option<&Keypair>,
+    ) -> Result<(), String> {
+        let new_pubkey = match new_kp {
+            Some(kp) => kp.pubkey(),
+            None => Pubkey::default(),
+        };
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(current.pubkey(), true),
+                AccountMeta::new(new_pubkey, new_kp.is_some()),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_update_authority(kind, &new_pubkey),
+        };
+        let signers: Vec<&Keypair> = if let Some(kp) = new_kp {
+            if kp.pubkey() == current.pubkey() {
+                vec![current]
+            } else {
+                vec![current, kp]
+            }
+        } else {
+            vec![current]
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&current.pubkey()),
+            &signers,
             self.svm.latest_blockhash(),
         );
         self.svm
@@ -3000,7 +3059,7 @@ impl TestEnv {
         // Working back: c_tot(184) - last_crank(8) - ready_pad(8) - h_den(16) - h_num(16) - resolved_slot(8) - resolved_price(8)
         // = 184 - 64 = 120. resolved_price at ENGINE+120.
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        let off = 472 + 240; // ENGINE_OFF + resolved_price offset
+        let off = 536 + 240; // ENGINE_OFF + resolved_price offset
         let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
         rp > 0
     }
@@ -3011,7 +3070,7 @@ impl TestEnv {
         // ENGINE_OFF = 440, InsuranceFund.balance is at offset 16 within engine
         // (vault is 16 bytes at 0, insurance_fund starts at 16)
         // InsuranceFund { balance: U128, ... } - balance is first field
-        pub const INSURANCE_OFFSET: usize = 472 + 16;
+        pub const INSURANCE_OFFSET: usize = 536 + 16;
         u128::from_le_bytes(
             slab_account.data[INSURANCE_OFFSET..INSURANCE_OFFSET + 16]
                 .try_into()
@@ -3894,7 +3953,7 @@ impl TradeCpiTestEnv {
 
     pub fn is_market_resolved(&self) -> bool {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        let off = 472 + 240; // ENGINE_OFF + resolved_price offset (BPF)
+        let off = 536 + 240; // ENGINE_OFF + resolved_price offset (BPF)
         let rp = u64::from_le_bytes(d[off..off+8].try_into().unwrap());
         rp > 0
     }
@@ -3904,7 +3963,7 @@ impl TradeCpiTestEnv {
         // ENGINE_OFF = 440
         // RiskEngine layout: vault(U128=16) + insurance_fund(balance(U128=16) + fee_revenue(16))
         // So insurance_fund.balance is at ENGINE_OFF + 16 = 408
-        pub const INSURANCE_BALANCE_OFFSET: usize = 472 + 16;
+        pub const INSURANCE_BALANCE_OFFSET: usize = 536 + 16;
         u128::from_le_bytes(
             slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET + 16]
                 .try_into()
@@ -3915,7 +3974,7 @@ impl TradeCpiTestEnv {
     /// Read effective position (v12.15: position_basis_q is i128, not I256)
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ENGINE: usize = 472;
+        pub const ENGINE: usize = 536;
         pub const ACCOUNTS_OFFSET: usize = ENGINE + 17632;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PBQ: usize = 56;
@@ -3986,9 +4045,9 @@ impl TradeCpiTestEnv {
 
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF (472) + num_used_accounts offset (1240, +8 for v12.18.x
-        // min_funding_lifetime_slots) = 1712.
-        u16::from_le_bytes(slab_data[1712..1714].try_into().unwrap())
+        // ENGINE_OFF (536, after 4-way-auth SlabHeader +64) +
+        // num_used_accounts offset (1240) = 1776.
+        u16::from_le_bytes(slab_data[1776..1778].try_into().unwrap())
     }
 
     /// Read pnl_pos_tot aggregate from slab
@@ -3996,7 +4055,7 @@ impl TradeCpiTestEnv {
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // ENGINE_OFF = 472, pnl_pos_tot at engine offset 368 (after c_tot at 352)
-        pub const PNL_POS_TOT_OFFSET: usize = 472 + 368;
+        pub const PNL_POS_TOT_OFFSET: usize = 536 + 368;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -4008,7 +4067,7 @@ impl TradeCpiTestEnv {
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // c_tot is at offset 264 within RiskEngine (16 bytes before pnl_pos_tot)
-        pub const C_TOT_OFFSET: usize = 472 + 352;
+        pub const C_TOT_OFFSET: usize = 536 + 352;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -4020,7 +4079,7 @@ impl TradeCpiTestEnv {
     pub fn read_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         // vault is at offset 0 within RiskEngine
-        pub const VAULT_OFFSET: usize = 472;
+        pub const VAULT_OFFSET: usize = 536;
         u128::from_le_bytes(
             slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
                 .try_into()
@@ -4038,7 +4097,7 @@ impl TradeCpiTestEnv {
         //   pnl: i128 (16), offset 24
         //   reserved_pnl: u128 (16), offset 40
         //   position_basis_q: i128 (16), offset 56
-        pub const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
@@ -4219,7 +4278,7 @@ impl TradeCpiTestEnv {
 
     pub fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0;
         let account_off =
@@ -4483,7 +4542,7 @@ impl TestEnv {
     /// Read c_tot aggregate from slab
     pub fn read_c_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const C_TOT_OFFSET: usize = 472 + 352;
+        pub const C_TOT_OFFSET: usize = 536 + 352;
         u128::from_le_bytes(
             slab_data[C_TOT_OFFSET..C_TOT_OFFSET + 16]
                 .try_into()
@@ -4494,7 +4553,7 @@ impl TestEnv {
     /// Read vault balance from engine state
     pub fn read_engine_vault(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const VAULT_OFFSET: usize = 472;
+        pub const VAULT_OFFSET: usize = 536;
         u128::from_le_bytes(
             slab_data[VAULT_OFFSET..VAULT_OFFSET + 16]
                 .try_into()
@@ -4505,7 +4564,7 @@ impl TestEnv {
     /// Read pnl_pos_tot aggregate from slab
     pub fn read_pnl_pos_tot(&self) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const PNL_POS_TOT_OFFSET: usize = 472 + 368;
+        pub const PNL_POS_TOT_OFFSET: usize = 536 + 368;
         u128::from_le_bytes(
             slab_data[PNL_POS_TOT_OFFSET..PNL_POS_TOT_OFFSET + 16]
                 .try_into()
@@ -4516,7 +4575,7 @@ impl TestEnv {
     /// Read account PnL for a slot
     pub fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24; // BPF: i128 has 8-byte alignment
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
@@ -5216,7 +5275,7 @@ impl TestEnv {
     /// Fee credits is at offset 240 within Account.
     pub fn read_account_fee_credits(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const FEE_CREDITS_OFFSET: usize = 224;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
@@ -5230,7 +5289,7 @@ impl TestEnv {
     /// fees_earned_total is at offset 264 within Account.
     pub fn read_account_fees_earned_total(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const FEES_EARNED_OFFSET: usize = 264;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEES_EARNED_OFFSET;
@@ -5244,7 +5303,7 @@ impl TestEnv {
     /// warmup_started_at_slot is at offset 64 within Account.
     pub fn read_account_warmup_started_at_slot(&self, idx: u16) -> u64 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const WARMUP_SLOT_OFFSET: usize = 64;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + WARMUP_SLOT_OFFSET;
@@ -5258,7 +5317,7 @@ impl TestEnv {
     /// reserved_pnl is at offset 48 within Account.
     pub fn read_account_reserved_pnl(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const RESERVED_PNL_OFFSET: usize = 40; // BPF: u128 has 8-byte alignment
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + RESERVED_PNL_OFFSET;
@@ -5274,7 +5333,7 @@ impl TestEnv {
     ///   kind: u8 at offset 16
     pub fn read_account_kind(&self, idx: u16) -> u8 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const KIND_OFFSET: usize = 16;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
@@ -5288,7 +5347,7 @@ impl TestEnv {
     /// matcher_program is at offset 144 within Account (BPF layout).
     pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const MATCHER_PROG_OFFSET: usize = 128;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
@@ -5301,7 +5360,7 @@ impl TestEnv {
     /// matcher_context is at offset 176 within Account (BPF layout).
     pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 472 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + 17632;
         const ACCOUNT_SIZE: usize = 360;
         const MATCHER_CTX_OFFSET: usize = 160;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
@@ -7725,7 +7784,7 @@ impl TestEnv {
         // params.insurance_floor. Engine v12.18.1 removed new_account_fee (U128=16B),
         // so fields after it shifted by -16. Within RiskParams:
         //   6×u64 (48) + 3×U128 (48) + 2×u128 (32) = 128 for insurance_floor.
-        pub const INSURANCE_FLOOR_OFFSET: usize = 472 + 32 + 128;
+        pub const INSURANCE_FLOOR_OFFSET: usize = 536 + 32 + 128;
         u128::from_le_bytes(
             slab_data[INSURANCE_FLOOR_OFFSET..INSURANCE_FLOOR_OFFSET + 16]
                 .try_into()

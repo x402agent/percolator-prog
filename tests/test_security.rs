@@ -639,9 +639,9 @@ fn test_attack_trade_risk_increase_when_gated() {
     // But the diff is not uniform. Use the read_num_used helper's ENGINE offset (472)
     // and compute empirically. The oi_eff_long/short pair (32 bytes) precedes side_mode.
     // From code analysis: BPF side_mode_long at engine offset ~488.
-    // Slab absolute = 472 + 960 = 960.
+    // Slab absolute = 536 + 960 = 960.
     // Fallback: try the value and if the trade still works, try adjacent offsets.
-    const SIDE_MODE_LONG_OFF: usize = 472 + 552; // v12.18.x layout
+    const SIDE_MODE_LONG_OFF: usize = 536 + 552; // v12.18.x layout
     {
         let original_slab = env
             .svm
@@ -1092,7 +1092,7 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
     env.set_slot(101);
 
     // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -1236,8 +1236,8 @@ fn test_attack_push_oracle_zero_price() {
     // Push valid price first
     env.try_push_oracle_price(&admin, 138_000_000, 100)
         .expect("oracle price push must succeed");
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -1280,8 +1280,8 @@ fn test_attack_push_oracle_without_authority_set() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -2608,7 +2608,7 @@ fn test_attack_oracle_cap_ultra_restrictive() {
     env.set_slot(200);
 
     // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -3660,7 +3660,7 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
     // Read last_effective_price_e6 (the index) before same-slot crank
     // last_effective_price_e6 is at config offset 312: slab bytes [384..392]
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_before =
         u64::from_le_bytes(slab_before[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert!(index_before > 0, "Index should be non-zero before crank");
@@ -3737,7 +3737,7 @@ fn test_attack_hyperp_push_extreme_price() {
     // Read stored last_effective_price_e6 - must be clamped, not u64::MAX/2
     // last_effective_price_e6 is at slab offset 384 (last u64 in config before engine)
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let stored_price = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     // With 5% cap and base price 1_000_000, max clamped = 1_050_000
     assert!(
@@ -7884,8 +7884,8 @@ fn test_attack_set_oracle_authority_to_zero_disables_push() {
     // Set to a different non-zero authority instead
     let new_auth = Keypair::new();
     env.try_set_oracle_authority(&admin, &new_auth.pubkey()).unwrap();
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -11406,7 +11406,7 @@ fn test_attack_push_oracle_after_resolution_rejected() {
     env.try_resolve_market(&admin).unwrap();
 
     // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 248; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let settle_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -11447,7 +11447,7 @@ fn test_attack_set_oracle_authority_after_resolution_rejected() {
     env.try_push_oracle_price(&admin, 140_000_000, 100).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    const AUTHORITY_OFF: usize = 328;
+    const AUTHORITY_OFF: usize = 392;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let authority_before: [u8; 32] = slab_before[AUTHORITY_OFF..AUTHORITY_OFF + 32]
         .try_into()
@@ -11485,7 +11485,7 @@ fn test_attack_set_oracle_price_cap_after_resolution_rejected() {
     env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    const CAP_OFF: usize = 264; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
+    const CAP_OFF: usize = 392; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let cap_before = u64::from_le_bytes(slab_before[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
 
@@ -12964,7 +12964,7 @@ fn test_attack_oracle_timestamp_zero_then_crank() {
 
     // In Hyperp mode authority_timestamp is funding-rate state, not publish time.
     // PushOraclePrice must not overwrite it with user-supplied timestamps.
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_TS_OFF: usize = 432;
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     let funding_state =
         i64::from_le_bytes(slab_data[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap());
@@ -13008,7 +13008,7 @@ fn test_attack_oracle_timestamp_i64_max_no_overflow() {
     );
 
     // In Hyperp mode, external timestamp input must not clobber funding-rate state.
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_TS_OFF: usize = 432;
     let slab_after_max = env.svm.get_account(&env.slab).unwrap().data;
     let funding_state_after_max = i64::from_le_bytes(
         slab_after_max[AUTH_TS_OFF..AUTH_TS_OFF + 8]

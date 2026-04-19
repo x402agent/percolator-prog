@@ -4442,7 +4442,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
     // Set bounded staleness for permissionless resolution
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[168..176].copy_from_slice(&30u64.to_le_bytes());
+        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
@@ -4923,8 +4923,9 @@ fn test_fee_sync_does_not_erase_market_accrual_interval() {
     env.crank();
 
     // BPF layout offset for engine.last_market_slot (v12.18.x).
-    // 472 (ENGINE_OFF) + 656 (field offset after params grew by 8) = 1128.
-    const LAST_MARKET_SLOT_OFF: usize = 1128;
+    // 536 (ENGINE_OFF, after SlabHeader +64 for 4-way auth) + 656
+    // (field offset) = 1192.
+    const LAST_MARKET_SLOT_OFF: usize = 1192;
     let read_last_market_slot = |e: &TestEnv| -> u64 {
         let d = e.svm.get_account(&e.slab).unwrap().data;
         u64::from_le_bytes(d[LAST_MARKET_SLOT_OFF..LAST_MARKET_SLOT_OFF + 8]

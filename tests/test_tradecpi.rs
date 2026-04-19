@@ -2426,8 +2426,8 @@ fn test_attack_hyperp_push_zero_mark_price() {
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
-    const AUTH_PRICE_OFF: usize = 360;
-    const AUTH_TS_OFF: usize = 368;
+    const AUTH_PRICE_OFF: usize = 424;
+    const AUTH_TS_OFF: usize = 432;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -4916,7 +4916,7 @@ fn test_zero_fill_must_not_advance_circuit_breaker_baseline() {
     env.crank();
 
     // Read the circuit-breaker baseline (last_effective_price_e6) from slab
-    const LAST_EFF_PRICE_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200) // last_effective_price_e6 in slab (config offset)
+    const LAST_EFF_PRICE_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200) // last_effective_price_e6 in slab (config offset)
     let baseline_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(data[LAST_EFF_PRICE_OFF..LAST_EFF_PRICE_OFF + 8].try_into().unwrap())
@@ -5357,7 +5357,7 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
     env.crank();
 
     // Read last_effective_price_e6 before the zero-fill trade
-    const LAST_EFF_PRICE_OFF: usize = 272; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const LAST_EFF_PRICE_OFF: usize = 336; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
     let index_before = {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         u64::from_le_bytes(
@@ -5423,11 +5423,11 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
 /// offset_of!(RiskEngine, last_market_slot)=672, so 480+672=1152).
 #[test]
 fn test_tradecpi_zero_fill_advances_engine_time() {
-    // BPF layout offset for engine.last_market_slot. BPF ENGINE_OFF=472 with
-    // u128 align=8 (tighter than native align=16). last_market_slot sits at
-    // engine offset 656 after v12.18.x added RiskParams::min_funding_lifetime_slots
-    // (+8 vs the prior 648), giving absolute slab offset 472+656=1128.
-    const LAST_MARKET_SLOT_OFF: usize = 1128;
+    // BPF layout offset for engine.last_market_slot. 4-way-auth header
+    // grew from 72→136 (+64 for insurance_authority + close_authority),
+    // so ENGINE_OFF is now 536. last_market_slot at engine offset 656,
+    // absolute slab offset 536+656=1192.
+    const LAST_MARKET_SLOT_OFF: usize = 1192;
 
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;

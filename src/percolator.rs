@@ -1319,6 +1319,29 @@ pub mod ix {
         /// but discard the observed price/index to avoid applying
         /// post-observation state to earlier engine slots.
         CatchupAccrue,
+        /// Scoped-authority update (tag 32).
+        ///
+        /// kind:
+        ///   0 = AUTHORITY_ADMIN          (header.admin)
+        ///   1 = AUTHORITY_ORACLE         (config.oracle_authority)
+        ///   2 = AUTHORITY_INSURANCE      (config.insurance_authority)
+        ///   3 = AUTHORITY_CLOSE          (config.close_authority)
+        ///
+        /// Authorization: the CURRENT authority of the specified kind
+        /// must sign. When `new_pubkey != Pubkey::default()` the NEW
+        /// pubkey must ALSO sign, proving the receiver consents to
+        /// take the role and the key isn't a typo. When `new_pubkey
+        /// == Pubkey::default()` (burn), only the current authority
+        /// signs.
+        ///
+        /// Each kind is independent — set them all to the same pubkey
+        /// for a "super admin" or delegate/burn them individually for
+        /// capability isolation. Burning `admin` applies the existing
+        /// admin-burn liveness guards (permissionless resolve + force
+        /// close configured). Burning any other kind has no guards —
+        /// it just makes that capability permanently unavailable,
+        /// which is a legitimate rug-proofing configuration.
+        UpdateAuthority { kind: u8, new_pubkey: Pubkey },
     }
 
     impl Instruction {
@@ -1615,6 +1638,12 @@ pub mod ix {
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
                 31 => Ok(Instruction::CatchupAccrue),
+                32 => {
+                    // UpdateAuthority { kind: u8, new_pubkey: [u8; 32] }
+                    let kind = read_u8(&mut rest)?;
+                    let new_pubkey = read_pubkey(&mut rest)?;
+                    Ok(Instruction::UpdateAuthority { kind, new_pubkey })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             };
             // Trailing-byte guard: every tag above fully consumes its expected
@@ -1843,12 +1872,27 @@ pub mod state {
         pub _padding: [u8; 3],
         pub admin: [u8; 32],
         pub _reserved: [u8; 24], // [0..8]=nonce, [8..24]=unused
+        /// Scoped authority: may execute WithdrawInsurance (and the
+        /// admin-only bounded WithdrawInsuranceLimited policy-setter
+        /// path, once refactored). Independent of `admin`; can be
+        /// delegated or burned via UpdateAuthority { kind=INSURANCE }.
+        /// Initialized to the creator's pubkey at InitMarket, which
+        /// yields a functional "super admin" by default.
+        pub insurance_authority: [u8; 32],
+        /// Scoped authority: may execute CloseSlab to sweep rent +
+        /// residual insurance after the market resolves and all
+        /// accounts close. Independent of `admin`; can be delegated
+        /// or burned via UpdateAuthority { kind=CLOSE }. Burning
+        /// traps rent forever (the traders-are-rug-proof setting).
+        pub close_authority: [u8; 32],
     }
 
     /// Offset of _reserved field in SlabHeader, derived from offset_of! for correctness.
     pub const RESERVED_OFF: usize = offset_of!(SlabHeader, _reserved);
 
-    // Portable compile-time assertion that RESERVED_OFF is 48 (expected layout)
+    // Portable compile-time assertion that RESERVED_OFF is 48 (expected layout).
+    // The new insurance_authority / close_authority fields go AFTER _reserved,
+    // so this offset is unchanged at 48.
     const _: [(); 48] = [(); RESERVED_OFF];
 
     #[repr(C)]
@@ -3797,6 +3841,159 @@ pub mod processor {
         Ok(())
     }
 
+    // UpdateAuthority kind constants. Keep in a single place so the
+    // decoder, handler, and any future on-chain schema references agree.
+    pub const AUTHORITY_ADMIN: u8 = 0;
+    pub const AUTHORITY_ORACLE: u8 = 1;
+    pub const AUTHORITY_INSURANCE: u8 = 2;
+    pub const AUTHORITY_CLOSE: u8 = 3;
+
+    /// Standalone handler for UpdateAuthority. Extracted from
+    /// process_instruction to keep its stack frame independent —
+    /// inlining adds a full MarketConfig + SlabHeader to the giant
+    /// process_instruction frame, which overflows the Solana BPF
+    /// stack.
+    #[inline(never)]
+    fn handle_update_authority<'a>(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo<'a>],
+        kind: u8,
+        new_pubkey: Pubkey,
+    ) -> Result<(), ProgramError> {
+        accounts::expect_len(accounts, 3)?;
+        let a_current = &accounts[0];
+        let a_new = &accounts[1];
+        let a_slab = &accounts[2];
+
+        accounts::expect_signer(a_current)?;
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+
+        // Hard-timeout gate (consistent with other config mutators).
+        // Matured markets are terminal; authority changes are
+        // meaningless past that point.
+        {
+            let clock_gate = Clock::get()
+                .map_err(|_| ProgramError::UnsupportedSysvar)?;
+            let cfg_gate = state::read_config(&data);
+            if oracle::permissionless_stale_matured(&cfg_gate, clock_gate.slot) {
+                return Err(PercolatorError::OracleStale.into());
+            }
+        }
+
+        let new_bytes = new_pubkey.to_bytes();
+        let is_burn = new_bytes == [0u8; 32];
+
+        // New pubkey must consent unless this is a burn.
+        if !is_burn {
+            accounts::expect_signer(a_new)?;
+            accounts::expect_key(a_new, &new_pubkey)?;
+        }
+
+        // Read current authority pubkey only (not the whole header/
+        // config), to keep the frame small.
+        let mut header = state::read_header(&data);
+        let mut config = state::read_config(&data);
+
+        let current_bytes = match kind {
+            AUTHORITY_ADMIN => header.admin,
+            AUTHORITY_ORACLE => config.oracle_authority,
+            AUTHORITY_INSURANCE => header.insurance_authority,
+            AUTHORITY_CLOSE => header.close_authority,
+            _ => return Err(ProgramError::InvalidInstructionData),
+        };
+        require_admin(current_bytes, a_current.key)?;
+
+        // Kind-specific invariants at assignment time.
+        match kind {
+            AUTHORITY_ADMIN => {
+                if is_burn {
+                    // Burning admin requires permissionless paths so the
+                    // market lifecycle can complete without admin. Non-
+                    // admin kinds have no such guards (burning them
+                    // simply removes that capability, which is a
+                    // legitimate rug-proofing configuration).
+                    let (resolved, has_accounts) = {
+                        let engine = zc::engine_ref(&data)?;
+                        (engine.is_resolved(), engine.num_used_accounts > 0)
+                    };
+                    if !resolved {
+                        if config.permissionless_resolve_stale_slots == 0
+                            || config.force_close_delay_slots == 0
+                        {
+                            return Err(PercolatorError::InvalidConfigParam.into());
+                        }
+                    } else if has_accounts && config.force_close_delay_slots == 0 {
+                        return Err(PercolatorError::InvalidConfigParam.into());
+                    }
+                    // Note: no is_policy_configured check. Under the
+                    // 4-way split, admin and insurance_authority are
+                    // independent; burning admin doesn't retain a back-
+                    // channel — the insurance_authority's withdrawal
+                    // policy is bounded by what admin configured BEFORE
+                    // burn. Operators who want full rug-proofing also
+                    // burn insurance_authority.
+                }
+            }
+            AUTHORITY_ORACLE => {
+                // Hyperp: rejecting zero-address oracle authority is
+                // only needed when the EWMA isn't bootstrapped (no
+                // trades → no mark source).
+                if oracle::is_hyperp_mode(&config)
+                    && is_burn
+                    && config.mark_ewma_e6 == 0
+                {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                // Weaker-authority invariant: non-Hyperp markets with
+                // a configured authority must have a non-zero cap.
+                if !oracle::is_hyperp_mode(&config)
+                    && !is_burn
+                    && config.oracle_price_cap_e2bps == 0
+                {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+            }
+            AUTHORITY_INSURANCE | AUTHORITY_CLOSE => {
+                // No per-kind invariants. Burning is a legitimate
+                // no-rug configuration; setting to any pubkey is a
+                // normal delegation.
+            }
+            _ => unreachable!(),
+        }
+
+        // Commit the assignment.
+        match kind {
+            AUTHORITY_ADMIN => {
+                header.admin = new_bytes;
+                state::write_header(&mut data, &header);
+            }
+            AUTHORITY_ORACLE => {
+                config.oracle_authority = new_bytes;
+                if !oracle::is_hyperp_mode(&config) {
+                    // Clear stored price on authority change — prevents
+                    // carrying over a prior authority's last push.
+                    config.authority_price_e6 = 0;
+                    config.authority_timestamp = 0;
+                }
+                state::write_config(&mut data, &config);
+            }
+            AUTHORITY_INSURANCE => {
+                header.insurance_authority = new_bytes;
+                state::write_header(&mut data, &header);
+            }
+            AUTHORITY_CLOSE => {
+                header.close_authority = new_bytes;
+                state::write_header(&mut data, &header);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     pub fn process_instruction<'a, 'b>(
         program_id: &Pubkey,
         accounts: &'b [AccountInfo<'a>],
@@ -4249,6 +4446,12 @@ pub mod processor {
                     _padding: [0; 3],
                     admin: a_admin.key.to_bytes(),
                     _reserved: [0; 24],
+                    // Default the scoped authorities to the creator's
+                    // pubkey — yields a functional super-admin out of
+                    // the box. Operators who want capability isolation
+                    // call UpdateAuthority with the specific kind.
+                    insurance_authority: a_admin.key.to_bytes(),
+                    close_authority: a_admin.key.to_bytes(),
                 };
                 state::write_header(&mut data, &new_header);
                 // Step 4: Explicitly initialize nonce to 0 for determinism
@@ -6238,10 +6441,15 @@ pub mod processor {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
+                    // CloseSlab is gated by the scoped close_authority,
+                    // not general admin. Operators can burn admin while
+                    // retaining close_authority for rent cleanup, or
+                    // burn close_authority to trap rent forever (the
+                    // traders-are-rug-proof configuration).
                     let header = state::read_header(&data);
-                    require_admin(header.admin, a_dest.key)?;
-
+                    require_admin(header.close_authority, a_dest.key)?;
                     let config = state::read_config(&data);
+
                     let mint = Pubkey::new_from_array(config.collateral_mint);
                     let auth = accounts::derive_vault_authority_with_bump(
                     program_id, a_slab.key, config.vault_authority_bump,
@@ -7180,7 +7388,11 @@ pub mod processor {
             }
 
             Instruction::WithdrawInsurance => {
-                // Withdraw insurance fund (admin only, requires RESOLVED and all positions closed)
+                // Withdraw insurance fund. Gated by insurance_authority
+                // (scoped), not general admin — operators who have
+                // burned admin can still withdraw here if they kept a
+                // separate insurance_authority, or lock withdrawal
+                // forever by burning insurance_authority.
                 accounts::expect_len(accounts, 6)?;
                 let a_admin = &accounts[0];
                 let a_slab = &accounts[1];
@@ -7198,7 +7410,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 let header = state::read_header(&data);
-                require_admin(header.admin, a_admin.key)?;
+                require_admin(header.insurance_authority, a_admin.key)?;
 
                 // Must be resolved
                 if !zc::engine_ref(&data)?.is_resolved() {
@@ -7206,6 +7418,7 @@ pub mod processor {
                 }
 
                 let config = state::read_config(&data);
+
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -8411,6 +8624,10 @@ pub mod processor {
                 if !state::is_oracle_initialized(&data) {
                     state::set_oracle_initialized(&mut data);
                 }
+            }
+
+            Instruction::UpdateAuthority { kind, new_pubkey } => {
+                handle_update_authority(program_id, accounts, kind, new_pubkey)?;
             }
         }
         Ok(())

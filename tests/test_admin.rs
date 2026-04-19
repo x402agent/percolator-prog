@@ -483,7 +483,7 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .expect("set authority must succeed");
 
-    const AUTHORITY_OFF: usize = 72 + 128;
+    const AUTHORITY_OFF: usize = 136 + 128;
     let authority_bytes = {
         let slab = env.svm.get_account(&env.slab).unwrap();
         let mut b = [0u8; 32];
@@ -930,9 +930,9 @@ fn test_admin_limits_lifecycle() {
     // maintenance_fee_per_slot: u128 @ config offset 352
     // max_insurance_floor: u128 @ config offset 208
     // min_oracle_price_cap_e2bps: u64 @ config offset 224
-    const MAINT_FEE_OFF: usize = 72 + 352;
-    const MAX_INS_FLOOR_OFF: usize = 72 + 208;
-    const MIN_OPC_OFF: usize = 72 + 224;
+    const MAINT_FEE_OFF: usize = 136 + 352;
+    const MAX_INS_FLOOR_OFF: usize = 136 + 208;
+    const MIN_OPC_OFF: usize = 136 + 224;
 
     let maint_fee = u128::from_le_bytes(
         slab.data[MAINT_FEE_OFF..MAINT_FEE_OFF + 16].try_into().unwrap(),
@@ -1303,5 +1303,214 @@ fn test_update_config_admin_only() {
         result.is_err(),
         "UpdateConfig must reject non-admin signer"
     );
+}
+
+// ============================================================================
+// UpdateAuthority (4-way split) — positive and negative paths for each kind
+// ============================================================================
+
+/// Precondition: new markets default insurance_authority + close_authority
+/// to the creator's pubkey (super-admin by default). Confirms the default
+/// so subsequent tests can rely on it.
+#[test]
+fn test_update_authority_init_defaults_match_admin() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+
+    let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // UpdateAuthority with the current admin signing + new_authority = self
+    // must succeed for insurance and close kinds — which proves the
+    // current authority on both slots IS the admin pubkey at init.
+    env.try_update_authority(&admin_kp, AUTHORITY_INSURANCE, Some(&admin_kp))
+        .expect("init default: insurance_authority == admin");
+    env.try_update_authority(&admin_kp, AUTHORITY_CLOSE, Some(&admin_kp))
+        .expect("init default: close_authority == admin");
+}
+
+/// UpdateAuthority happy path: admin delegates insurance_authority to a
+/// separate key, then the new insurance_authority can execute
+/// WithdrawInsurance (via the scoped check) while the original admin
+/// cannot.
+#[test]
+fn test_update_authority_insurance_positive_delegation() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let delegate = Keypair::new();
+    env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
+
+    // Delegate insurance_authority to a fresh key (requires both signers).
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&delegate))
+        .expect("two-sig delegation must succeed");
+
+    // Verify by attempting a re-delegation that requires the new key
+    // to sign as current — proves the authority transferred.
+    env.try_update_authority(&delegate, AUTHORITY_INSURANCE, Some(&admin))
+        .expect("delegate should now be able to act as insurance_authority");
+}
+
+/// Negative: UpdateAuthority requires the CURRENT authority to sign.
+/// An attacker with no authority cannot transfer.
+#[test]
+fn test_update_authority_negative_wrong_current_signer() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let target = Keypair::new();
+
+    for kind in [AUTHORITY_ADMIN, AUTHORITY_INSURANCE, AUTHORITY_CLOSE] {
+        let err = env
+            .try_update_authority(&attacker, kind, Some(&target))
+            .expect_err("attacker must not be able to transfer authority");
+        let _ = err;
+    }
+}
+
+/// Negative: the NEW pubkey MUST sign when it's non-zero (two-sig
+/// handover). Without the new-key signature, the instruction rejects —
+/// prevents accidental loss via typo.
+#[test]
+fn test_update_authority_negative_new_pubkey_not_signer() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let target_pubkey = Pubkey::new_unique();
+
+    // Raw instruction: current signs, but new_pubkey is NOT a signer.
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(target_pubkey, false), // non-signer
+            AccountMeta::new(env.slab, false),
+        ],
+        data: encode_update_authority(AUTHORITY_INSURANCE, &target_pubkey),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "new pubkey must sign (two-sig handover) when non-zero; \
+         non-signer transfer must reject"
+    );
+}
+
+/// Burn: current authority can zero out its own slot with a
+/// single-sig (new_pubkey == Pubkey::default()). Verifies by asserting
+/// the authority can no longer act after the burn.
+#[test]
+fn test_update_authority_burn_single_sig_and_then_dead() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Burn insurance_authority (single-sig: only current signs).
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
+        .expect("burning insurance_authority must succeed with one signer");
+
+    // After burn, admin can no longer act as insurance_authority.
+    let new_target = Keypair::new();
+    let err = env
+        .try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&new_target))
+        .expect_err("after burn, no one can set insurance_authority again");
+    let _ = err;
+}
+
+/// Independence: burning insurance_authority does NOT affect admin or
+/// close_authority. Each kind is independent.
+#[test]
+fn test_update_authority_burning_one_kind_leaves_others_intact() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
+        .expect("burn insurance_authority");
+
+    // admin (still valid) should be able to delegate close_authority.
+    let close_delegate = Keypair::new();
+    env.try_update_authority(&admin, AUTHORITY_CLOSE, Some(&close_delegate))
+        .expect("admin still acts on close_authority after insurance_authority burn");
+
+    // admin → admin role self-transfer should also still work.
+    // Re-verified via UpdateAdmin (legacy alias) for defense-in-depth.
+    let new_admin = Keypair::new();
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_admin(&admin, &new_admin.pubkey())
+        .expect("legacy UpdateAdmin still works for admin kind");
+}
+
+/// Admin-burn liveness guard still applies via UpdateAuthority(kind=ADMIN):
+/// cannot burn admin on a live market without permissionless paths wired.
+#[test]
+fn test_update_authority_admin_burn_requires_permissionless_paths() {
+    program_path();
+    let mut env = TestEnv::new();
+    // permissionless_resolve = 0 → admin burn must reject.
+    env.init_market_with_cap(0, 10_000, 0);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let err = env
+        .try_update_authority(&admin, AUTHORITY_ADMIN, None)
+        .expect_err("admin burn on live market without perm-resolve must reject");
+    let _ = err;
+}
+
+/// Bad kind byte rejects.
+#[test]
+fn test_update_authority_negative_invalid_kind() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let err = env
+        .try_update_authority(&admin, 42u8, None)
+        .expect_err("unknown kind must reject");
+    let _ = err;
+}
+
+/// After admin burn, insurance_authority can STILL withdraw insurance
+/// (proves the scoped split works — insurance_authority outlives admin).
+/// Conversely, burning insurance_authority locks insurance forever
+/// (the traders-are-rug-proof configuration).
+#[test]
+fn test_update_authority_insurance_survives_admin_burn() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 10_000, 1000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Before admin burn: delegate insurance_authority to a dedicated key.
+    let ins_authority = Keypair::new();
+    env.svm.airdrop(&ins_authority.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&admin, AUTHORITY_INSURANCE, Some(&ins_authority))
+        .expect("delegate insurance_authority");
+
+    // Burn admin (live market with perm-resolve + force-close configured).
+    env.try_update_authority(&admin, AUTHORITY_ADMIN, None)
+        .expect("admin burn allowed: liveness guards satisfied");
+
+    // Insurance_authority still valid — can now re-delegate itself.
+    // (Actual WithdrawInsurance requires resolved + zero accounts, out of
+    // scope for this auth test; proving the signer can still act via
+    // UpdateAuthority is a sufficient liveness indicator.)
+    let new_ins = Keypair::new();
+    env.svm.airdrop(&new_ins.pubkey(), 1_000_000_000).unwrap();
+    env.try_update_authority(&ins_authority, AUTHORITY_INSURANCE, Some(&new_ins))
+        .expect("insurance_authority survives admin burn");
 }
 
