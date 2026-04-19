@@ -575,7 +575,15 @@ fn test_critical_admin_oracle_authority() {
     );
     println!("SetOracleAuthority by non-admin: REJECTED (correct)");
 
-    // Admin sets oracle authority - should succeed
+    // Weaker-authority invariant (Model 1): non-Hyperp markets with a
+    // configured oracle authority must also have a non-zero circuit
+    // breaker cap. init_market_with_invert(0) ships cap=0 (permissive
+    // test default), so enable the cap first before configuring
+    // authority.
+    env.try_set_oracle_price_cap(&admin, 10_000)
+        .expect("admin must enable cap before setting authority");
+
+    // Admin sets oracle authority - should succeed now that cap is set
     let result = env.try_set_oracle_authority(&admin, &oracle_authority.pubkey());
     assert!(
         result.is_ok(),
@@ -1177,5 +1185,66 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
 
     println!();
     println!("FUNDING ANTI-RETROACTIVITY UpdateConfig: PASSED");
+}
+
+/// Regression: PushOraclePrice on a non-Hyperp market must reject a push
+/// whose timestamp is already stale relative to max_staleness_secs.
+/// Without this guard, a monotonic-but-ancient timestamp can pass the
+/// monotonicity + non-future checks, clear first_observed_stale_slot,
+/// yet be ignored by read_authority_price (age > max_staleness_secs) —
+/// yielding a freeze state where the stale-resolve window never matures
+/// even though the market cannot actually be priced.
+#[test]
+fn test_push_oracle_price_rejects_stale_timestamp() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    // Non-Hyperp market with non-zero cap so authority can be enabled.
+    env.init_market_with_cap(0, 10_000, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority_raw(&admin, &admin.pubkey())
+        .expect("authority setup with cap != 0 must succeed");
+
+    // Advance clock by a large amount so the push timestamp we construct
+    // below is monotonic (> 0) AND non-future (<= current unix_timestamp)
+    // AND stale (age > max_staleness_secs). encode_init_market_full_v2
+    // ships max_staleness_secs = 86_400, so we need age > 86_400 seconds.
+    let clock: Clock = env.svm.get_sysvar();
+    let now = clock.unix_timestamp;
+    let far_future = now + 200_000; // advance clock 200k seconds forward
+    env.svm.set_sysvar(&Clock {
+        unix_timestamp: far_future,
+        ..clock
+    });
+
+    // Build a push with a timestamp that is:
+    //   - Positive and monotonic (> authority_timestamp == 0)
+    //   - Non-future (equals `now` from before the clock warp,
+    //     so <= `far_future`)
+    //   - Stale (age = 200_000 > max_staleness_secs = 86_400)
+    let stale_ts = now;
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+        ],
+        data: encode_push_oracle_price(150_000_000, stale_ts),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "PushOraclePrice must reject a timestamp older than \
+         max_staleness_secs — otherwise a stale push would clear \
+         first_observed_stale_slot while read_authority_price still \
+         ignores the stored price, creating a liveness freeze"
+    );
 }
 

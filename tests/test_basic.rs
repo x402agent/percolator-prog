@@ -2492,6 +2492,8 @@ fn test_convert_released_pnl_blocked_on_resolved() {
 
     // Resolve the market.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // try_set_oracle_authority auto-enables the circuit-breaker cap
+    // before setting authority (Model-1 weaker-authority invariant).
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 138_000_000, 300).unwrap();
     env.set_slot(300);
