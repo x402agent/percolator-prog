@@ -759,6 +759,17 @@ nonzero; even if the clamped value were 0, the downstream
 `if mark == 0 → OracleInvalid` (e.g., line 2951 in
 `get_engine_oracle_price_e6`) rejects it.
 
+### D56. Fee sweep cursor infinite loop
+
+**Hypothesis**: If only word 0 of the bitmap has set bits (e.g., 64
+accounts in a 4096-slot market), the cursor could loop endlessly
+between word 0 and wrap-around.
+
+**Why discarded**: Outer loop (line 3603) is bounded by
+`words_scanned < BITMAP_WORDS`, terminating after exactly
+BITMAP_WORDS=64 iterations regardless of bit distribution. Each
+word is visited at most once per crank.
+
 ## Audit completion status
 
 **54 concrete attack hypotheses probed across three rounds.** Every
