@@ -277,6 +277,39 @@ header. InitMarket sets admin to `a_admin.key.to_bytes()`
 (src/percolator.rs:4633) — if the admin signer is zero, it fails
 validation upstream (Solana signer-flag checks).
 
+### D21. Cross-market reentrancy via malicious matcher
+
+**Hypothesis**: During TradeCpi's matcher CPI in market A, the
+malicious matcher CPIs back to the wrapper with a DIFFERENT slab
+(market B). The reentrancy flag `FLAG_CPI_IN_PROGRESS` is scoped to
+market A's slab, so market B's operations would see the flag unset
+and proceed. Could this grant privileges the attacker didn't have?
+
+**Why discarded**: Cross-market ops from inside matcher CPI require
+the attacker to already have privileges on market B:
+- Admin-gated ops need B's admin to sign (not available to matcher)
+- LP PDA signing uses market B's slab in seeds (different from A's)
+- User-signed ops need B's user to sign (attacker's own user, fine)
+- Permissionless ops (Crank, CatchupAccrue, ResolvePermissionless)
+  are already callable by anyone
+
+The matcher cannot elevate privileges via cross-slab CPI. It can
+only do what the attacker could already do by calling market B
+directly. Not a reentrancy flaw.
+
+### D22. Dust-capital account remains operational
+
+**Hypothesis**: User's capital drops below min_initial_deposit (e.g.,
+via fee sweeps). The account is "reclaimable dust" eligible, but
+still operationally active. Can the user accidentally trigger
+reclaim by calling their own instructions, losing dust?
+
+**Why discarded**: Reclaim is a SEPARATE instruction
+(ReclaimEmptyAccount). No other instruction auto-reclaims on dust
+detection. The user can top up via DepositCollateral any time before
+a keeper races in with reclaim. This is the intended dormant-account
+cleanup semantics (spec §2.6).
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
