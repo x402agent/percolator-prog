@@ -366,6 +366,46 @@ paid out. Users' individual claims are already withdrawable via
 close/force-close. The trapped insurance is structurally designed
 to be inaccessible.
 
+### D28. UpdateConfig funding param change retroactively reprices accrual
+
+**Hypothesis**: Admin calls UpdateConfig to change funding_k_bps or
+funding_max_bps_per_slot. The accrued period [last_market_slot,
+clock.slot] is re-priced at the NEW rate, retroactively applying
+the admin's chosen rate to elapsed time.
+
+**Why discarded**: UpdateConfig captures `funding_rate_e9` BEFORE
+any config mutation (src/percolator.rs:6763) and passes it to
+`catchup_accrue` + `accrue_market_to` (lines 6842-6847). ONLY
+after the accrue completes does the handler write the new funding
+params (lines 6856-6859). The accrued interval uses the pre-change
+rate. Post-accrue time uses the new rate. Anti-retroactivity is
+preserved (spec §5.5).
+
+### D29. LP with stuck counterparty positions cannot close
+
+**Hypothesis**: LP has matched several user trades and accumulated
+positions. Users never close their sides. LP cannot CloseAccount
+because position != 0. Funds trapped.
+
+**Why discarded**: Not a bug — standard perp-market lifecycle. LP
+must trade OUT of each position (or wait for liquidation /
+resolution). If no counterparty is willing to trade the other way,
+the market still eventually resolves (admin or permissionless
+timeout), and resolved close returns LP's capital.
+Perp-market liquidity is an operational concern, not a
+vulnerability.
+
+### D30. Trade at exec_price clamped to MAX_ORACLE_PRICE
+
+**Hypothesis**: Matcher returns exec_price exactly at
+MAX_ORACLE_PRICE (10^12). Engine's notional computation overflows.
+
+**Why discarded**: MAX_POSITION_ABS_Q = 10^14. notional = size ×
+price / POS_SCALE = 10^14 × 10^12 / 10^15 = 10^11, well within
+u128 range. The engine's envelope invariant (spec §1.4) guarantees
+all arithmetic stays under i128::MAX (~1.7×10^38) across the full
+product of (size × price × rate × lifetime).
+
 ### D22. Dust-capital account remains operational
 
 **Hypothesis**: User's capital drops below min_initial_deposit (e.g.,
