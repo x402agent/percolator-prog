@@ -720,49 +720,12 @@ impl TestEnv {
     }
 
     pub fn init_market_with_invert(&mut self, invert: u8) {
-        let admin = &self.payer;
-        let dummy_ata = Pubkey::new_unique();
-        self.svm
-            .set_account(
-                dummy_ata,
-                Account {
-                    lamports: 1_000_000,
-                    data: vec![0u8; TokenAccount::LEN],
-                    owner: spl_token::ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(self.slab, false),
-                AccountMeta::new_readonly(self.mint, false),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(sysvar::rent::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            ],
-            data: encode_init_market_with_invert(
-                &admin.pubkey(),
-                &self.mint,
-                &TEST_FEED_ID,
-                invert,
-            ),
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), ix],
-            Some(&admin.pubkey()),
-            &[admin],
-            self.svm.latest_blockhash(),
-        );
-        self.svm.send_transaction(tx).expect("init_market failed");
+        // Delegate to init_market_with_cap with min_cap=10_000 so the
+        // init-time invariant (non-Hyperp + cap=0 → oracle_authority=0)
+        // doesn't zero oracle_authority for tests that later expect to
+        // use it. Tests that want the cap=0 behavior use
+        // init_market_with_cap directly with 0.
+        self.init_market_with_cap(invert, 10_000, 0);
     }
 
     /// Initialize a market with oracle price cap (enables EWMA) and optional permissionless resolution.
@@ -1556,7 +1519,10 @@ pub fn encode_init_market_full(
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor (<= MAX_VAULT_TVL)
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
+    // min_oracle_price_cap_e2bps = 10_000 so oracle_authority defaults
+    // to admin under the init-time invariant. Tests that specifically
+    // want cap=0 should use init_market_with_cap(..., 0, ...) directly.
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps

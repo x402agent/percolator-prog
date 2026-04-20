@@ -523,38 +523,38 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
 /// cap == 0) — that would make authority an admin-equivalent, not a
 /// bounded fallback, and break the assumption that let UpdateAdmin burn
 /// safely with a retained authority.
+///
+/// Under the init-time invariant (non-Hyperp + min_cap=0 →
+/// oracle_authority defaults to ZERO), the rejection now happens
+/// earlier: require_admin fails because the current ORACLE slot is
+/// zero. The test verifies this stronger property — such a market is
+/// PERMANENTLY unable to have oracle authority configured (zero is
+/// terminal under UpdateAuthority).
 #[test]
 fn test_set_oracle_authority_rejects_nonzero_on_non_hyperp_with_cap_zero() {
     program_path();
 
     let mut env = TestEnv::new();
-    // min_oracle_price_cap_e2bps=0 and permissionless_resolve=0 yields
-    // a market with oracle_price_cap_e2bps=0 at genesis.
     env.init_market_with_cap(0, 0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Attempting to configure authority without a cap must be rejected.
-    // Use the RAW helper to bypass the auto-cap bootstrap in the common
-    // helper — the invariant under test is that the primitive
-    // SetOracleAuthority instruction itself rejects authority + cap=0.
+    // oracle_authority is zero at init (new invariant). require_admin
+    // rejects any signer.
     let err = env
         .try_set_oracle_authority_raw(&admin, &admin.pubkey())
         .expect_err(
-            "SetOracleAuthority must reject non-zero authority on a \
-             non-Hyperp market with cap==0 — unbounded authority is \
-             admin-equivalent and breaks the weaker-authority model",
+            "UpdateAuthority(ORACLE) must reject — non-Hyperp + \
+             min_cap==0 markets have oracle_authority = 0 at init \
+             and zero is terminal",
         );
+    // EngineUnauthorized (0xf) or InvalidConfigParam (0x1a) both
+    // indicate rejection. The earlier-failing error under the new
+    // invariant is 0xf.
     assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
+        err.contains("0xf") || err.contains("0x1a"),
+        "expected rejection error, got: {}", err,
     );
-
-    // Sanity: zeroing authority when it's already zero still succeeds
-    // (legal no-op; Hyperp-specific EWMA guard doesn't apply here).
-    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
-    env.try_set_oracle_authority_raw(&admin, &zero_pubkey)
-        .expect("zeroing an already-zero authority must succeed");
 }
 
 /// Weaker-authority invariant: SetOraclePriceCap may not disable the
@@ -567,24 +567,16 @@ fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Start with a non-zero cap (10_000 e2bps = 1%) so we can configure
-    // authority. Floor must be 0 so we can then attempt to disable the
-    // cap — SetOraclePriceCap also rejects cap=0 when the floor > 0
-    // (independent guard), which we don't want to conflate here.
-    env.init_market_with_cap(0, 0, 0);
-    // Set cap to a small positive value via SetOraclePriceCap so it is
-    // mutable (init min=0 means cap=0 at genesis).
+    // Init with min_cap > 0 so oracle_authority defaults to admin
+    // (under the init-time invariant — non-Hyperp + cap=0 zeroes
+    // authority). permissionless_resolve=0 keeps the test simple.
+    env.init_market_with_cap(0, 10_000, 0);
+
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_price_cap(&admin, 10_000)
-        .expect("set cap must succeed");
 
-    // Configure authority; now both authority != 0 and cap > 0.
-    // Use the raw helper to avoid the common helper's auto-cap — the
-    // cap is already set, we just want the direct instruction.
-    env.try_set_oracle_authority_raw(&admin, &admin.pubkey())
-        .expect("set authority must succeed");
-
-    // Disabling the cap must be rejected.
+    // Admin starts as oracle_authority. The weaker-authority
+    // invariant must prevent disabling the cap while the slot is
+    // still non-zero.
     let err = env
         .try_set_oracle_price_cap(&admin, 0)
         .expect_err(
@@ -595,10 +587,6 @@ fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
         err.contains("0x1a"),
         "expected InvalidConfigParam, got: {}", err,
     );
-
-    // Positive case (disabling cap with no authority) is out of scope
-    // for this test; the intent here is to prove that authority + cap=0
-    // is forbidden, which the expect_err above already verified.
 }
 
 /// Verify that InitMarket rejects initial risk_params that exceed per-market limits.

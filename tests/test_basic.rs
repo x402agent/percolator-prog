@@ -1569,7 +1569,7 @@ fn test_position_flip_minimal_equity() {
 fn test_liquidation_reduces_position_and_charges_fee() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 0, 0); // liquidation test: no cap for large price moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -1772,7 +1772,7 @@ fn test_partial_withdrawal_with_position_succeeds() {
 fn test_keeper_crank_format_v1_full_close() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
@@ -2178,7 +2178,7 @@ fn test_settle_account_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2477,7 +2477,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin (for later push)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2739,7 +2739,7 @@ fn test_reclaim_rejects_account_with_position() {
 fn test_reclaim_blocked_on_resolved() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → oracle_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4075,7 +4075,7 @@ fn test_trading_fee_exact_amounts() {
 fn test_liquidation_fee_goes_to_insurance() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 0, 0); // liquidation test: no cap for large price moves
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);

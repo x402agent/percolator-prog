@@ -557,7 +557,8 @@ fn test_critical_admin_oracle_authority() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // cap > 0 so oracle_authority defaults to admin (init-time invariant)
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let oracle_authority = Keypair::new();
@@ -574,14 +575,6 @@ fn test_critical_admin_oracle_authority() {
         "SECURITY: Non-admin should not set oracle authority"
     );
     println!("SetOracleAuthority by non-admin: REJECTED (correct)");
-
-    // Weaker-authority invariant (Model 1): non-Hyperp markets with a
-    // configured oracle authority must also have a non-zero circuit
-    // breaker cap. init_market_with_invert(0) ships cap=0 (permissive
-    // test default), so enable the cap first before configuring
-    // authority.
-    env.try_set_oracle_price_cap(&admin, 10_000)
-        .expect("admin must enable cap before setting authority");
 
     // Admin transfers oracle authority to a separate key (cross-Keypair
     // two-sig handover under the 4-way split).

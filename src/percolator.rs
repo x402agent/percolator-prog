@@ -4361,9 +4361,23 @@ pub mod processor {
                     // have oracle_price_cap_e2bps > 0 — this is
                     // checked at PushOraclePrice time (live defense)
                     // and at UpdateAuthority(ORACLE) time (set-time
-                    // invariant). Hyperp markets use the cap for
-                    // index smoothing and always require cap > 0.
-                    oracle_authority: a_admin.key.to_bytes(),
+                    // invariant). At init, enforce the SAME invariant:
+                    // non-Hyperp with min_cap == 0 defaults
+                    // oracle_authority to zero. This prevents the
+                    // half-configured "visible authority, unusable
+                    // push" state the auditor flagged. Once zero,
+                    // authority is terminal (UpdateAuthority can't
+                    // transfer from a zero current slot) — operators
+                    // who want oracle push in non-Hyperp markets must
+                    // init with min_cap > 0.
+                    // Hyperp markets always get cap > 0 from
+                    // DEFAULT_HYPERP_PRICE_CAP_E2BPS, so authority
+                    // defaults to admin there.
+                    oracle_authority: if is_hyperp || min_oracle_price_cap_e2bps > 0 {
+                        a_admin.key.to_bytes()
+                    } else {
+                        [0u8; 32]
+                    },
                     authority_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     authority_timestamp: 0, // In Hyperp mode: stores funding rate (bps per slot)
                     // Oracle price circuit breaker
@@ -5904,8 +5918,19 @@ pub mod processor {
                             fee_paid_cpi,
                             config.mark_min_fee,
                         );
-                        // Only update EWMA clock when mark actually moved
-                        if config.mark_ewma_e6 != old_ewma_cpi {
+                        // Liveness refresh: a trade is an "observation-
+                        // eligible" event when it paid full EWMA weight
+                        // (fee_paid >= mark_min_fee, or mark_min_fee == 0).
+                        // Honest same-price trades still count — the
+                        // fee-weighted EWMA value may not move
+                        // numerically when price matches the prior
+                        // EWMA, but the observation itself is a real
+                        // market signal. Dust-wash trades below
+                        // mark_min_fee are excluded (they don't meet
+                        // the cost-of-observation threshold).
+                        let eligible = config.mark_min_fee == 0
+                            || fee_paid_cpi >= config.mark_min_fee;
+                        if eligible {
                             config.mark_ewma_last_slot = clock.slot;
                         }
                         // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
@@ -5913,22 +5938,30 @@ pub mod processor {
                     }
 
                     // Hyperp: also update authority_price (legacy mark field).
-                    // Liveness rule (strict): only refresh last_mark_push_slot
-                    // when the EWMA actually moved. A trade whose fee did not
-                    // meet mark_min_fee or whose price equals the prior EWMA
-                    // is NOT a meaningful mark update, so it must not extend
-                    // the Hyperp oracle-liveness timer. Otherwise a cheap
-                    // attacker could submit dust wash trades indefinitely to
-                    // keep a dead Hyperp market "alive" while no real price
-                    // discovery happens — same no-liveness-extension rule
-                    // that mark_ewma_last_slot already follows just above.
+                    // Liveness refresh on observation-eligible trades
+                    // (same rule as mark_ewma_last_slot above). Honest
+                    // same-price Hyperp trades refresh the stale timer;
+                    // sub-threshold dust wash trades do not.
                     if is_hyperp {
                         config.authority_price_e6 = oracle::clamp_oracle_price(
                             config.last_effective_price_e6,
                             ret.exec_price_e6,
                             config.oracle_price_cap_e2bps,
                         );
-                        if config.mark_ewma_e6 != old_ewma_cpi {
+                        // Recompute eligibility in this scope — the
+                        // EWMA branch above is gated on
+                        // oracle_price_cap_e2bps > 0, so its local
+                        // `eligible` isn't visible here.
+                        let eligible = config.mark_min_fee == 0
+                            || if config.mark_min_fee > 0 {
+                                let ins_after_cpi = engine.insurance_fund.balance.get();
+                                let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                                (core::cmp::min(delta, u64::MAX as u128) as u64)
+                                    >= config.mark_min_fee
+                            } else {
+                                true
+                            };
+                        if eligible {
                             config.last_mark_push_slot = clock.slot as u128;
                         }
                     }

@@ -177,7 +177,7 @@ fn test_attack_withdraw_insurance_with_open_positions() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -300,7 +300,7 @@ fn test_attack_topup_insurance_after_resolution() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.try_set_oracle_authority(&admin, &admin.pubkey())
@@ -899,7 +899,7 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 10_000, 0);
     let admin = env.payer.insecure_clone();
 
     // Create LP and user
@@ -1185,13 +1185,14 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // init with cap > 0 so oracle_authority defaults to admin (under
+    // the init-time invariant; cap=0 would zero oracle_authority).
+    env.init_market_with_cap(0, 10_000, 0);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
     env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
 
-    // No SetInsuranceWithdrawPolicy call — is_policy_configured stays false.
+    // Snapshot fields.
     const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + authority_price_e6(176)
     const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + authority_timestamp(184)
     let (price_before, ts_before) = {

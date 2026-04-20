@@ -1075,18 +1075,14 @@ fn test_attack_oracle_price_cap_circuit_breaker() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // min_cap=100: non-zero floor → oracle_authority=admin at init,
+    // and SetOraclePriceCap(100) stays at/above the floor.
+    env.init_market_with_cap(0, 100, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Crank first to establish external oracle baseline
     env.crank();
-
-    // Set oracle authority and cap
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-    env.try_set_oracle_price_cap(&admin, 100)
-        .expect("oracle price cap setup must succeed"); // 0.01% per slot
 
     // Push initial price (clamped against external baseline $138)
     env.try_push_oracle_price(&admin, 138_000_000, 100)
@@ -2555,39 +2551,32 @@ fn test_attack_oracle_cap_zero_disables_clamping() {
     // is non-zero, and SetOracleAuthority(non-zero) is rejected on a
     // non-Hyperp market with cap=0. Verify both guards fire.
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0); // non-Hyperp, cap=0 at genesis
+    // Explicitly init with cap=0 so oracle_authority is zero at init
+    // (init-time invariant). UpdateAuthority(ORACLE) then rejects any
+    // signer because current is zero.
+    env.init_market_with_cap(0, 0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Guard 1: raw SetOracleAuthority with cap=0 is rejected. (The
-    // common helper's auto-cap bootstrap would mask this — use the
-    // raw primitive to prove the engine-side rejection.)
+    // Guard 1: UpdateAuthority(ORACLE) on a cap=0 market rejects.
+    // Under the init-time invariant, oracle_authority starts at zero
+    // and is terminal — require_admin fails for any signer.
     let err = env
         .try_set_oracle_authority_raw(&admin, &admin.pubkey())
-        .expect_err("SetOracleAuthority(non-zero) with cap=0 must reject");
+        .expect_err("UpdateAuthority(ORACLE) on cap=0 market must reject");
+    // Either EngineUnauthorized (0xf) or InvalidConfigParam (0x1a)
+    // indicates the expected rejection.
     assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
+        err.contains("0xf") || err.contains("0x1a"),
+        "expected rejection, got: {}", err,
     );
 
-    // Guard 2: the reverse ordering is also rejected. First enable cap
-    // so authority can be set; then attempt to disable the cap while
-    // authority is live. Use a distinct authority pubkey so the second
-    // SetOracleAuthority tx bytes differ from the first (LiteSVM dedups
-    // identical signatures under the same blockhash).
-    env.try_set_oracle_price_cap(&admin, 10_000)
-        .expect("enabling cap must succeed");
-    let alt_authority = Keypair::new();
-    env.svm.airdrop(&alt_authority.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&alt_authority))
-        .expect("authority with cap>0 must succeed");
-    let err = env
-        .try_set_oracle_price_cap(&admin, 0)
-        .expect_err("SetOraclePriceCap(0) while authority set must reject");
-    assert!(
-        err.contains("0x1a"),
-        "expected InvalidConfigParam, got: {}", err,
-    );
+    // Under the init-time invariant, non-Hyperp + cap=0 markets
+    // start with oracle_authority=0, which is terminal. There's no
+    // transition path from (cap=0, auth=0) to (cap>0, auth=X) —
+    // operators must commit at init. The old "Guard 2" case (enable
+    // cap later, then attempt to disable while authority is set) is
+    // now unreachable on a cap=0 market.
 }
 
 /// ATTACK: Set oracle price cap to 1 (ultra-restrictive), push any change.
@@ -2597,18 +2586,14 @@ fn test_attack_oracle_cap_ultra_restrictive() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // min_cap=1 at init: oracle_authority defaults to admin (non-zero
+    // init floor passes the init-time invariant), and cap can be held
+    // at or above 1 per the immutable floor check in SetOraclePriceCap.
+    env.init_market_with_cap(0, 1, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Crank first to establish external oracle baseline
     env.crank();
-
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("oracle authority setup must succeed");
-
-    // Set ultra-restrictive cap
-    env.try_set_oracle_price_cap(&admin, 1)
-        .expect("oracle price cap setup must succeed");
 
     // Push initial price (clamped against external baseline $138)
     env.try_push_oracle_price(&admin, 138_000_000, 100)
@@ -4016,7 +4001,7 @@ fn test_attack_liquidate_healthy_account() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 0, 0);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -6066,7 +6051,7 @@ fn test_attack_liquidation_after_price_crash() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -6291,7 +6276,7 @@ fn test_attack_same_slot_triple_crank_convergence() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 0, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -13513,7 +13498,7 @@ fn test_attack_resolve_rejects_stale_settlement_push() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap = 0 (no cap)
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap > 0 so oracle_authority defaults to admin
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -13587,7 +13572,8 @@ fn test_attack_authority_push_crank_does_not_ratchet_baseline() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    // cap > 0 so oracle_authority defaults to admin.
+    env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
