@@ -894,17 +894,41 @@ pub mod zc {
     /// Offset of market_mode within RiskEngine (repr(u8) enum)
     const MM_OFF: usize = offset_of!(RiskEngine, market_mode);
 
-    /// Validate ALL enum discriminants from raw bytes BEFORE casting to &RiskEngine.
+    // Runtime tripwire: a unit test in tests/unit.rs
+    // (`test_zc_cast_safety_invariant`) asserts that no slab-persisted
+    // field has an invalid bit pattern beyond the enums validated
+    // above. A compile-time size assert was considered but rejected:
+    // sizeof<RiskEngine> differs between x86_64 and sbf targets (u128
+    // alignment), so a const-eval tripwire cannot cover both builds.
+    // The unit test runs on x86_64 but is a structural check — it
+    // inspects type identities, not sizes — so it is target-
+    // independent and still catches the "someone silently added a
+    // bool field" class.
+
+    /// Validate ALL fields with invalid bit patterns from raw bytes
+    /// BEFORE casting the slab to &RiskEngine / &mut RiskEngine.
+    /// Required because the cast is `unsafe`: a Rust reference to a
+    /// struct containing an invalid bit pattern is UB on first field
+    /// access, irrespective of whether we read the field.
     ///
-    /// RiskEngine contains these types with invalid bit patterns:
-    ///   - SideMode (2 instances): valid 0-2
-    ///   - MarketMode (1 instance): valid 0-1
-    ///   - Account.overflow_older_present / overflow_newest_present (bool):
-    ///     valid 0-1, but per-account validation is O(MAX_ACCOUNTS) so we rely
-    ///     on the slab being program-owned (only typed Rust writes touch these).
+    /// The only field types in the RiskEngine slab with invalid bit
+    /// patterns today are the two `#[repr(u8)]` enums:
+    ///   - SideMode (2 instances at side_mode_long / side_mode_short):
+    ///     valid tag bytes 0 (Normal), 1 (DrainOnly), 2 (ResetPending).
+    ///   - MarketMode (at market_mode): valid tag bytes 0 (Live),
+    ///     1 (Resolved).
+    /// No other field type in either RiskEngine or Account has invalid
+    /// bit patterns: every other field is u64/u128/i64/i128/[u8; N]/
+    /// wrapper-Pod (U128/I128) or fixed u8 — all-bits-valid types.
+    /// The two bool fields in the engine crate (InstructionContext,
+    /// CrankOutcome) are transient runtime structs, not slab-persisted,
+    /// so they are never materialized through this cast.
     ///
-    /// Account.kind was changed from AccountKind enum to plain u8, eliminating
-    /// the UB class at the type level — u8 has no invalid representations.
+    /// If a future revision adds any new enum or bool field to the
+    /// slab, the validation below must be extended before the cast
+    /// can be considered sound. A compile-time invariant check
+    /// (`assert!(size_of::<RiskEngine>() == EXPECTED)`) elsewhere in
+    /// this module forces deliberate attention on layout changes.
     #[inline]
     fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
