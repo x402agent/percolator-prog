@@ -693,6 +693,28 @@ Not a practical attack surface; the engine uses `checked_add(1)` at
 line 5155 which would fail with `None` on wrap, producing
 CorruptState rejection rather than a silent wrap-induced match.
 
+### D51. Mat_counter overflow
+
+**Hypothesis**: u64 mat_counter wraps after 2^64 materializations,
+allowing gen collision → stale lp_account_id matches new account.
+
+**Why discarded**: `next_mat_counter` uses checked_add (line 2165),
+returns None on overflow. Callers map None to EngineOverflow error
+rejection. 2^64 materializations is not practically reachable.
+
+### D52. Empty-market keeper crank
+
+**Hypothesis**: Keeper cranks on a market with num_used_accounts=0.
+Some state mutation or reward payment could happen on the empty
+state that shouldn't.
+
+**Why discarded**: Crank with no accounts: scan finds no bits set,
+no candidates processed, no fees swept (no accounts to sweep).
+`sweep_delta = 0` → reward gate at line 5327 (`sweep_delta > 0`)
+blocks reward payment. Crank returns cleanly; no state mutation
+beyond the accrue-to-clock-slot (which is the correct ongoing
+market-clock advancement, not a bug).
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
