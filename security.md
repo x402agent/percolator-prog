@@ -743,6 +743,22 @@ at epoch start, NOT current F). Reconcile line 5166:
 reset doesn't lose the information needed for prior-epoch
 reconciliation.
 
+### D55. clamp_oracle_price saturating underflow
+
+**Hypothesis**: `clamp_oracle_price` computes `lower = last_price -
+max_delta`. If `max_delta > last_price`, the subtraction saturates
+to 0, allowing `raw_price = 0` to be accepted as a valid clamped
+price — but `OracleInvalid` check rejects price=0 elsewhere. Does
+any path accept a 0 price?
+
+**Why discarded**: Every oracle consumer (`read_pyth_price_e6`,
+`read_chainlink_price_e6`, `read_authority_price`) checks for
+price=0 and rejects with `OracleInvalid`. The clamp's saturating
+behavior is only applied AFTER validation ensures the raw input is
+nonzero; even if the clamped value were 0, the downstream
+`if mark == 0 → OracleInvalid` (e.g., line 2951 in
+`get_engine_oracle_price_e6`) rejects it.
+
 ## Audit completion status
 
 **54 concrete attack hypotheses probed across three rounds.** Every
