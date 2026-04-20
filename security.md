@@ -827,6 +827,65 @@ deployers choose their own per-market caps.
 - Then follow the exploit path above
 - Mitigation: burn admin, or use multisig/timelock for admin
 
+## Sophisticated-attacker analysis (Lazarus-style)
+
+Thinking like a professional DeFi hacker, the high-value attacks
+typically target one of these surfaces:
+
+1. **Admin-key compromise + config abuse** — D57 analyzed this. The
+   protocol's design bounds admin abuse to funding-rate manipulation
+   within the envelope max. Users can always close; protocol
+   conservation preserved. Operational risk, not a protocol flaw.
+
+2. **Oracle manipulation** — circuit-breaker caps per-push movement
+   (cap_e2bps). Admin/oracle_authority can drive moves within cap.
+   User's close-escape limits per-block exposure. Hard-timeout
+   `permissionless_stale_matured` forces resolution after sustained
+   staleness. Bounded attack surface.
+
+3. **Cross-protocol composition (matcher CPI tail)** — D1/D11/D14
+   covered. The matcher is LP-delegated; anything the matcher does
+   is within the LP's trust model. Wrapper enforces account shape
+   + signer propagation + ABI validation. No privilege elevation
+   possible through the tail.
+
+4. **Reentrancy** — `FLAG_CPI_IN_PROGRESS` blocks reentry on the
+   same slab. Cross-slab reentry (D21) can't elevate privileges
+   beyond what attacker already has.
+
+5. **Token transfer / mint tricks** — verify_token_program checks
+   legacy `spl_token::ID` (rejects Token-2022 fee extensions).
+   `verify_vault_empty` at init rejects pre-loaded vaults.
+   `verify_token_account` checks mint + owner on every transfer.
+
+6. **State initialization / layout** — D56/D45/D55 covered.
+   `slab_guard` checks owner + length + reentrancy. Instruction
+   decoder uses checked reads. No uninitialized-data exploits.
+
+7. **Arithmetic precision** — D30/D45/D55 covered. Fee
+   computation uses ceil (protocol wins rounding). Wide
+   arithmetic (U256/I256) for haircut + K-diff paths. Envelope
+   invariant ensures products stay within i128::MAX.
+
+8. **Flash-loan-style attacks** — Solana doesn't have native flash
+   loans. Multi-ix tx is atomic (D17). No repeated-borrow
+   primitives. The circuit breaker bounds same-slot price
+   manipulation.
+
+9. **MEV / sandwich** — limit_price_e6 on TradeCpi bounds slippage.
+   User can refuse to execute outside their limit. Standard perp
+   protection.
+
+10. **Governance / upgrade attacks** — percolator has NO governance
+    mechanism. The program owner controls upgrades; that's a
+    Solana-level trust assumption.
+
+**Conclusion**: Every standard DeFi attack pattern I considered
+either (a) doesn't apply to this architecture, (b) is blocked by
+existing defenses, or (c) requires admin-key compromise (which the
+burn-admin feature mitigates). No ship-blocking protocol-level
+vulnerability identified.
+
 ## Audit completion status
 
 **54 concrete attack hypotheses probed across three rounds.** Every
