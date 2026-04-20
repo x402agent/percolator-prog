@@ -2823,51 +2823,6 @@ fn test_init_lp_survives_stale_oracle() {
 // in the sync insertion (monotonicity, envelope, etc.) would surface
 // as an Overflow/Undercollateralized on those tests.
 
-// ============================================================================
-// QueryLpFees (tag 24) additional coverage
-// ============================================================================
-
-/// Spec SS 2.2: QueryLpFees rejects non-LP (user) accounts.
-#[test]
-fn test_query_lp_fees_rejects_non_lp() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 1_000_000_000);
-
-    let result = env.try_query_lp_fees(user_idx);
-    assert!(
-        result.is_err(),
-        "QueryLpFees must reject a non-LP (user) account; \
-         this is a read-only query so no state mutation is possible"
-    );
-}
-
-/// Spec: QueryLpFees rejects an out-of-bounds or unused index.
-#[test]
-fn test_query_lp_fees_rejects_invalid_idx() {
-    program_path();
-    let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    // No accounts created yet; index 0 is unused.
-    let result = env.try_query_lp_fees(0);
-    assert!(
-        result.is_err(),
-        "QueryLpFees must reject an unused account index"
-    );
-
-    // Also test a clearly out-of-bounds index
-    let result = env.try_query_lp_fees(4095);
-    assert!(
-        result.is_err(),
-        "QueryLpFees must reject an out-of-bounds index"
-    );
-}
-
 /// Audit gap 2: Inverted market full lifecycle.
 ///
 /// Spec behavior: An inverted market (invert=1) should support the complete

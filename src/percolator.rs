@@ -1289,11 +1289,16 @@ pub mod ix {
         AdminForceCloseAccount {
             user_idx: u16,
         },
-        /// Query cumulative fees earned by an LP position (§2.2).
-        /// Returns fees_earned_total via set_return_data. No state mutation.
-        QueryLpFees {
-            lp_idx: u16,
-        },
+        // Tag 24 QueryLpFees removed. The instruction exposed
+        // `Account.fee_credits` as an "earned fees" query, but
+        // `fee_credits` is a debt-tracker (engine invariant: stays in
+        // [-i128::MAX, 0]; positive values are unreachable) — all
+        // trading fees go straight to insurance, LPs don't accumulate
+        // earnings through this field. The query returned 0 for every
+        // real input; the ABI was misleading. Deleted outright rather
+        // than reshaped because there is no "cumulative earned fees"
+        // counter elsewhere in the engine — LPs earn via their
+        // matcher's spread, not via wrapper-visible accounting.
         /// Permissionless reclamation of empty/dust accounts (§2.6, §10.7).
         ReclaimEmptyAccount {
             user_idx: u16,
@@ -1611,10 +1616,9 @@ pub mod ix {
                 // policy was non-binding (same insurance_authority
                 // could bypass via tag 20 WithdrawInsurance) and
                 // added complexity without a real security property.
-                24 => {
-                    let lp_idx = read_u16(&mut rest)?;
-                    Ok(Instruction::QueryLpFees { lp_idx })
-                }
+                // Tag 24 (QueryLpFees) removed — fell out of the ABI
+                // because fee_credits is a debt counter, not an LP
+                // earnings counter. See the enum comment.
                 25 => {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ReclaimEmptyAccount { user_idx })
@@ -7602,32 +7606,6 @@ pub mod processor {
                     base_to_pay,
                     &signer_seeds,
                 )?;
-            }
-
-            Instruction::QueryLpFees { lp_idx } => {
-                // §2.2: Read-only query of LP cumulative fees. No state mutation.
-                accounts::expect_len(accounts, 1)?;
-                let a_slab = &accounts[0];
-
-                let data = a_slab.try_borrow_data()?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                let engine = zc::engine_ref(&data)?;
-                check_idx(engine, lp_idx)?;
-                if !engine.accounts[lp_idx as usize].is_lp() {
-                    return Err(PercolatorError::EngineNotAnLPAccount.into());
-                }
-
-                // Return the LP's earned (positive) fee credit balance. Debt
-                // is represented as a negative value in the engine; we clamp to
-                // zero for the u64 wire format. Fee credits cannot exceed
-                // realistic u64 range for any live market; saturate as a
-                // defensive bound rather than truncating silently.
-                let fc = engine.accounts[lp_idx as usize].fee_credits.get();
-                let earned = if fc > 0 { fc as u128 } else { 0u128 };
-                let fees: u64 = if earned > u64::MAX as u128 { u64::MAX } else { earned as u64 };
-                solana_program::program::set_return_data(&fees.to_le_bytes());
             }
 
             Instruction::ReclaimEmptyAccount { user_idx } => {

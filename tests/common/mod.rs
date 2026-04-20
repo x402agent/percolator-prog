@@ -5379,33 +5379,6 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
-    /// QueryLpFees (tag 24) -- read-only, no signer required
-    pub fn try_query_lp_fees(&mut self, lp_idx: u16) -> Result<(), String> {
-        let caller = Keypair::new();
-        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
-
-        let mut data = vec![24u8];
-        data.extend_from_slice(&lp_idx.to_le_bytes());
-
-        let ix = Instruction {
-            program_id: self.program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(self.slab, false), // 0: slab (read-only)
-            ],
-            data,
-        };
-
-        let tx = Transaction::new_signed_with_payer(
-            &[cu_ix(), ix],
-            Some(&caller.pubkey()),
-            &[&caller],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
 
     // ------------------------------------------------------------------
     // Account field readers for fee_credits and fees_earned_total
