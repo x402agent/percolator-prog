@@ -5972,3 +5972,87 @@ fn test_hyperp_init_rejects_permissionless_window_past_accrue_envelope() {
         too_large,
     ).expect_err("init must reject perm_resolve past the accrue envelope");
 }
+
+/// TradeCpi ABI: variadic tail accounts past index 7 are forwarded
+/// verbatim to the matcher CPI. This test exercises the wiring — it
+/// passes two arbitrary readonly accounts after the fixed 8 and
+/// asserts that the instruction still succeeds.
+///
+/// Scope of this test: proves the wrapper does NOT reject the tail
+/// and does NOT corrupt the CPI plumbing (account-count / info-slice
+/// mismatches would surface as `NotEnoughAccountKeys`, `MissingAccount`,
+/// or `AccountBorrowFailed`). The test does NOT prove the matcher
+/// actually reads the tail accounts — that's matcher-side
+/// responsibility (the stub matcher in-tree does not inspect its
+/// tail). Integrators who rely on tail accounts should add a matcher-
+/// side assertion.
+#[test]
+fn test_tradecpi_forwards_variadic_tail_to_matcher() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // Two arbitrary readonly tail accounts. Using the existing pyth
+    // index and pyth collateral accounts so the AccountInfo resolves
+    // cleanly through litesvm; the matcher ignores them but that's OK
+    // — we are testing wrapper wiring, not matcher behavior.
+    let tail = vec![
+        AccountMeta::new_readonly(env.pyth_index, false),
+        AccountMeta::new_readonly(env.pyth_col, false),
+    ];
+
+    env.set_slot(10);
+    env.try_trade_cpi_with_tail(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+        &tail,
+    )
+    .expect("TradeCpi with 2-account variadic tail must succeed");
+}
+
+/// Companion: a trade with ZERO tail (the canonical 8-account form)
+/// must behave identically — documents that the tail is optional.
+#[test]
+fn test_tradecpi_empty_tail_is_canonical() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 10).unwrap();
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000);
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(10);
+    env.try_trade_cpi_with_tail(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+        &[], // empty tail
+    )
+    .expect("TradeCpi with empty tail must succeed (canonical 8-account form)");
+}

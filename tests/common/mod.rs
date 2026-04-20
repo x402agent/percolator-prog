@@ -3631,6 +3631,56 @@ impl TradeCpiTestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    /// Execute TradeCpi with an extra variadic tail. The wrapper is
+    /// documented to forward accounts past index 7 to the matcher
+    /// CPI verbatim. Used by the tail-forwarding regression test.
+    pub fn try_trade_cpi_with_tail(
+        &mut self,
+        user: &Keypair,
+        lp_owner: &Pubkey,
+        lp_idx: u16,
+        user_idx: u16,
+        size: i128,
+        matcher_prog: &Pubkey,
+        matcher_ctx: &Pubkey,
+        tail: &[AccountMeta],
+    ) -> Result<(), String> {
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (lp_pda, _) =
+            Pubkey::find_program_address(&[b"lp", self.slab.as_ref(), &lp_bytes], &self.program_id);
+
+        let mut metas = vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(*lp_owner, false),
+            AccountMeta::new(self.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(self.pyth_index, false),
+            AccountMeta::new_readonly(*matcher_prog, false),
+            AccountMeta::new(*matcher_ctx, false),
+            AccountMeta::new_readonly(lp_pda, false),
+        ];
+        for m in tail.iter() {
+            metas.push(m.clone());
+        }
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: metas,
+            data: encode_trade_cpi(lp_idx, user_idx, size),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&user.pubkey()),
+            &[user],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
     /// Execute TradeCpi with a limit price for slippage protection
     pub fn try_trade_cpi_with_limit(
         &mut self,

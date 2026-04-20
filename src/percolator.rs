@@ -422,6 +422,17 @@ pub mod verify {
 
     /// Account count requirement: must have at least `need` accounts.
     #[inline]
+    /// Account-count check. Most handlers want "at least N" — the
+    /// handler only indexes into the first N slots and ignores any
+    /// trailing accounts. A blanket strict-equal rule would be more
+    /// defensive but would break every caller/test that appends a
+    /// conventional trailing clock/sysvar to a Solana tx out of habit;
+    /// the blast radius of that change is large and each handler
+    /// needs per-site review.
+    ///
+    /// TradeCpi deliberately uses this "at least" behavior: the
+    /// variadic tail beyond its 8 fixed accounts is forwarded to the
+    /// matcher CPI. See the TradeCpi handler for the full ABI.
     pub fn len_ok(actual: usize, need: usize) -> bool {
         actual >= need
     }
@@ -982,23 +993,36 @@ pub mod zc {
         program::invoke_signed,
     };
 
-    /// Invoke the matcher program via CPI. The AccountInfo clones satisfy
-    /// solana_program::program::invoke_signed's ownership requirement
-    /// without relying on lifetime transmutes (the earlier transmute-
-    /// based version has been removed).
+    /// Invoke the matcher program via CPI. The AccountInfo clones
+    /// satisfy solana_program::program::invoke_signed's ownership
+    /// requirement without relying on lifetime transmutes.
+    ///
+    /// `tail` is the caller-supplied variadic account list that
+    /// TradeCpi forwards verbatim to the matcher. The wrapper does
+    /// NOT validate tail contents — the matcher owns that
+    /// responsibility. Tail length is unbounded at the wire level;
+    /// Solana's CPI transaction-size and account-count limits are
+    /// the effective cap.
     #[inline]
     pub fn invoke_signed_trade<'a>(
         ix: &SolInstruction,
         a_lp_pda: &AccountInfo<'a>,
         a_matcher_ctx: &AccountInfo<'a>,
         a_matcher_prog: &AccountInfo<'a>,
+        tail: &[AccountInfo<'a>],
         seeds: &[&[u8]],
     ) -> Result<(), ProgramError> {
-        let infos = [
-            a_lp_pda.clone(),
-            a_matcher_ctx.clone(),
-            a_matcher_prog.clone(),
-        ];
+        // Infos: lp_pda + matcher_ctx + matcher_prog + tail. The
+        // matcher_prog is always included because invoke_signed needs
+        // it to resolve the destination program; the CPI metas do not
+        // list it (Solana convention).
+        let mut infos: alloc::vec::Vec<AccountInfo<'a>> = alloc::vec::Vec::with_capacity(3 + tail.len());
+        infos.push(a_lp_pda.clone());
+        infos.push(a_matcher_ctx.clone());
+        infos.push(a_matcher_prog.clone());
+        for ai in tail.iter() {
+            infos.push(ai.clone());
+        }
         invoke_signed(ix, &infos, &[seeds])
     }
 }
@@ -1837,12 +1861,21 @@ pub mod accounts {
     use crate::error::PercolatorError;
     use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 
+    /// Account-count floor. See `verify::len_ok` — this is "at least
+    /// N" today. TradeCpi specifically documents and uses the tail;
+    /// other handlers ignore extras.
     pub fn expect_len(accounts: &[AccountInfo], n: usize) -> Result<(), ProgramError> {
-        // Length check via verify helper (Kani-provable)
         if !crate::verify::len_ok(accounts.len(), n) {
             return Err(ProgramError::NotEnoughAccountKeys);
         }
         Ok(())
+    }
+
+    /// Alias for `expect_len` that documents the variadic-tail intent
+    /// at the callsite. Functionally identical; the value is making
+    /// the TradeCpi handler self-documenting.
+    pub fn expect_len_min(accounts: &[AccountInfo], n: usize) -> Result<(), ProgramError> {
+        expect_len(accounts, n)
     }
 
     pub fn expect_signer(ai: &AccountInfo) -> Result<(), ProgramError> {
@@ -5641,8 +5674,41 @@ pub mod processor {
                 size,
                 limit_price_e6,
             } => {
-                // Phase 1: Updated account layout - lp_pda must be in accounts
-                accounts::expect_len(accounts, 8)?;
+                // Account layout:
+                //   [0]  user (signer)
+                //   [1]  lp_owner (non-signer; matcher delegates auth)
+                //   [2]  slab (writable)
+                //   [3]  clock sysvar
+                //   [4]  oracle
+                //   [5]  matcher_program
+                //   [6]  matcher_context (writable)
+                //   [7]  lp_pda (PDA: ["lp", slab, lp_idx])
+                //   [8..] VARIADIC TAIL forwarded to matcher CPI verbatim
+                //
+                // The variadic tail is the one deliberate exception to
+                // the wrapper's exact-account-count ABI. Callers can
+                // append any number of extra accounts (other programs,
+                // on-chain state the matcher wants to inspect, etc.)
+                // after the fixed 8. The wrapper does NOT interpret or
+                // validate the tail — it is the MATCHER'S
+                // responsibility to check keys, ownership, and signer
+                // flags on anything it uses. This is what makes it safe:
+                //   1. The matcher is the party the LP has authorized,
+                //      so extending the matcher's account set is an
+                //      LP-scoped authorization.
+                //   2. The wrapper's own state (slab, oracle, vault,
+                //      pyth, etc.) is never in the tail — those are
+                //      always at the fixed indices above. A tail
+                //      account whose key collides with one of the fixed
+                //      slots does not get reinterpreted by the wrapper.
+                //   3. The tail accounts are passed as-is to the CPI
+                //      (preserving signer/writable flags from the outer
+                //      transaction), so the matcher cannot use them to
+                //      gain privileges the caller didn't already grant.
+                // Typical uses: pyth/chainlink feeds for matcher-side
+                // pricing, on-chain whitelist PDAs, cross-program
+                // inventory state, etc.
+                accounts::expect_len_min(accounts, 8)?;
                 let a_user = &accounts[0];
                 let a_lp_owner = &accounts[1];
                 let a_slab = &accounts[2];
@@ -5651,6 +5717,7 @@ pub mod processor {
                 let a_matcher_prog = &accounts[5];
                 let a_matcher_ctx = &accounts[6];
                 let a_lp_pda = &accounts[7];
+                let a_tail = &accounts[8..];
 
                 accounts::expect_signer(a_user)?;
                 // Reject zero-size requests at entry — zero-fill path should only
@@ -5808,14 +5875,27 @@ pub mod processor {
                 cpi_data[27..43].copy_from_slice(&size.to_le_bytes());
                 // bytes 43..67 already zero (padding)
 
-                let metas = [
-                    AccountMeta::new_readonly(*a_lp_pda.key, true),
-                    AccountMeta::new(*a_matcher_ctx.key, false),
-                ];
+                // Build CPI accounts: [lp_pda (signer), matcher_ctx
+                // (writable), ...tail]. Tail metas mirror the outer
+                // transaction's signer/writable flags so the matcher
+                // sees exactly the same privileges the caller sent.
+                // The matcher is responsible for validating keys,
+                // owners, and data on every tail account it uses; the
+                // wrapper does NO interpretation here.
+                let mut metas: alloc::vec::Vec<AccountMeta> = alloc::vec::Vec::with_capacity(2 + a_tail.len());
+                metas.push(AccountMeta::new_readonly(*a_lp_pda.key, true));
+                metas.push(AccountMeta::new(*a_matcher_ctx.key, false));
+                for tail_ai in a_tail.iter() {
+                    metas.push(AccountMeta {
+                        pubkey: *tail_ai.key,
+                        is_signer: tail_ai.is_signer,
+                        is_writable: tail_ai.is_writable,
+                    });
+                }
 
                 let ix = SolInstruction {
                     program_id: *a_matcher_prog.key,
-                    accounts: metas.to_vec(),
+                    accounts: metas,
                     data: cpi_data.to_vec(),
                 };
 
@@ -5830,7 +5910,7 @@ pub mod processor {
                 }
 
                 // Phase 2: Use zc helper for CPI - slab not passed to avoid ExternalAccountDataModified
-                zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, a_matcher_prog, seeds)?;
+                zc::invoke_signed_trade(&ix, a_lp_pda, a_matcher_ctx, a_matcher_prog, a_tail, seeds)?;
 
                 // Clear reentrancy guard after CPI returns.
                 {
