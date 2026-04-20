@@ -638,6 +638,33 @@ creating risk the protocol can't cover.
 init (src/percolator.rs:4190-4194). Both initial and maintenance
 must be nonzero. Admin cannot configure a zero-margin market.
 
+### D47. Insurance-floor drain via inflated losses
+
+**Hypothesis**: Attacker triggers loss cascades to drain insurance
+to the floor, leaving legitimate later losses to hit junior haircut
+early. Winners get haircut that wouldn't have fired without the
+attacker's actions.
+
+**Why discarded**: Losses require the ATTACKER's position to move
+against them. To cause large losses that drain insurance, attacker
+must themselves lose money. Net economic flow: attacker pays loss
+out of their capital → drains insurance → haircut on winners.
+Attacker doesn't benefit from the haircut (they're not the winner).
+Attacker cost > any gain; not rational.
+
+### D48. Junior haircut preservation (record_uninsured_protocol_loss)
+
+**Hypothesis**: After insurance is drained, the remaining uninsured
+loss gets "double-counted" — once via haircut on matured pos, once
+via vault reduction — unfairly penalizing winners.
+
+**Why discarded**: `record_uninsured_protocol_loss` (engine line
+2326) is explicitly a no-op per spec §4.17. Code comment documents
+the exact reason: double-draining would penalize winners twice. The
+current implementation is correct — losses are absorbed purely via
+the haircut mechanism after insurance is drained, without additional
+vault reduction.
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
