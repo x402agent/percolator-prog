@@ -585,6 +585,36 @@ exhausting the u64 space and bricking trading via
 exhausting takes ~234 billion years. Each nonce burn is a full tx
 with Solana-level fees. Economic impossibility, not a protocol flaw.
 
+### D43. Resolved-payout snapshot premature lock
+
+**Hypothesis**: `resolved_payout_h_num/h_den` snapshot locks based on
+`is_terminal_ready() == (neg_pnl_account_count == 0)`. If the
+counter is ever desynced from reality, the snapshot could lock
+prematurely, paying out winners at a favorable ratio that doesn't
+account for not-yet-reconciled losers.
+
+**Why discarded**: `neg_pnl_account_count` is maintained via
+`checked_add/checked_sub` at every PnL/capital transition point
+(set_pnl line 1466-1469, set_capital line 1527-1532). Any
+inconsistency surfaces as CorruptState immediately. There is no
+silent-drift path: the counter is only updated inside the state
+mutation functions that also control the sign transitions, so it
+reflects the actual count at all times.
+
+### D44. c_tot desync on close
+
+**Hypothesis**: CloseAccount removes user's capital from vault but
+could miss updating `c_tot`, leaving c_tot elevated post-close.
+Conservation `V >= C_tot + I` would then be violated (V decreased
+more than C_tot).
+
+**Why discarded**: All capital mutations route through `set_capital`
+(engine line 1588) which applies the signed delta to c_tot using
+checked arithmetic. CloseAccount's `set_capital(idx, 0)` decrements
+c_tot by exactly the account's prior capital. `assert_public_post
+conditions` then verifies conservation; a drift would surface as
+CorruptState.
+
 ## Audit completion status
 
 **16 concrete attack hypotheses probed across two rounds.** Every
