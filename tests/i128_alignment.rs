@@ -24,7 +24,18 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
-const SLAB_LEN: usize = 1525656; // +64 bytes for insurance_authority + close_authority in SlabHeader
+// BPF-target SLAB_LEN, cfg-gated by deployment-size feature.
+#[cfg(all(feature = "small", not(feature = "medium")))]
+const SLAB_LEN: usize = 96696;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+const SLAB_LEN: usize = 382488;
+#[cfg(not(any(feature = "small", feature = "medium")))]
+const SLAB_LEN: usize = 1525656;
+#[cfg(all(feature = "small", not(feature = "medium")))]
+const MAX_ACCOUNTS: usize = 256;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+const MAX_ACCOUNTS: usize = 1024;
+#[cfg(not(any(feature = "small", feature = "medium")))]
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

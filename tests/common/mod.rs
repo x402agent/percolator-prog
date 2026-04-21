@@ -15,17 +15,54 @@ pub use solana_sdk::{
 pub use spl_token::state::{Account as TokenAccount, AccountState};
 pub use std::path::PathBuf;
 
-// SLAB_LEN hard-coded for default MAX_ACCOUNTS=4096. Uses BPF-target
-// alignment (u128 aligned to 8 on sbf vs 16 on x86_64), so this
-// constant CANNOT be derived from `percolator_prog::constants::SLAB
-// _LEN` — that compiles with native alignment and produces a
-// different value than the BPF binary the tests actually run.
+// BPF-target SLAB_LEN values, cfg-gated by the wrapper's deployment-
+// size feature. u128 aligns to 8 on sbf (vs 16 on x86_64), so these
+// values cannot be derived from `percolator_prog::constants::SLAB_LEN`
+// at native compile time — they are BPF-target-specific and observed
+// empirically against the compiled BPF binary.
 //
-// To test with `percolator/small` (1024) or `percolator/medium`
-// (1024), this constant (and the BPF build flags) would need to
-// match. Today the test suite is tied to the default tier.
-pub const SLAB_LEN: usize = 1525656; // 4-way-auth (default 4096 accounts, BPF target)
+// Run `cargo test --features small` for MAX_ACCOUNTS=256, `cargo test
+// --features medium` for MAX_ACCOUNTS=1024, or no flag for the
+// default MAX_ACCOUNTS=4096.
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const SLAB_LEN: usize = 96696;
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const MAX_ACCOUNTS: usize = 256;
+
+#[cfg(all(feature = "medium", not(feature = "small")))]
+pub const SLAB_LEN: usize = 382488;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+pub const MAX_ACCOUNTS: usize = 1024;
+
+#[cfg(not(any(feature = "small", feature = "medium")))]
+pub const SLAB_LEN: usize = 1525656;
+#[cfg(not(any(feature = "small", feature = "medium")))]
 pub const MAX_ACCOUNTS: usize = 4096;
+
+// BPF-target offsets within RiskEngine — cfg-gated because the
+// bitmap and free_list arrays scale with MAX_ACCOUNTS. The BITMAP
+// offset itself is tier-independent (fields before it are size-
+// invariant); NUM_USED_OFFSET = BITMAP + bitmap_size; ACCOUNTS_OFFSET
+// = NUM_USED + 4 (num_used_accounts u16 + free_head u16) + 4 (align
+// padding to 8) + 2 × MAX_ACCOUNTS × 2 (next_free + prev_free u16
+// arrays). Values observed against the compiled BPF binary for each
+// tier.
+pub const ENGINE_BITMAP_OFFSET: usize = 728;
+
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const ENGINE_NUM_USED_OFFSET: usize = 760;
+#[cfg(all(feature = "small", not(feature = "medium")))]
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 1792;
+
+#[cfg(all(feature = "medium", not(feature = "small")))]
+pub const ENGINE_NUM_USED_OFFSET: usize = 856;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 4960;
+
+#[cfg(not(any(feature = "small", feature = "medium")))]
+pub const ENGINE_NUM_USED_OFFSET: usize = 1240;
+#[cfg(not(any(feature = "small", feature = "medium")))]
+pub const ENGINE_ACCOUNTS_OFFSET: usize = 17632;
 
 // Pyth Receiver program ID
 pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -1809,7 +1846,7 @@ impl TestEnv {
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 472, num_used_accounts at engine offset 1224
-        pub const NUM_USED_OFFSET: usize = 536 + 1240;
+        pub const NUM_USED_OFFSET: usize = 536 + ENGINE_NUM_USED_OFFSET;
         if slab_account.data.len() < NUM_USED_OFFSET + 2 {
             return 0;
         }
@@ -1906,7 +1943,7 @@ impl TestEnv {
         let slab_account = self.svm.get_account(&self.slab).unwrap();
         // ENGINE_OFF = 472, accounts array at offset 9376 within RiskEngine
         // Account size = 280 bytes, capital at offset 8 within Account (after account_id u64)
-        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0; // After account_id (u64)
         let account_offset =
@@ -1929,7 +1966,7 @@ impl TestEnv {
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
         pub const ENGINE: usize = 536;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 17632;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + ENGINE_ACCOUNTS_OFFSET;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PBQ: usize = 56;       // position_basis_q: i128 (16 bytes)
         pub const A_BASIS: usize = 72;   // adl_a_basis: u128 (16 bytes)
@@ -4169,7 +4206,7 @@ impl TradeCpiTestEnv {
     pub fn read_account_position(&self, idx: u16) -> i128 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
         pub const ENGINE: usize = 536;
-        pub const ACCOUNTS_OFFSET: usize = ENGINE + 17632;
+        pub const ACCOUNTS_OFFSET: usize = ENGINE + ENGINE_ACCOUNTS_OFFSET;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PBQ: usize = 56;
         pub const A_BASIS: usize = 72;
@@ -4239,9 +4276,8 @@ impl TradeCpiTestEnv {
 
     pub fn read_num_used_accounts(&self) -> u16 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        // ENGINE_OFF (536, after 4-way-auth SlabHeader +64) +
-        // num_used_accounts offset (1240) = 1776.
-        u16::from_le_bytes(slab_data[1776..1778].try_into().unwrap())
+        let off = 536 + ENGINE_NUM_USED_OFFSET;
+        u16::from_le_bytes(slab_data[off..off + 2].try_into().unwrap())
     }
 
     /// Read pnl_pos_tot aggregate from slab
@@ -4291,7 +4327,7 @@ impl TradeCpiTestEnv {
         //   pnl: i128 (16), offset 24
         //   reserved_pnl: u128 (16), offset 40
         //   position_basis_q: i128 (16), offset 56
-        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24;
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
@@ -4472,7 +4508,7 @@ impl TradeCpiTestEnv {
 
     pub fn read_account_capital(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const CAPITAL_OFFSET_IN_ACCOUNT: usize = 0;
         let account_off =
@@ -4769,7 +4805,7 @@ impl TestEnv {
     /// Read account PnL for a slot
     pub fn read_account_pnl(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        pub const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        pub const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         pub const ACCOUNT_SIZE: usize = 360;
         pub const PNL_OFFSET_IN_ACCOUNT: usize = 24; // BPF: i128 has 8-byte alignment
         let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + PNL_OFFSET_IN_ACCOUNT;
@@ -5443,7 +5479,7 @@ impl TestEnv {
     /// Fee credits is at offset 240 within Account.
     pub fn read_account_fee_credits(&self, idx: u16) -> i128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const FEE_CREDITS_OFFSET: usize = 224;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
@@ -5457,7 +5493,7 @@ impl TestEnv {
     /// fees_earned_total is at offset 264 within Account.
     pub fn read_account_fees_earned_total(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const FEES_EARNED_OFFSET: usize = 264;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEES_EARNED_OFFSET;
@@ -5471,7 +5507,7 @@ impl TestEnv {
     /// warmup_started_at_slot is at offset 64 within Account.
     pub fn read_account_warmup_started_at_slot(&self, idx: u16) -> u64 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const WARMUP_SLOT_OFFSET: usize = 64;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + WARMUP_SLOT_OFFSET;
@@ -5485,7 +5521,7 @@ impl TestEnv {
     /// reserved_pnl is at offset 48 within Account.
     pub fn read_account_reserved_pnl(&self, idx: u16) -> u128 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const RESERVED_PNL_OFFSET: usize = 40; // BPF: u128 has 8-byte alignment
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + RESERVED_PNL_OFFSET;
@@ -5501,7 +5537,7 @@ impl TestEnv {
     ///   kind: u8 at offset 16
     pub fn read_account_kind(&self, idx: u16) -> u8 {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const KIND_OFFSET: usize = 16;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + KIND_OFFSET;
@@ -5515,7 +5551,7 @@ impl TestEnv {
     /// matcher_program is at offset 144 within Account (BPF layout).
     pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const MATCHER_PROG_OFFSET: usize = 128;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
@@ -5528,7 +5564,7 @@ impl TestEnv {
     /// matcher_context is at offset 176 within Account (BPF layout).
     pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
-        const ACCOUNTS_OFFSET: usize = 536 + 17632;
+        const ACCOUNTS_OFFSET: usize = 536 + ENGINE_ACCOUNTS_OFFSET;
         const ACCOUNT_SIZE: usize = 360;
         const MATCHER_CTX_OFFSET: usize = 160;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
@@ -7967,7 +8003,7 @@ impl TestEnv {
         use bytemuck::Zeroable;
         let d = self.svm.get_account(&self.slab).unwrap().data;
         let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
-        let gen_table_size = 4096 * 8; // MAX_ACCOUNTS * sizeof(u64)
+        let gen_table_size = MAX_ACCOUNTS * 8;
         let buf_off = SLAB_LEN - gen_table_size - buf_size;
         let mut buf = percolator_prog::risk_buffer::RiskBuffer::zeroed();
         bytemuck::bytes_of_mut(&mut buf).copy_from_slice(&d[buf_off..buf_off + buf_size]);

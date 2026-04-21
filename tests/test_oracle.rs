@@ -119,7 +119,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
     const HEADER_CONFIG_LEN: usize = 584;
-    const NUM_USED_OFF: usize = 1776;
+    let NUM_USED_OFF: usize = 536 + common::ENGINE_NUM_USED_OFFSET;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {
         let vault_data = svm.get_account(&vault).unwrap().data;
@@ -290,7 +290,8 @@ fn test_hyperp_init_market_with_valid_price() {
     let cap = config.oracle_price_cap_e2bps;
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
+    let used_off = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(
@@ -448,7 +449,8 @@ fn test_hyperp_init_market_with_inverted_price() {
     let cap = config.oracle_price_cap_e2bps;
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used = u16::from_le_bytes(slab_data[1648..1650].try_into().unwrap());
+    let used_off = 536 + common::ENGINE_NUM_USED_OFFSET;
+    let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
     assert_eq!(

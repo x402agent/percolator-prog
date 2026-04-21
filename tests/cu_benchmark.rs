@@ -30,7 +30,13 @@ use std::path::PathBuf;
 // SLAB_LEN / MAX_ACCOUNTS: production BPF values. The wrapper's `"test"`
 // feature (which compiled the engine with MAX_ACCOUNTS=64 for native unit
 // tests) has been removed; integration tests go through the BPF binary.
-const SLAB_LEN: usize = 1525656; // +64 bytes for insurance_authority + close_authority in SlabHeader
+// BPF-target SLAB_LEN, cfg-gated by deployment-size feature.
+#[cfg(all(feature = "small", not(feature = "medium")))]
+const SLAB_LEN: usize = 96696;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+const SLAB_LEN: usize = 382488;
+#[cfg(not(any(feature = "small", feature = "medium")))]
+const SLAB_LEN: usize = 1525656;
 const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)

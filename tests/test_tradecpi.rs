@@ -5591,7 +5591,7 @@ fn test_tradecpi_buffer_notional_uses_oracle_price() {
         use bytemuck::Zeroable;
         let d = env.svm.get_account(&env.slab).unwrap().data;
         let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
-        let gen_table_size = 4096 * 8;
+        let gen_table_size = common::MAX_ACCOUNTS * 8;
         let buf_off = SLAB_LEN - gen_table_size - buf_size;
         let mut buf = percolator_prog::risk_buffer::RiskBuffer::zeroed();
         bytemuck::bytes_of_mut(&mut buf).copy_from_slice(&d[buf_off..buf_off + buf_size]);
