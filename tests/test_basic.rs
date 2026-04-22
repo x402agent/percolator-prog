@@ -5235,6 +5235,173 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     );
 }
 
+/// Regression: reward must pay on the SECOND crank of a market with live
+/// positions, not just the first.
+///
+/// The earlier `test_keeper_crank_reward_pays_half...` test only exercises
+/// the first crank against a market with no open positions. That path keeps
+/// the risk buffer empty, so `combined` stays empty, no candidate-sync
+/// happens, and all fees flow through `sweep_maintenance_fees` — giving
+/// `sweep_delta > 0` and paying the reward.
+///
+/// On a real market, Phase C of the crank's risk-buffer maintenance
+/// populates the buffer with every used account that holds a non-zero
+/// effective position. On the NEXT crank, those accounts show up in
+/// `combined`, and the candidate-sync loop realizes their fees to insurance
+/// BEFORE `ins_before` is captured. `sweep_maintenance_fees` then finds
+/// nothing left to charge (all touched accounts have `last_fee_slot == now`
+/// already), so `sweep_delta == 0` and the reward branch silently skips.
+///
+/// That was the devnet bug: cranker capital drops by their own fee with no
+/// offsetting reward, even though every gate condition appears satisfied.
+/// Fix: capture `ins_before` BEFORE the candidate-sync loop so the reward
+/// base reflects ALL fee collection this crank did — candidate-directed or
+/// bitmap-swept.
+#[test]
+fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(), &env.mint, &TEST_FEED_ID,
+        1_000_000_000, // max_maintenance_fee_per_slot
+        1_000,         // maintenance_fee_per_slot
+        0,             // min_oracle_price_cap
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // LP + user with an actual trade so both end up with non-zero
+    // effective positions. Phase C then upserts them into the risk
+    // buffer on the first crank — that's the precondition that
+    // surfaces the bug on the second crank.
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(10);
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
+
+    // Crank #1 at slot 500: empty risk buffer, all fees flow through the
+    // sweep, reward pays. Phase C at the end populates the buffer.
+    env.set_slot(500);
+    env.crank_as(&user, user_idx);
+    env.svm.expire_blockhash();
+
+    // Crank #2 at slot 1000: buffer is populated, `combined` includes
+    // LP + user. Without the fix, candidate-sync realizes their fees
+    // to insurance before ins_before is captured → sweep_delta == 0 →
+    // reward gate fails silently.
+    env.set_slot(1000);
+    let cap_before = env.read_account_capital(user_idx);
+    let ins_before = env.read_insurance_balance();
+    env.crank_as(&user, user_idx);
+    let cap_after = env.read_account_capital(user_idx);
+    let ins_after = env.read_insurance_balance();
+
+    let cap_delta: i128 = (cap_after as i128) - (cap_before as i128);
+    let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
+
+    // Each of the 2 used accounts (LP, user) owes fee = 1_000 × 500 =
+    // 500_000 for the [500, 1000] interval. Total fee = 1_000_000.
+    // Reward = 500_000 to cranker, insurance keeps 500_000. Cranker's
+    // net = reward − own fee = 500_000 − 500_000 = 0.
+    let per_account_fee: i128 = 1_000 * 500;
+    let total_fee: i128 = per_account_fee * 2;
+    let reward: i128 = total_fee / 2;
+    let insurance_share: i128 = total_fee / 2;
+    let expected_cap_delta: i128 = reward - per_account_fee;
+
+    assert_eq!(
+        cap_delta, expected_cap_delta,
+        "second-crank reward must still pay (expected cap Δ = {expected_cap_delta}, got {cap_delta}). \
+         Bug symptom on devnet: cap Δ = −{per_account_fee} with no reward credit."
+    );
+    assert_eq!(
+        ins_delta, insurance_share,
+        "insurance must keep exactly 50% (expected {insurance_share}, got {ins_delta}). \
+         Full-sweep-to-insurance is the devnet bug signature."
+    );
+}
+
+/// Regression (PR #33): InitUser/InitLP must reject rather than silently
+/// wrap when the global materialization counter would overflow u64::MAX.
+///
+/// The counter (`_reserved[8..16]` in the slab header) supplies the
+/// per-account `lp_account_id`. Wrapping to 0 would collide with the
+/// "never-materialized" sentinel that TradeCpi rejects — every further
+/// InitLP would silently materialize an account whose lp_account_id
+/// makes it permanently untradeable. checked_add + `?` surfaces the
+/// condition explicitly instead.
+///
+/// Repro: poke the counter byte-field directly to u64::MAX via
+/// svm.set_account, then attempt InitUser. The wrapper's
+/// `next_mat_counter` returns `None`, callers convert to
+/// `PercolatorError::EngineOverflow` (code 0x12), and the tx fails.
+#[test]
+fn test_init_user_rejects_when_mat_counter_would_overflow() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = common::encode_init_market_full(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        0,    // invert
+        1,    // unit_scale
+        1000, // new_account_fee
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    // Poke mat_counter to u64::MAX so the next increment would overflow.
+    // RESERVED_OFF = 48 (see percolator.rs), counter lives at +8..+16.
+    const RESERVED_OFF: usize = 48;
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    acct.data[RESERVED_OFF + 8..RESERVED_OFF + 16]
+        .copy_from_slice(&u64::MAX.to_le_bytes());
+    env.svm.set_account(env.slab, acct).unwrap();
+
+    // Sanity: confirm the poke took hold.
+    let counter = {
+        let a = env.svm.get_account(&env.slab).unwrap();
+        u64::from_le_bytes(
+            a.data[RESERVED_OFF + 8..RESERVED_OFF + 16].try_into().unwrap()
+        )
+    };
+    assert_eq!(
+        counter, u64::MAX,
+        "setup failure: mat_counter poke did not persist"
+    );
+
+    // InitUser must REJECT with overflow rather than succeeding — silent
+    // wrap would produce generation=0, which TradeCpi rejects as the
+    // never-materialized sentinel. Use a well-funded fee payment so the
+    // transfer/fee paths succeed and execution reaches next_mat_counter.
+    // fee_payment must exceed new_account_fee (1000) so non-zero capital
+    // remains after the fee split — otherwise InitUser rejects early with
+    // EngineInsufficientBalance and we never reach next_mat_counter.
+    let user = Keypair::new();
+    let err = env
+        .try_init_user_with_fee(&user, 2000)
+        .expect_err(
+            "InitUser must fail with overflow when mat_counter is at u64::MAX. \
+             If this succeeds, next_mat_counter wraps silently and new accounts \
+             inherit generation=0 — the TradeCpi sentinel that blocks trading.",
+        );
+    // 0x12 = PercolatorError::EngineOverflow (18th variant in declaration order).
+    // The engine-Overflow mapping routes RiskError::Overflow here too; either
+    // the next_mat_counter branch or the engine check can fire — both are
+    // the correct "reject overflow" signal.
+    assert!(
+        err.contains("0x12") || err.contains("Overflow"),
+        "expected EngineOverflow (0x12), got: {err}"
+    );
+}
+
 /// Permissionless crank must not pay a reward — the caller has no account.
 #[test]
 fn test_keeper_crank_permissionless_pays_no_reward() {

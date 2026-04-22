@@ -468,3 +468,116 @@ commits:
 
 The SLAB_LEN cascade (RiskParams field removals in earlier
 commits) was verified against all three BPF binary sizes.
+
+---
+
+## F5 — KeeperCrank reward never pays on steady-state markets (HIGH, economic)
+
+**Location:** `src/percolator.rs:5278-5341` (KeeperCrank handler).
+
+**Reported from devnet:** slab `dtrNVk7otCtcmPvrARnLxi5nWoNFYQYS7b9vC1Yjnt2`
+with byte-identical HEAD binary (hash matches `build-sbf` output,
+confirmed after stripping program-data zero padding). Permissioned
+cranks with `caller_idx ∈ {0, 1}` observe full sweep → insurance
+with `caller cap Δ = −fee` (no reward credit), across multiple
+cranks and multiple caller identities.
+
+**Bug.** The reward base `sweep_delta` was captured AFTER the
+candidate-sync phase:
+
+```rust
+// OLD (buggy):
+for &(idx, _policy) in combined.iter() { ... sync_account_fee ... }
+let ins_before = engine.insurance_fund.balance.get();  // too late
+sweep_maintenance_fees(engine, ...);
+let sweep_delta = engine.insurance_fund.balance.get().sub(ins_before);
+```
+
+`combined = risk_buffer ++ caller_candidates`. The risk buffer
+auto-populates via Phase C of the crank's own buffer maintenance
+(`src/percolator.rs:5480-5491`) on every live-position market. So
+on the **second and every subsequent crank**:
+
+1. `combined` is non-empty (holds every account with a position).
+2. Candidate-sync loop charges each candidate's fee to insurance.
+3. `ins_before` captured — already includes those fees.
+4. `sweep_maintenance_fees` iterates the bitmap, re-visits the same
+   accounts, but sync is idempotent at same-slot — no additional
+   fee charged.
+5. `sweep_delta = 0` → reward gate fails on `sweep_delta > 0`.
+
+LiteSVM's existing `test_keeper_crank_reward_pays_half_of_swept_fees`
+only exercised the FIRST crank against a market with no positions,
+so `combined` stayed empty and the bug was invisible.
+
+**Impact.** Keeper economics broken in production: cranker pays
+their own maintenance fee with zero reward credit. Over time this
+disincentivizes cranking — which is the mechanism the protocol
+relies on to realize maintenance fees and prune dust.
+
+**Fix.** Capture `ins_before` BEFORE the candidate-sync loop so
+the reward base covers ALL fee collection this crank performed:
+
+```rust
+// NEW:
+let ins_before = engine.insurance_fund.balance.get();
+for &(idx, _policy) in combined.iter() { ... sync_account_fee ... }
+sweep_maintenance_fees(engine, ...);
+let sweep_delta = engine.insurance_fund.balance.get().sub(ins_before);
+```
+
+No reward-inflation vector opens up: `sync_account_fee_to_slot_not_atomic`
+is idempotent at same-slot (a caller can't double-charge the same
+account), duplicates in `combined` are deduped at decode
+(`src/percolator.rs:5311-5315`), unused slots are skipped before
+budget consumption (`src/percolator.rs:5309`), and total syncs per
+instruction stay bounded by `FEE_SWEEP_BUDGET`. The reward is
+still 50% of exactly what the caller helped collect.
+
+**Regression test.**
+`tests/test_basic.rs::test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer`
+— reproduces the devnet scenario: LP + user with open positions,
+first crank populates the buffer, second crank must still pay
+reward. Fails on HEAD before the fix with `cap Δ = −500_000`
+(matching devnet), passes after.
+
+---
+
+## F6 — Ignored `_not_atomic` reclaim error in sweep (MEDIUM, hardening)
+
+**Location:** `src/percolator.rs:3609` (`sweep_maintenance_fees`).
+
+**Pattern (before):**
+```rust
+let _ = engine
+    .reclaim_empty_account_not_atomic(idx as u16, now_slot);
+```
+
+**Concern.** The engine header states that `_not_atomic` functions
+may return `Err` after partial mutation, and callers must abort
+the transaction on error. Silently swallowing the Result violates
+that contract. Today the wrapper's flat-clean pre-checks make all
+`Undercollateralized`/`CorruptState` engine paths unreachable, so
+no exploit exists — but any future engine-side precondition would
+turn this into silent state corruption.
+
+**Fix.** Add the missing `fee_credits <= 0` pre-check (closes the
+last engine-side `CorruptState` path), then propagate with `?`:
+
+```rust
+if acc.capital.is_zero()
+    && acc.position_basis_q == 0
+    && acc.pnl == 0
+    && acc.reserved_pnl == 0
+    && acc.sched_present == 0
+    && acc.pending_present == 0
+    && acc.fee_credits.get() <= 0
+{
+    engine
+        .reclaim_empty_account_not_atomic(idx as u16, now_slot)
+        .map_err(map_risk_error)?;
+}
+```
+
+Existing dust-reclaim regression coverage
+(`test_dust_account_drained_and_gc_by_crank_alone`) still passes.

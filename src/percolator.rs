@@ -3589,15 +3589,26 @@ pub mod processor {
                 // Permissionless dust reclaim: fee accrual just charged
                 // this account; if that drained capital to zero on a
                 // flat account (no position, no PnL, no reserve, no
-                // pending), free the slot now. The engine's reclaim
-                // call re-checks all preconditions and forgives any
-                // fee_credits debt < 0, so we don't need to mirror
-                // those checks here — `capital == 0` is the cheap
-                // gate, the engine guarantees the rest. Without this,
-                // an attacker could fill `max_accounts` with dust and
-                // brick onboarding even when fees drain capital,
-                // because slot reclamation would still require an
-                // explicit per-account `ReclaimEmptyAccount` call.
+                // pending, no positive fee_credits), free the slot now.
+                // Without this, an attacker could fill `max_accounts`
+                // with dust and brick onboarding even when fees drain
+                // capital, because slot reclamation would still require
+                // an explicit per-account `ReclaimEmptyAccount` call.
+                //
+                // All six flat-clean predicates the engine's reclaim
+                // checks are mirrored here so the call CANNOT hit an
+                // `Undercollateralized` / `CorruptState` early return.
+                // That lets us propagate any remaining error with `?`
+                // rather than silently swallowing a `_not_atomic`
+                // failure — per the engine contract, a failing
+                // `_not_atomic` may have already mutated state and the
+                // caller must abort the transaction. Envelope /
+                // market-mode guards upstream (KeeperCrank's oracle
+                // read + is_resolved gate + accrue_market_to) ensure
+                // the remaining engine preconditions hold, so in
+                // practice the `?` is unreachable — but if a future
+                // engine change introduces a new precondition, we get
+                // a transaction rollback instead of silent corruption.
                 let acc = &engine.accounts[idx];
                 if acc.capital.is_zero()
                     && acc.position_basis_q == 0
@@ -3605,9 +3616,11 @@ pub mod processor {
                     && acc.reserved_pnl == 0
                     && acc.sched_present == 0
                     && acc.pending_present == 0
+                    && acc.fee_credits.get() <= 0
                 {
-                    let _ = engine
-                        .reclaim_empty_account_not_atomic(idx as u16, now_slot);
+                    engine
+                        .reclaim_empty_account_not_atomic(idx as u16, now_slot)
+                        .map_err(map_risk_error)?;
                 }
             }
             // Word fully drained — advance to next word, reset bit cursor.
@@ -5275,6 +5288,20 @@ pub mod processor {
                 // on consecutive entries, which is idempotent at the same
                 // anchor). The wrapper skips duplicate SYNC calls purely
                 // to save CU — dedup is within the loop, not the budget.
+                // Capture the pre-fee-collection insurance balance so the
+                // reward base reflects EVERY fee this crank swept in —
+                // candidate-directed syncs AND the bitmap sweep. Earlier
+                // revisions captured `ins_before` between the two phases,
+                // which silently dropped the reward to zero whenever the
+                // risk buffer auto-populated `combined` (i.e. on every
+                // crank after the first live crank). Including both
+                // phases is safe: `sync_account_fee_to_slot_not_atomic`
+                // is idempotent at same-slot and the shared FEE_SWEEP
+                // _BUDGET still caps total syncs, so a caller cannot
+                // inflate the reward by stuffing candidates — duplicates
+                // are dedup'd, already-synced accounts are no-ops, and
+                // unused slots are skipped before consuming budget.
+                let ins_before = engine.insurance_fund.balance.get();
                 let mut candidate_syncs = 0usize;
                 if config.maintenance_fee_per_slot > 0 {
                     // Candidate syncs share the FEE_SWEEP_BUDGET with
@@ -5326,11 +5353,6 @@ pub mod processor {
                     }
                 }
 
-                // Sweep with the REMAINING fee-sync budget. Keeper
-                // reward (sweep_delta) is computed from balance
-                // BEFORE the sweep, so candidate-sync deltas are
-                // excluded from the reward.
-                let ins_before = engine.insurance_fund.balance.get();
                 let remaining_budget = crate::constants::FEE_SWEEP_BUDGET
                     .saturating_sub(candidate_syncs);
                 sweep_maintenance_fees(engine, &mut config, clock.slot, remaining_budget)?;
