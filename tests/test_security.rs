@@ -13236,3 +13236,275 @@ fn test_attack_settle_account_idempotent_at_same_slot() {
     );
 }
 
+/// ATTACK (security R&D loop, iteration 4 — perp DEX corner case):
+/// Net-zero trade cycle — open and immediately close the same position
+/// at the same oracle price. Alice's capital should end at
+/// `initial - 2*fee` with `position_basis_q == 0`. Any drift beyond
+/// the two-fee outcome is weird and potentially extractable over
+/// many cycles.
+///
+/// Attacker model: Alice repeatedly opens-and-closes a position
+/// against the same LP at the same oracle price. With zero trading
+/// fees (bps=0) and zero funding, the round trip should be *exactly*
+/// capital-preserving — any per-cycle drift is free money for
+/// whoever captures the drift direction.
+///
+/// Why this matters (classic perp DEX failure mode): rounding
+/// asymmetry between open (floor) and close (ceil), or PnL
+/// accounting that credits the closer differently than it debits
+/// the opener, can accumulate per-cycle. An attacker running the
+/// cycle 10^6 times can extract meaningful dust from the vault.
+///
+/// Success criterion (weird): Alice's capital end != start AND LP's
+/// capital end != start (modulo fees). OR the sum of deltas is
+/// nonzero (asymmetric rounding → protocol gain or loss).
+/// Expected: everything returns to start, or LP gains = Alice loss
+/// and the sum is exactly zero.
+#[test]
+fn test_attack_net_zero_trade_cycle_preserves_capital() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Zero fees so the round trip should be exactly zero-sum. Any
+    // drift is structural, not fee-related.
+    // NOTE: encode_init_market_with_maint_fee_bounded hardcodes
+    // trading_fee_bps = 0, so we get free trading for this probe.
+    let data = common::encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        1_000_000_000,
+        0, // maintenance_fee_per_slot — off
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let alice = Keypair::new();
+    let alice_idx = env.init_user(&alice);
+    env.deposit(&alice, alice_idx, 10_000_000_000);
+
+    // Snapshot all four quantities at steady state.
+    env.set_slot(100);
+    let alice_cap0 = env.read_account_capital(alice_idx);
+    let lp_cap0 = env.read_account_capital(lp_idx);
+    let ins0 = env.read_insurance_balance();
+    let vault0 = env.vault_balance();
+
+    // Open: Alice buys 10M units from LP.
+    env.trade(&alice, &lp, lp_idx, alice_idx, 10_000_000);
+
+    // Close: Alice sells 10M back. Same slot, same oracle price.
+    // (Uses expire_blockhash to distinguish the two txs — LiteSVM
+    // dedupes identical blockhashes even for different instruction
+    // data.)
+    env.svm.expire_blockhash();
+    env.trade(&alice, &lp, lp_idx, alice_idx, -10_000_000);
+
+    // Post-cycle snapshot.
+    let alice_cap1 = env.read_account_capital(alice_idx);
+    let lp_cap1 = env.read_account_capital(lp_idx);
+    let ins1 = env.read_insurance_balance();
+    let vault1 = env.vault_balance();
+
+    let alice_delta: i128 = (alice_cap1 as i128) - (alice_cap0 as i128);
+    let lp_delta: i128 = (lp_cap1 as i128) - (lp_cap0 as i128);
+    let ins_delta: i128 = (ins1 as i128) - (ins0 as i128);
+    let vault_delta: i128 = (vault1 as i128) - (vault0 as i128);
+
+    // Conservation: capital + insurance moves must sum to vault move
+    // (which should be 0 — no money in or out).
+    let sum_capital_delta = alice_delta + lp_delta + ins_delta;
+    assert_eq!(
+        vault_delta, 0,
+        "vault must not change across a closed round-trip",
+    );
+    assert_eq!(
+        sum_capital_delta, 0,
+        "conservation: sum of all capital+insurance deltas must be 0 \
+         (vault unchanged). Alice Δ={alice_delta}, LP Δ={lp_delta}, \
+         Insurance Δ={ins_delta}.",
+    );
+
+    // Position must be exactly zero for Alice.
+    let alice_pos = env.read_account_position(alice_idx);
+    assert_eq!(
+        alice_pos, 0,
+        "Alice's position must be zero after the exact-offset close. \
+         Got {alice_pos} — engine is leaking position basis.",
+    );
+
+    // With zero fees, the ideal outcome is `alice_delta == 0` and
+    // `lp_delta == 0`. A symmetric rounding loss (e.g. −1 to each
+    // side, +2 to insurance) is also acceptable and conservation-
+    // preserving. Asymmetric drift (one party gains, another loses)
+    // is weird and attacker-exploitable over repetition.
+    //
+    // Log the exact observed shape so a future run that diverges
+    // gives a readable failure.
+    println!(
+        "round-trip deltas: Alice={alice_delta}, LP={lp_delta}, \
+         Insurance={ins_delta}, vault={vault_delta}"
+    );
+    assert!(
+        alice_delta <= 0 && lp_delta <= 0,
+        "UNEXPECTED GAIN from a zero-sum close. Alice Δ={alice_delta}, \
+         LP Δ={lp_delta}. A user cannot gain from a round-trip with \
+         zero fees — the counterparty or insurance must take the \
+         rounding, not a trader.",
+    );
+}
+
+/// ATTACK (security R&D loop, iteration 5 — perp DEX corner case):
+/// Position flip through zero with price movement in between. Classic
+/// source of bugs in perp DEXs: when a trade crosses the zero
+/// position line, the engine must split the trade into
+/// (close-and-realize) + (open-at-flip-price) accounting, not treat
+/// the whole thing as a single position adjustment.
+///
+/// Attack mechanic: If the engine doesn't realize PnL on the close
+/// portion before opening the reverse side, the cost basis for the
+/// new short could absorb the profit from the old long, hiding it
+/// inside unrealized PnL that the user can extract asymmetrically.
+///
+/// Also: spec §3 (position flips) mandates the crossed trade check
+/// `initial_margin_bps` (not maintenance_margin_bps) since it's
+/// effectively opening a new position. If the wrapper/engine uses
+/// MM instead of IM, the user can open a more-leveraged reverse
+/// position than they'd otherwise be allowed.
+///
+/// Scenario:
+///   1. Alice long 10M at oracle=$1.00.
+///   2. Price moves to $1.10 (engine still uses stored mark; accrue
+///      happens inside next trade's preamble).
+///   3. Alice sells 20M at $1.10. Should flip to short 10M.
+///
+/// Expected:
+///   - Alice's realized PnL from the 10M close at $1.10: +$1.0M
+///     (+10M × $0.10/1e6 in the 1e6-scaled POS units).
+///   - Alice's new position: -10M short, entry around $1.10.
+///   - LP's capital ~ mirror (zero fees).
+///
+/// Weird:
+///   - Alice's position != -10M after the flip.
+///   - Conservation broken (vault delta != 0 across a trade that
+///     didn't touch capital/fees).
+///   - Entry price stale (old $1.00 still applied to the new short).
+#[test]
+fn test_attack_position_flip_through_zero_with_pnl() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = common::encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        1_000_000_000,
+        0,  // no maintenance fee
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let alice = Keypair::new();
+    let alice_idx = env.init_user(&alice);
+    env.deposit(&alice, alice_idx, 10_000_000_000);
+
+    // Step 1: open long 10M at $1.00 (1_000_000 in e6 scale).
+    env.set_slot_and_price(100, 1_000_000);
+    env.trade(&alice, &lp, lp_idx, alice_idx, 10_000_000);
+    let alice_pos_after_long = env.read_account_position(alice_idx);
+    assert_eq!(alice_pos_after_long, 10_000_000, "open long failed");
+
+    // Step 2: advance slot + bump price to $1.10.
+    env.set_slot_and_price(200, 1_100_000);
+    env.svm.expire_blockhash();
+
+    let alice_cap_pre_flip = env.read_account_capital(alice_idx);
+    let lp_cap_pre_flip = env.read_account_capital(lp_idx);
+    let ins_pre_flip = env.read_insurance_balance();
+    let vault_pre_flip = env.vault_balance();
+
+    // Step 3: sell 20M — should close 10M long (+PnL) and open 10M
+    // short at $1.10.
+    env.trade(&alice, &lp, lp_idx, alice_idx, -20_000_000);
+
+    let alice_pos_after_flip = env.read_account_position(alice_idx);
+    let alice_cap_after_flip = env.read_account_capital(alice_idx);
+    let lp_cap_after_flip = env.read_account_capital(lp_idx);
+    let ins_after_flip = env.read_insurance_balance();
+    let vault_after_flip = env.vault_balance();
+
+    // Primary invariant: position must be exactly -10M (short 10M).
+    assert_eq!(
+        alice_pos_after_flip, -10_000_000,
+        "POSITION FLIP BROKEN: expected -10M short, got {alice_pos_after_flip}. \
+         Engine lost track of position basis across the zero-crossing.",
+    );
+
+    // Conservation: vault must not move during a trade.
+    assert_eq!(
+        (vault_after_flip as i128) - (vault_pre_flip as i128),
+        0,
+        "vault moved during a trade — tokens leaked somewhere",
+    );
+
+    // Conservation: full vault = c_tot + insurance + sum(pnl).
+    // Profits (Alice side) park in pnl field (warmup-deferred, spec
+    // §6.2) while losses (LP side) realize immediately to capital
+    // (§6.1). The full conservation sum — capital + pnl across
+    // parties + insurance — must be constant.
+    let alice_pnl_pre = 0i128; // before flip; she had no pnl
+    let lp_pnl_pre = 0i128;
+    let alice_pnl_post = env.read_account_pnl(alice_idx);
+    let lp_pnl_post = env.read_account_pnl(lp_idx);
+
+    let alice_cap_delta: i128 = (alice_cap_after_flip as i128) - (alice_cap_pre_flip as i128);
+    let lp_cap_delta: i128 = (lp_cap_after_flip as i128) - (lp_cap_pre_flip as i128);
+    let alice_pnl_delta: i128 = alice_pnl_post - alice_pnl_pre;
+    let lp_pnl_delta: i128 = lp_pnl_post - lp_pnl_pre;
+    let ins_delta: i128 = (ins_after_flip as i128) - (ins_pre_flip as i128);
+
+    let full_sum = alice_cap_delta + lp_cap_delta
+        + alice_pnl_delta + lp_pnl_delta
+        + ins_delta;
+    println!(
+        "flip conservation: Alice(capΔ={alice_cap_delta}, pnlΔ={alice_pnl_delta}), \
+         LP(capΔ={lp_cap_delta}, pnlΔ={lp_pnl_delta}), InsΔ={ins_delta}, \
+         full sum={full_sum}"
+    );
+    assert_eq!(
+        full_sum, 0,
+        "FULL CONSERVATION BROKEN across position flip. Sum of \
+         (capital + pnl + insurance) deltas must be 0 for a trade \
+         with zero fees and no token movement. Non-zero means the \
+         engine created or destroyed value during the cross-zero \
+         trade.",
+    );
+
+    // Expected profit magnitude: 10M × $0.10 / 1e6 = 1_000_000.
+    // Alice's side (capital + pnl) delta should approximately equal +1_000_000
+    // (gain); LP's side should approximately equal -1_000_000 (loss).
+    let alice_total = alice_cap_delta + alice_pnl_delta;
+    let lp_total = lp_cap_delta + lp_pnl_delta;
+    // Tight rounding bound: the actual math uses POS_SCALE=1e6 divisions.
+    const TOL: i128 = 2;
+    assert!(
+        (alice_total - 1_000_000).abs() <= TOL,
+        "Alice's total (capital + pnl) Δ = {alice_total}, expected \
+         ≈ +1_000_000 from closing the 10M long at +10%",
+    );
+    assert!(
+        (lp_total + 1_000_000).abs() <= TOL,
+        "LP's total (capital + pnl) Δ = {lp_total}, expected ≈ -1_000_000",
+    );
+}
+
