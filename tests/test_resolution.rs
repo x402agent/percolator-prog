@@ -2177,14 +2177,14 @@ fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
     // doesn't need to warp far.
     env.init_market_with_cap(0, 10_000, 50);
 
-    // Non-Hyperp markets have oracle_authority == 0 at init (no
+    // Non-Hyperp markets have hyperp_authority == 0 at init (no
     // authority role), so no burn is needed — the "no authority
     // configured" precondition is the default.
     {
         let slab = env.svm.get_account(&env.slab).unwrap();
         let config = percolator_prog::state::read_config(&slab.data);
         assert_eq!(
-            config.oracle_authority, [0u8; 32],
+            config.hyperp_authority, [0u8; 32],
             "precondition: non-Hyperp markets init with zero authority",
         );
     }
@@ -2264,7 +2264,7 @@ fn test_resolve_permissionless_fresh_authority_does_not_block_resolve() {
 /// Strict hard-timeout regression: after the window matures, admin
 /// ResolveMarket settles at engine.last_oracle_price via the same
 /// Degenerate arm ResolvePermissionless uses — NOT at
-/// authority_price_e6. This closes the admin-revive channel where a
+/// hyperp_mark_e6. This closes the admin-revive channel where a
 /// rogue admin could PushOraclePrice past maturity and then settle at
 /// the pushed price. (PushOraclePrice itself now also rejects past
 /// maturity, but the admin-resolve Degenerate path is the safety net.)
@@ -2280,7 +2280,7 @@ fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
     // Use the read_engine_last_price helper by reading the slab directly:
     // the engine struct starts at ENGINE_OFF = 472 and last_oracle_price
     // is an early field. We only need the value shape; read it via the
-    // authority_price_e6 post-resolve assertion indirectly.
+    // hyperp_mark_e6 post-resolve assertion indirectly.
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Warp clock far past the maturity window.
@@ -2291,7 +2291,7 @@ fn test_admin_resolve_after_maturity_uses_degenerate_p_last() {
     });
 
     // Admin ResolveMarket must succeed via the Degenerate branch —
-    // authority_price_e6 == 0 (never pushed), so the old path would
+    // hyperp_mark_e6 == 0 (never pushed), so the old path would
     // return InvalidAccountData, but the new Degenerate fast-path
     // runs first and succeeds at engine.last_oracle_price.
     env.try_resolve_market(&admin)
@@ -2420,11 +2420,11 @@ fn test_cluster_restart_freezes_market_at_last_oracle_price() {
     // Settlement price must equal the last cached pre-restart oracle price:
     // the baseline push of 138_000_000 µUSD that the crank stamped into
     // engine.last_oracle_price. The resolve handler mirrors that into
-    // config.authority_price_e6, which is readable by anyone.
+    // config.hyperp_mark_e6, which is readable by anyone.
     let slab_after = env.svm.get_account(&env.slab).unwrap();
     let cfg_after = percolator_prog::state::read_config(&slab_after.data);
     assert_eq!(
-        cfg_after.authority_price_e6, 138_000_000,
+        cfg_after.hyperp_mark_e6, 138_000_000,
         "resolved market must settle at the last cached pre-restart oracle price"
     );
 }

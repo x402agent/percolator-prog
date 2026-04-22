@@ -700,7 +700,7 @@ fn encode_set_maintenance_fee(new_fee: u128) -> Vec<u8> {
 }
 
 fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    // UpdateAuthority { kind: AUTHORITY_ORACLE = 1, new_pubkey }
+    // UpdateAuthority { kind: AUTHORITY_HYPERP_MARK = 1, new_pubkey }
     let mut data = vec![32u8];
     data.push(1u8);
     data.extend_from_slice(new_authority.as_ref());

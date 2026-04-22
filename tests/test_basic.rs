@@ -2178,7 +2178,7 @@ fn test_settle_account_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2475,7 +2475,7 @@ fn test_convert_released_pnl_blocked_on_resolved() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so oracle_authority defaults to admin (for later push)
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 so hyperp_authority defaults to admin (for later push)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -2707,7 +2707,7 @@ fn test_reclaim_rejects_account_with_position() {
 fn test_reclaim_blocked_on_resolved() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → oracle_authority defaults to admin
+    env.init_market_with_cap(0, 10_000, 0); // cap > 0 → hyperp_authority defaults to admin
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);

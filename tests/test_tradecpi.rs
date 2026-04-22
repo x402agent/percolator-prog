@@ -2621,7 +2621,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     env.svm
         .airdrop(&old_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&old_authority))
+    env.try_update_authority(&admin, AUTHORITY_HYPERP_MARK, Some(&old_authority))
         .unwrap();
     env.try_push_oracle_price(&old_authority, 1_000_000, 1000)
         .unwrap();
@@ -2655,7 +2655,7 @@ fn test_attack_hyperp_oracle_authority_swap_with_positions() {
     env.svm
         .airdrop(&new_authority.pubkey(), 1_000_000_000)
         .unwrap();
-    env.try_update_authority(&old_authority, AUTHORITY_ORACLE, Some(&new_authority))
+    env.try_update_authority(&old_authority, AUTHORITY_HYPERP_MARK, Some(&new_authority))
         .unwrap();
 
     // Old authority should no longer be able to push prices

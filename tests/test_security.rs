@@ -1041,8 +1041,8 @@ fn test_attack_push_oracle_without_authority_set() {
 
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(168) + authority_price_e6(176)
-    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(168) + authority_timestamp(184)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + hyperp_mark_e6(176)
+    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + _reserved_auth_ts(184)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
         u64::from_le_bytes(slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap());
@@ -7424,19 +7424,19 @@ fn test_attack_set_oracle_authority_to_zero_disables_push() {
         "Hyperp with bootstrapped EWMA should accept zero authority: {:?}",
         zero_result);
 
-    // Under the 4-way split, burning oracle_authority is a
+    // Under the 4-way split, burning hyperp_authority is a
     // one-way operation — the zero slot has no current authority
     // so no one can re-set it. Admin's attempt to set a new
     // authority here must fail.
     let new_auth = Keypair::new();
     env.svm.airdrop(&new_auth.pubkey(), 1_000_000_000).unwrap();
-    let reset_result = env.try_update_authority(&admin, AUTHORITY_ORACLE, Some(&new_auth));
+    let reset_result = env.try_update_authority(&admin, AUTHORITY_HYPERP_MARK, Some(&new_auth));
     assert!(
         reset_result.is_err(),
-        "Burned oracle_authority must not be resettable by admin: {:?}",
+        "Burned hyperp_authority must not be resettable by admin: {:?}",
         reset_result,
     );
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, hyperp_mark_e6)(176)
     const AUTH_TS_OFF: usize = 320;
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let auth_price_before =
@@ -10912,8 +10912,8 @@ fn test_attack_push_oracle_after_resolution_rejected() {
     env.try_push_oracle_price(&admin, 140_000_000, 100).unwrap();
     env.try_resolve_market(&admin).unwrap();
 
-    // Config offset for authority_price_e6
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, authority_price_e6)(176)
+    // Config offset for hyperp_mark_e6
+    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(72) + offset_of!(MarketConfig, hyperp_mark_e6)(176)
     let slab_before = env.svm.get_account(&env.slab).unwrap().data;
     let settle_before = u64::from_le_bytes(
         slab_before[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8]
@@ -12469,8 +12469,8 @@ fn test_attack_oracle_timestamp_zero_then_crank() {
         result2
     );
 
-    // In Hyperp mode authority_timestamp is funding-rate state, not publish time.
-    // PushOraclePrice must not overwrite it with user-supplied timestamps.
+    // The legacy authority-timestamp slot is now reserved padding
+    // (`_reserved_auth_ts`). PushOraclePrice must not touch it.
     const AUTH_TS_OFF: usize = 320;
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
     let funding_state =
@@ -12860,7 +12860,7 @@ fn test_attack_first_push_does_not_poison_baseline() {
         baseline, baseline_after_burst
     );
 
-    // authority_price_e6 is clamped to within 1 cap-width of baseline
+    // hyperp_mark_e6 is clamped to within 1 cap-width of baseline
     let auth_price = env.read_authority_price();
     let max_delta = baseline as u128 * 10_000 / 1_000_000; // 1% of baseline
     let upper = baseline + max_delta as u64;

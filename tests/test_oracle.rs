@@ -285,7 +285,7 @@ fn test_hyperp_init_market_with_valid_price() {
     let slab_data = svm.get_account(&slab).unwrap().data;
     let magic = u64::from_le_bytes(slab_data[0..8].try_into().unwrap());
     let config = percolator_prog::state::read_config(&slab_data);
-    let mark = config.authority_price_e6;
+    let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
     let cap = config.oracle_price_cap_e2bps;
     const FEED_ID_OFF: usize = 136 + 64;
@@ -444,7 +444,7 @@ fn test_hyperp_init_market_with_inverted_price() {
     let slab_data = svm.get_account(&slab).unwrap().data;
     let magic = u64::from_le_bytes(slab_data[0..8].try_into().unwrap());
     let config = percolator_prog::state::read_config(&slab_data);
-    let mark = config.authority_price_e6;
+    let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
     let cap = config.oracle_price_cap_e2bps;
     const FEED_ID_OFF: usize = 136 + 64;

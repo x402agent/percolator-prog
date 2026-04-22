@@ -463,7 +463,7 @@ fn test_update_admin_zero_accepted_for_burn() {
 }
 
 /// Weaker-authority model (Model 1): admin burn is allowed when
-/// oracle_authority is still set PROVIDED the circuit-breaker cap is
+/// hyperp_authority is still set PROVIDED the circuit-breaker cap is
 /// non-zero. The cap bounds what authority can do (it cannot walk the
 /// effective price beyond cap-per-push), so a retained authority is
 /// strictly weaker than admin and a safe survivor of burn. This is the
@@ -476,7 +476,7 @@ fn test_update_admin_zero_accepted_for_burn() {
 ///   min_oracle_price_cap_e2bps == 0   AND
 ///   permissionless_resolve_stale_slots == 0
 /// has NO resolve path. Admin ResolveMarket needs a pushed
-/// authority_price_e6; under the init-time default, oracle_authority is
+/// hyperp_mark_e6; under the init-time default, hyperp_authority is
 /// zero when min_cap == 0 — so nobody can push and the admin path dies
 /// instantly. ResolvePermissionless is disabled when perm_resolve == 0.
 /// The init must reject this combo outright rather than create a
@@ -505,8 +505,8 @@ fn test_init_rejects_non_hyperp_with_no_resolve_path() {
 
 /// Positive complement: same (cap=0) market with perm_resolve > 0 is
 /// allowed. The perm-stale branch of ResolveMarket settles at
-/// engine.last_oracle_price and does not require authority_price_e6,
-/// so the market retains a resolve path even with oracle_authority = 0.
+/// engine.last_oracle_price and does not require hyperp_mark_e6,
+/// so the market retains a resolve path even with hyperp_authority = 0.
 #[test]
 fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
     program_path();
@@ -543,7 +543,7 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
 
 
 /// Weaker-authority invariant: SetOraclePriceCap may not disable the
-/// cap (set it to 0) on a non-Hyperp market while oracle_authority is
+/// cap (set it to 0) on a non-Hyperp market while hyperp_authority is
 /// configured. Disabling the cap would upgrade authority from a
 /// bounded fallback to an admin-equivalent role. Admins wanting to
 /// remove the cap must first zero out the authority.
@@ -552,14 +552,14 @@ fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Init with min_cap > 0 so oracle_authority defaults to admin
+    // Init with min_cap > 0 so hyperp_authority defaults to admin
     // (under the init-time invariant — non-Hyperp + cap=0 zeroes
     // authority). permissionless_resolve=0 keeps the test simple.
     env.init_market_with_cap(0, 10_000, 0);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Admin starts as oracle_authority. The weaker-authority
+    // Admin starts as hyperp_authority. The weaker-authority
     // invariant must prevent disabling the cap while the slot is
     // still non-zero.
     let err = env

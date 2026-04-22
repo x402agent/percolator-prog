@@ -1381,7 +1381,7 @@ fn test_deposit_cap_tightened_blocks_further_deposits() {
 // apart. Operator CANNOT bypass via tag 20 — that path is gated on a
 // different field (`header.insurance_authority`).
 //
-// Authority kinds: AUTHORITY_ADMIN=0, AUTHORITY_ORACLE=1, AUTHORITY_INSURANCE=2,
+// Authority kinds: AUTHORITY_ADMIN=0, AUTHORITY_HYPERP_MARK=1, AUTHORITY_INSURANCE=2,
 // AUTHORITY_CLOSE=3, AUTHORITY_INSURANCE_OPERATOR=4.
 
 const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;

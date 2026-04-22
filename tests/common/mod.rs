@@ -840,8 +840,8 @@ impl TestEnv {
 
     pub fn init_market_with_invert(&mut self, invert: u8) {
         // Delegate to init_market_with_cap with min_cap=10_000 so the
-        // init-time invariant (non-Hyperp + cap=0 → oracle_authority=0)
-        // doesn't zero oracle_authority for tests that later expect to
+        // init-time invariant (non-Hyperp + cap=0 → hyperp_authority=0)
+        // doesn't zero hyperp_authority for tests that later expect to
         // use it. Tests that want the cap=0 behavior use
         // init_market_with_cap directly with 0.
         self.init_market_with_cap(invert, 10_000, 0);
@@ -1634,7 +1634,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp)
     // Per-market admin limits (uncapped defaults for tests)
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled) (<= MAX_PROTOCOL_FEE_ABS)
-    // min_oracle_price_cap_e2bps = 10_000 so oracle_authority defaults
+    // min_oracle_price_cap_e2bps = 10_000 so hyperp_authority defaults
     // to admin under the init-time invariant. Tests that specifically
     // want cap=0 should use init_market_with_cap(..., 0, ...) directly.
     data.extend_from_slice(&10_000u64.to_le_bytes()); // min_oracle_price_cap_e2bps
@@ -1848,10 +1848,10 @@ impl TestEnv {
         u16::from_le_bytes(bytes)
     }
 
-    /// Read authority_price_e6 from config (mark price for Hyperp, settlement for non-Hyperp)
+    /// Read hyperp_mark_e6 from config (mark price for Hyperp, settlement for non-Hyperp)
     pub fn read_authority_price(&self) -> u64 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        percolator_prog::state::read_config(&d).authority_price_e6
+        percolator_prog::state::read_config(&d).hyperp_mark_e6
     }
 
     /// Read last_effective_price_e6 from config (index for Hyperp, baseline for non-Hyperp)
@@ -2565,12 +2565,12 @@ pub fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
 }
 
 pub fn encode_set_oracle_authority(new_authority: &Pubkey) -> Vec<u8> {
-    encode_update_authority(AUTHORITY_ORACLE, new_authority)
+    encode_update_authority(AUTHORITY_HYPERP_MARK, new_authority)
 }
 
 // 4-way authority split constants (must match src/percolator.rs)
 pub const AUTHORITY_ADMIN: u8 = 0;
-pub const AUTHORITY_ORACLE: u8 = 1;
+pub const AUTHORITY_HYPERP_MARK: u8 = 1;
 pub const AUTHORITY_INSURANCE: u8 = 2;
 pub const AUTHORITY_CLOSE: u8 = 3;
 
@@ -5933,7 +5933,7 @@ impl TestEnv {
 // ============================================================================
 
 /// ATTACK: Setting oracle authority to [0;32] disables authority price and clears stored price.
-/// Expected: After setting to zero, PushOraclePrice fails, authority_price_e6 is cleared.
+/// Expected: After setting to zero, PushOraclePrice fails, hyperp_mark_e6 is cleared.
 
 
 /// ATTACK: Oracle authority change mid-flight (while positions open).

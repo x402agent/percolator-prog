@@ -475,8 +475,8 @@ fn test_struct_sizes() {
     println!("CONFIG_LEN: {}", percolator_prog::constants::CONFIG_LEN);
     println!("Offset of last_effective_price_e6: {}", offset_of!(state::MarketConfig, last_effective_price_e6));
     println!("Slab offset of last_effective_price_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, last_effective_price_e6));
-    println!("Offset of authority_price_e6: {}", offset_of!(state::MarketConfig, authority_price_e6));
-    println!("Slab offset of authority_price_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, authority_price_e6));
+    println!("Offset of hyperp_mark_e6: {}", offset_of!(state::MarketConfig, hyperp_mark_e6));
+    println!("Slab offset of hyperp_mark_e6: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, hyperp_mark_e6));
     println!("Offset of oracle_price_cap_e2bps: {}", offset_of!(state::MarketConfig, oracle_price_cap_e2bps));
     println!("Slab offset of oracle_price_cap_e2bps: {}", percolator_prog::constants::HEADER_LEN + offset_of!(state::MarketConfig, oracle_price_cap_e2bps));
     println!("Offset of max_staleness_secs: {}", offset_of!(state::MarketConfig, max_staleness_secs));
