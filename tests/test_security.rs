@@ -13139,3 +13139,100 @@ fn test_attack_deposit_fee_credits_does_not_inflate_capital() {
     );
 }
 
+/// regression (security R&D loop, iteration 3 — PASS_SAFE + coverage gap):
+/// Idempotency gap on SettleAccount (tag 26, permissionless). Two
+/// consecutive calls at the same clock slot on the same account
+/// should produce identical state. If the second call has any
+/// observable side effect — shifts capital, updates pnl, advances
+/// cursors, shrinks insurance — an attacker can chain N repeats to
+/// accumulate drift for free (permissionless = no gas markup beyond
+/// tx fees).
+///
+/// Attacker model: any keeper submits SettleAccount(idx) twice at
+/// the same slot against a seasoned account holding a position with
+/// realized PnL, reserved_pnl, and fee debt.
+///
+/// Observable success criterion: the state snapshot (capital + pnl +
+/// reserved_pnl + fee_credits + insurance + c_tot) after call #1
+/// differs from after call #2. Any delta is a finding.
+///
+/// Invariant: SettleAccount at same slot is a no-op because the
+/// anchors (account.last_fee_slot, engine.last_market_slot,
+/// engine.current_slot) are all already equal to clock.slot.
+#[test]
+fn test_attack_settle_account_idempotent_at_same_slot() {
+    program_path();
+    let mut env = TestEnv::new();
+    // Non-Hyperp market with a maintenance fee so fee_credits is a
+    // meaningful field to monitor. Modest rate so fee doesn't drain
+    // Alice mid-test.
+    let data = common::encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &common::TEST_FEED_ID,
+        1_000_000_000,
+        50,  // maintenance_fee_per_slot — small, survivable
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // Give Alice real position state: trade against an LP so she
+    // holds position_basis + pnl + (with funding) funding snapshot.
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let alice = Keypair::new();
+    let alice_idx = env.init_user(&alice);
+    env.deposit(&alice, alice_idx, 1_000_000_000);
+
+    env.set_slot(100);
+    env.trade(&alice, &lp, lp_idx, alice_idx, 10_000_000);
+
+    // Advance time so maintenance fee has something to realize.
+    env.set_slot(1_000);
+    env.svm.expire_blockhash();
+
+    // Call #1 at slot 1000: normal settle. Snapshot.
+    env.try_settle_account(alice_idx)
+        .expect("first SettleAccount must succeed");
+    let snap1_alice_cap = env.read_account_capital(alice_idx);
+    let snap1_alice_fee_credits = env.read_account_fee_credits(alice_idx);
+    let snap1_lp_cap = env.read_account_capital(lp_idx);
+    let snap1_ins = env.read_insurance_balance();
+
+    // Call #2 at SAME slot: must be no-op.
+    env.svm.expire_blockhash();
+    env.try_settle_account(alice_idx)
+        .expect("second SettleAccount at same slot must succeed (no-op)");
+    let snap2_alice_cap = env.read_account_capital(alice_idx);
+    let snap2_alice_fee_credits = env.read_account_fee_credits(alice_idx);
+    let snap2_lp_cap = env.read_account_capital(lp_idx);
+    let snap2_ins = env.read_insurance_balance();
+
+    // Any delta is the exploit primitive.
+    assert_eq!(
+        snap1_alice_cap, snap2_alice_cap,
+        "IDEMPOTENCY BREAK: Alice capital drifted {} → {} across two \
+         same-slot SettleAccount calls. Chained N times = free drift.",
+        snap1_alice_cap, snap2_alice_cap,
+    );
+    assert_eq!(
+        snap1_alice_fee_credits, snap2_alice_fee_credits,
+        "IDEMPOTENCY BREAK: Alice fee_credits drifted {} → {}",
+        snap1_alice_fee_credits, snap2_alice_fee_credits,
+    );
+    assert_eq!(
+        snap1_lp_cap, snap2_lp_cap,
+        "IDEMPOTENCY BREAK: LP capital drifted {} → {}",
+        snap1_lp_cap, snap2_lp_cap,
+    );
+    assert_eq!(
+        snap1_ins, snap2_ins,
+        "IDEMPOTENCY BREAK: insurance drifted {} → {}",
+        snap1_ins, snap2_ins,
+    );
+}
+
