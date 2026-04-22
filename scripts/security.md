@@ -317,3 +317,154 @@ farming attacks:
 `checked_add` — u64 overflow returns None → error propagates. At
 ~226 billion years to overflow at 1 init/slot, not a real concern
 even ignoring the overflow check.
+
+---
+
+## Second pass — 2026-04-22 late (post F1-F4 commit)
+
+Revisiting surfaces after F1/F2/F4 landed, plus an explicit
+small/medium tier test run (655/655 each). No new actionable
+findings. Surfaces traced:
+
+### Matcher ABI return validation
+
+`matcher_abi::validate_matcher_return` at
+`src/percolator.rs:1084-1150` is thorough:
+
+- Echoes (`req_id`, `lp_account_id`, `oracle_price_e6`) must match
+  the wrapper's pre-CPI values. Any forgery rejects.
+- `abi_version == MATCHER_ABI_VERSION` — prevents future matchers
+  with new flag semantics being silently accepted.
+- Flag bits outside `{VALID, PARTIAL_OK, REJECTED}` rejected.
+- `VALID` required, `REJECTED` forbidden.
+- `reserved == 0` required.
+- `exec_price_e6 != 0` required (disambiguates "all zeros + valid flag").
+- `exec_size == 0` requires `PARTIAL_OK`.
+- `|exec_size| <= |req_size|`.
+- `sign(exec_size) == sign(req_size)` when `req_size != 0`.
+- `req_size == 0` is rejected at the entry (line 5770), so the
+  sign check can safely skip that case.
+- `exec_size == i128::MIN` with a negative req_size would pass the
+  sign/abs check, but the engine's `checked_neg()` at trade
+  execution (src/percolator.rs:3684) returns None → `Overflow`.
+  Safely rejected downstream.
+
+### Matcher identity immutability
+
+`matcher_program` and `matcher_context` on an LP account are set
+only at `InitLP` (`src/percolator.rs:4837-4838`) and never mutated
+elsewhere. No instruction offers to change them after registration.
+A registered LP is bound to its matcher for life. The only
+operator consideration is that the MATCHER PROGRAM itself may be
+upgradeable — operators deploying LPs should prefer matchers with
+burned upgrade_authority (out of percolator's control, documented
+as operator hygiene).
+
+### Panic surface
+
+21 uses of `.unwrap()` / `.expect()` in the wrapper, all in fixed-
+width `slice.try_into()` calls after preceding length guards. Each
+was traced — no unguarded panic reachable from caller input.
+Notable sites:
+- `matcher_abi::read_matcher_return` at line 1059: length guard
+  `ctx.len() < 64` at line 1060, each slice is a fixed subrange of
+  [0, 64). Safe.
+- `read_chainlink_price_e6` at line 2645/2652: length guard
+  `data.len() < CL_MIN_LEN (232)` upstream, both slices are within
+  [138, 232). Safe.
+- Wrapper's `read_u64/u128/pubkey/bytes32` all have per-call
+  `input.len() < N` guards before each `try_into().unwrap()`. Safe.
+
+### `ensure_market_accrued_to_now` idempotency
+
+`src/percolator.rs:3500-3513`. The helper:
+1. Calls `catchup_accrue(engine, now_slot, price, rate)` — returns
+   early when `now_slot <= engine.last_market_slot`, when
+   `max_dt == 0`, when engine never observed a real price, or when
+   funding is inactive. Safe no-op in all edge cases.
+2. Calls `accrue_market_to` only if `price > 0 && now_slot >
+   engine.last_market_slot`. Idempotent: a second call in the same
+   slot with the same price is a no-op inside the engine (§5.4
+   early return on same-slot + same-price).
+
+So instructions that call `ensure_market_accrued_to_now` AFTER
+their own internal accrue-bearing engine call (which also advances
+last_market_slot) don't double-accrue.
+
+### `cluster_restarted_since_init` false-positive analysis
+
+`src/percolator.rs:2914-2921`. The init-time sysvar read uses
+`.unwrap_or(0)` as a fallback:
+
+```rust
+init_restart_slot: LastRestartSlot::get()
+    .map(|lrs| lrs.last_restart_slot)
+    .unwrap_or(0),
+```
+
+Theoretical false positive: sysvar fails at init (→
+`init_restart_slot = 0`), then succeeds at a later read returning
+any `R > 0`. `restart_detected(0, R) = true` → market
+incorrectly frozen even without a real restart happening after
+init.
+
+Unreachable in practice: `LastRestartSlot` sysvar is always
+available on production Solana (SIMD-0047 landed in v1.18). The
+fallback exists only to avoid panicking in test environments with
+stubbed runtimes. Not a mainnet concern.
+
+### `SetOraclePriceCap` disable path
+
+`src/percolator.rs:7037+`. Admin can reduce `oracle_price_cap_e2bps`
+to 0 only when `min_oracle_price_cap_e2bps == 0` (init-time
+constraint). With cap=0, the circuit breaker is effectively off —
+a fresh Pyth read that lifts the price by ≥100% is passed through
+clamped-to-identity. Admin-only op; explicit operator choice. Not
+a protocol bug.
+
+### Max cap (100%) semantics
+
+`MAX_ORACLE_PRICE_CAP_E2BPS = 1_000_000` (100% per update). At
+this ceiling, `clamp_oracle_price(last=X, raw=Y, cap=MAX)` allows
+`Y ∈ [0, 2X]`. Prices can approach zero (rejected downstream by
+`if price == 0` checks in engine/wrapper). Effectively the same
+as "no cap" — documented as operator choice.
+
+### Negative `publish_time` handling
+
+Pyth's `publish_time` is `i64`, nominally a unix timestamp.
+Theoretical negative values (pre-1970, crafted, or i64::MIN):
+- `clamp_external_price` at `src/percolator.rs:2814+`: strict
+  `publish_time <= last_oracle_publish_time` gate. Any negative
+  publish_time with `last = 0` (init fresh market) is ≤ 0 →
+  graceful fallback, no advance. Safe.
+- `read_pyth_price_e6` staleness check: `age = now - publish_time`
+  with saturating sub. `publish_time = i64::MIN` → `now.sat_sub(MIN)`
+  saturates at `i64::MAX` → age > max_staleness_secs → reject.
+  Safe.
+
+### Reclaim forgives fee debt: loss-to-insurance analysis
+
+When `reclaim_empty_account_not_atomic` fires on a flat zero-
+capital account with `fee_credits < 0`, the debt is forgiven
+(`src/percolator.rs:5346-5348` in engine). Insurance loses the
+uncollected dust (shortfall = capital-drained-before-zeroing minus
+fees-already-collected).
+
+Attacker economics: they funded the account with some capital X,
+which flowed to insurance as fees. Unreclaimed debt is bounded by
+one max-interval's fee charge (capped at per-sync rate * dt_max).
+Net protocol loss is at most one slot's fee rate per dust account,
+per reclaim cycle. Attacker's net position: -X (capital lost to
+insurance), so they can't profit by forcing forgiveness.
+
+### Tier coverage
+
+All findings re-verified against three build tiers after the F1-F4
+commits:
+- default (`MAX_ACCOUNTS = 4096`): 655/655 pass.
+- `--features small` (`MAX_ACCOUNTS = 256`): 655/655 pass.
+- `--features medium` (`MAX_ACCOUNTS = 1024`): 655/655 pass.
+
+The SLAB_LEN cascade (RiskParams field removals in earlier
+commits) was verified against all three BPF binary sizes.
