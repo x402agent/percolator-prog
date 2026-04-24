@@ -1886,7 +1886,7 @@ pub mod ix {
     }
 
     fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
-        if input.len() < 40 {
+        if input.len() < 32 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let (bytes, rest) = input.split_at(32);
@@ -1911,7 +1911,7 @@ pub mod ix {
         let liquidation_fee_cap = U128::new(read_u128(input)?);
         let resolve_price_deviation_bps = read_u64(input)?; // was _liquidation_buffer_bps
         let min_liquidation_abs = U128::new(read_u128(input)?);
-        if input.len() < 32 {
+        if input.len() < 40 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let min_nonzero_mm_req = read_u128(input)?;
@@ -8809,7 +8809,12 @@ pub mod processor {
                     // accrue installs fresh_price. Persist the mutated
                     // config so the observation is recorded.
                     catchup_accrue(engine, clock.slot, fresh_price, funding_rate_e9_pre)?;
-                    if clock.slot > engine.last_market_slot {
+                    let flat_same_slot_price_update = fresh_price > 0
+                        && clock.slot == engine.last_market_slot
+                        && fresh_price != engine.last_oracle_price
+                        && engine.oi_eff_long_q == 0
+                        && engine.oi_eff_short_q == 0;
+                    if clock.slot > engine.last_market_slot || flat_same_slot_price_update {
                         engine
                             .accrue_market_to(clock.slot, fresh_price, funding_rate_e9_pre)
                             .map_err(map_risk_error)?;
