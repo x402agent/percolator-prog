@@ -7376,42 +7376,31 @@ pub mod processor {
                     false
                 };
 
-                // Mode = 0 (Ordinary): require a live input. Hyperp with a
-                // stale mark must switch to mode = 1; we no longer silently
-                // promote to Degenerate.
-                let (live_oracle, rate_for_final_accrual, in_ordinary_arm): (u64, i128, bool) =
+                // Mode = 0 (Ordinary) policy already stated above: require a
+                // live input. If none is available (oracle never initialized,
+                // Hyperp mark silent beyond 3× max_staleness, or external
+                // oracle missing on non-Hyperp) the caller must switch to
+                // mode = 1 (Degenerate); we no longer silently promote.
+                let (live_oracle, rate_for_final_accrual): (u64, i128) =
                     if let Some(fresh) = fresh_live_oracle {
-                        (fresh, funding_rate_e9, true)
+                        (fresh, funding_rate_e9)
                     } else if is_hyperp_local && !hyperp_stale {
-                        (config.last_effective_price_e6, funding_rate_e9, true)
+                        (config.last_effective_price_e6, funding_rate_e9)
                     } else {
-                        // Hyperp + stale, or oracle never initialized — caller
-                        // picked the wrong mode.
                         return Err(PercolatorError::OracleStale.into());
                     };
                 let _ = oracle_initialized;
                 // Engine v12.18.5+: resolve_market_not_atomic takes an explicit
-                // ResolveMode selector (Goal 51). The wrapper tells the engine
-                // which arm to run; the engine enforces that Degenerate carries
-                // `live == P_last && rate == 0`. A separate wrapper-side band
-                // check is no longer required because the engine's band check
-                // now runs unconditionally on Ordinary.
-                let resolve_mode = if in_ordinary_arm {
-                    percolator::ResolveMode::Ordinary
-                } else {
-                    percolator::ResolveMode::Degenerate
-                };
-                // Pre-chunk catch-up (Ordinary only). Degenerate arm already
-                // bypasses accrue_market_to inside the engine, so no envelope
-                // check applies. Ordinary accrues through the final step and
-                // would otherwise hit Overflow when the gap exceeds max_dt.
-                // Catchup uses the same (price, rate) the final accrue will
-                // use, preserving anti-retroactivity (Finding 2).
-                if in_ordinary_arm {
-                    catchup_accrue(
-                        engine, clock.slot, live_oracle, rate_for_final_accrual,
-                    )?;
-                }
+                // ResolveMode selector (Goal 51). This arm is always Ordinary;
+                // Degenerate is reached only via the mode == 1 branch below.
+                let resolve_mode = percolator::ResolveMode::Ordinary;
+                // Pre-chunk catch-up. Ordinary accrues through the final step
+                // and would otherwise hit Overflow when the gap exceeds
+                // max_dt. Catchup uses the same (price, rate) the final
+                // accrue will use, preserving anti-retroactivity (Finding 2).
+                catchup_accrue(
+                    engine, clock.slot, live_oracle, rate_for_final_accrual,
+                )?;
                 engine.resolve_market_not_atomic(
                     resolve_mode,
                     settlement_price,
