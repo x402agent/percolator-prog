@@ -6942,26 +6942,17 @@ pub mod processor {
                                     (price, funding_rate_e9)
                                 }
                                 Err(e) => {
-                                    // Only OracleStale / OracleConfTooWide
-                                    // prove the feed is unusable; other
-                                    // errors (wrong account, bad data,
-                                    // wrong feed) propagate as-is.
-                                    // OracleConfTooWide added to match
-                                    // ResolvePermissionless (Finding 7 of
-                                    // an earlier round) — without it,
-                                    // non-Hyperp markets with a live-but-
-                                    // wide feed would be unable to update
-                                    // config under the degenerate arm.
-                                    let stale_err: ProgramError =
-                                        PercolatorError::OracleStale.into();
-                                    let conf_err: ProgramError =
-                                        PercolatorError::OracleConfTooWide.into();
-                                    if e != stale_err && e != conf_err {
-                                        return Err(e);
-                                    }
-                                    // Oracle is confirmed unusable → degenerate arm.
-                                    let engine = zc::engine_ref(&data)?;
-                                    (engine.last_oracle_price, 0i128)
+                                    // v12.19.6: propagate the oracle error.
+                                    // UpdateConfig must NOT enter a
+                                    // degenerate-price + rate=0 arm on
+                                    // OracleStale / OracleConfTooWide — that
+                                    // would erase elapsed funding on a live
+                                    // market (current-slot advances but no
+                                    // accrual lands). Admin MUST route stale
+                                    // markets through Resolve{Market,
+                                    // Permissionless}; the hard-timeout gate
+                                    // above is the "market is dead" signal.
+                                    return Err(e);
                                 }
                             }
                         };

@@ -5760,9 +5760,12 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     let err = env
         .try_init_market_raw(payload)
         .expect_err("Hyperp+perm_resolve+mark_min_fee=0 must reject");
+    // Either InvalidInstructionData (original check) or InvalidConfigParam
+    // (v12.19.6 solvency envelope prevalidation fires first) proves the
+    // market is rejected.
     assert!(
-        err.contains("InvalidInstructionData") || err.contains("0x0"),
-        "expected InvalidInstructionData, got: {}",
+        err.contains("InvalidInstructionData") || err.contains("0x0") || err.contains("0x1a"),
+        "expected init rejection, got: {}",
         err,
     );
 }
