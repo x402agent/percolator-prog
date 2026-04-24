@@ -5566,7 +5566,7 @@ fn test_attack_lp_as_user_kind_swap() {
 }
 
 /// ATTACK: Deposit zero amount should be harmless.
-/// Depositing 0 tokens should either fail or be a no-op.
+/// Depositing 0 tokens is rejected and must leave state unchanged.
 #[test]
 fn test_attack_deposit_zero_amount_no_state_change() {
     program_path();
@@ -5587,30 +5587,30 @@ fn test_attack_deposit_zero_amount_no_state_change() {
     let cap_before = env.read_account_capital(user_idx);
     let vault_before = env.vault_balance();
 
-    // Deposit 0 should be accepted as a no-op.
+    // Deposit 0 is rejected as invalid input.
     let result = env.try_deposit(&user, user_idx, 0);
 
     let cap_after = env.read_account_capital(user_idx);
     let vault_after = env.vault_balance();
     assert!(
-        result.is_ok(),
-        "Zero-value deposit should be accepted as no-op: {:?}",
+        result.is_err(),
+        "Zero-value deposit should be rejected: {:?}",
         result
     );
     assert_eq!(
         cap_before, cap_after,
-        "ATTACK: Zero deposit accepted but changed capital! before={} after={}",
+        "ATTACK: Zero deposit changed capital! before={} after={}",
         cap_before, cap_after
     );
     assert_eq!(
         vault_before, vault_after,
-        "ATTACK: Zero deposit accepted but changed vault! before={} after={}",
+        "ATTACK: Zero deposit changed vault! before={} after={}",
         vault_before, vault_after
     );
 }
 
 /// ATTACK: Withdraw zero amount should be harmless.
-/// Withdrawing 0 tokens should either fail or be a no-op.
+/// Withdrawing 0 tokens is rejected and must leave state unchanged.
 #[test]
 fn test_attack_withdraw_zero_amount_no_state_change() {
     program_path();
@@ -5631,24 +5631,24 @@ fn test_attack_withdraw_zero_amount_no_state_change() {
     let cap_before = env.read_account_capital(user_idx);
     let vault_before = env.vault_balance();
 
-    // Withdraw 0 should be accepted as a no-op.
+    // Withdraw 0 is rejected as invalid input.
     let result = env.try_withdraw(&user, user_idx, 0);
 
     let cap_after = env.read_account_capital(user_idx);
     let vault_after = env.vault_balance();
     assert!(
-        result.is_ok(),
-        "Zero-value withdrawal should be accepted as no-op: {:?}",
+        result.is_err(),
+        "Zero-value withdrawal should be rejected: {:?}",
         result
     );
     assert_eq!(
         cap_before, cap_after,
-        "ATTACK: Zero withdrawal accepted but changed capital! before={} after={}",
+        "ATTACK: Zero withdrawal changed capital! before={} after={}",
         cap_before, cap_after
     );
     assert_eq!(
         vault_before, vault_after,
-        "ATTACK: Zero withdrawal accepted but changed vault! before={} after={}",
+        "ATTACK: Zero withdrawal changed vault! before={} after={}",
         vault_before, vault_after
     );
 }

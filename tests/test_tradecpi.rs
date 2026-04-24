@@ -14,6 +14,12 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+fn advance_hyperp_target(env: &mut TradeCpiTestEnv, logical_slot: &mut u64) {
+    *logical_slot += 1;
+    env.set_slot(*logical_slot);
+    env.crank();
+}
+
 /// CRITICAL: TradeCpi allows trading without LP signature
 ///
 /// The LP delegates trade authorization to a matcher program. The percolator
@@ -576,7 +582,8 @@ fn test_premarket_resolution_full_lifecycle() {
     // Push initial price and crank
     env.try_push_oracle_price(&admin, 1_000_000, 1000)
         .expect("initial oracle push must succeed"); // Price = 1.0
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Execute a trade via TradeCpi to create positions
@@ -688,7 +695,8 @@ fn test_withdraw_insurance_requires_positions_closed() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(50);
+    let slot = 50;
+    env.set_slot(slot);
     env.crank();
     env.try_trade_cpi(
         &user,
@@ -771,7 +779,8 @@ fn test_premarket_paginated_force_close() {
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
     env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
 
-    env.set_slot(50);
+    let mut slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     println!("Creating {} users with positions...", NUM_USERS);
@@ -791,6 +800,7 @@ fn test_premarket_paginated_force_close() {
             &matcher_ctx,
         )
         .expect("user setup trade must succeed");
+        advance_hyperp_target(&mut env, &mut slot);
         users.push((user, user_idx));
 
         if (i + 1) % 20 == 0 {
@@ -896,7 +906,8 @@ fn test_premarket_binary_outcome_price_zero() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(50);
+    let slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
@@ -962,7 +973,8 @@ fn test_premarket_binary_outcome_price_one() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(50);
+    let slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
@@ -1036,7 +1048,8 @@ fn test_premarket_force_close_cu_benchmark() {
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
     env.deposit(&lp, lp_idx, 1_000_000_000_000); // 1000 SOL
 
-    env.set_slot(50);
+    let mut slot = 50;
+    env.set_slot(slot);
     env.crank();
 
     // Create 64 users (one batch worth) with positions
@@ -1059,6 +1072,7 @@ fn test_premarket_force_close_cu_benchmark() {
             &matcher_ctx,
         )
         .expect("user setup trade must succeed");
+        advance_hyperp_target(&mut env, &mut slot);
         users.push((user, user_idx));
     }
     println!("Created {} users with positions", NUM_USERS);
@@ -1769,7 +1783,8 @@ fn test_attack_hyperp_mark_manipulation_via_trade() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Vault before
@@ -1786,6 +1801,7 @@ fn test_attack_hyperp_mark_manipulation_via_trade() {
         &matcher_ctx,
     );
     assert!(result.is_ok(), "First trade should succeed: {:?}", result);
+    advance_hyperp_target(&mut env, &mut slot);
 
     // Execute reverse trade to close
     let result = env.try_trade_cpi(
@@ -1836,7 +1852,8 @@ fn test_attack_hyperp_index_lag_exploitation() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let vault_total = env.read_vault();
@@ -1844,7 +1861,8 @@ fn test_attack_hyperp_index_lag_exploitation() {
     // Push mark price up significantly (circuit breaker will clamp)
     env.try_push_oracle_price(&admin, 2_000_000, 2000).unwrap();
 
-    // Trade at slot 101 (index lags behind new mark)
+    // Trade at slot 101 (index lags behind new mark). The wrapper now
+    // rejects user risk changes while target/effective divergence exists.
     env.set_slot(101);
     let result = env.try_trade_cpi(
         &user,
@@ -1855,26 +1873,11 @@ fn test_attack_hyperp_index_lag_exploitation() {
         &matcher_prog,
         &matcher_ctx,
     );
-    assert!(result.is_ok(), "Trade should succeed: {:?}", result);
-
-    // Crank to settle funding and move index toward mark
-    env.set_slot(200);
-    env.crank();
-
-    // Close position at new price
-    let result = env.try_trade_cpi(
-        &user,
-        &lp.pubkey(),
-        lp_idx,
-        user_idx,
-        -100_000_000,
-        &matcher_prog,
-        &matcher_ctx,
+    assert!(
+        result.is_err(),
+        "Lagged-index TradeCpi should be rejected: {:?}",
+        result
     );
-    assert!(result.is_ok(), "Close trade should succeed: {:?}", result);
-
-    env.set_slot(300);
-    env.crank();
 
     // Conservation: total vault should remain the same (PnL is zero-sum internally)
     let vault_after = env.read_vault();
@@ -1907,7 +1910,8 @@ fn test_attack_premarket_withdraw_before_force_close() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // User takes large position
@@ -1958,7 +1962,8 @@ fn test_attack_premarket_extra_cranks_idempotent() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    env.set_slot(100);
+    let slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let result = env.try_trade_cpi(
@@ -3051,7 +3056,8 @@ fn test_attack_nonce_replay_same_trade() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // First trade succeeds
@@ -3066,6 +3072,7 @@ fn test_attack_nonce_replay_same_trade() {
     );
     assert!(result.is_ok(), "First trade should succeed");
     let pos_after_first = env.read_account_position(user_idx);
+    advance_hyperp_target(&mut env, &mut slot);
 
     // Use a near-identical second trade to avoid tx-signature dedup artifacts in the harness.
     // This still checks that the second operation is processed as a new trade (not replay).
@@ -3134,7 +3141,8 @@ fn test_attack_rounding_extraction_rapid_trades() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 5_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let vault_before = env.read_vault();
@@ -3156,6 +3164,7 @@ fn test_attack_rounding_extraction_rapid_trades() {
         );
         if result.is_ok() {
             successful_open_trades += 1;
+            advance_hyperp_target(&mut env, &mut slot);
             // Close immediately
             env.try_trade_cpi(
                 &user,
@@ -3167,6 +3176,7 @@ fn test_attack_rounding_extraction_rapid_trades() {
                 &matcher_ctx,
             )
             .expect("close leg for successful tiny open trade must succeed");
+            advance_hyperp_target(&mut env, &mut slot);
             let pos_after_close = env.read_account_position(user_idx);
             assert_eq!(
                 pos_after_close, pos_before_attempt,
@@ -5665,7 +5675,8 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
     env.try_push_oracle_price(&admin, 2_000_000, 1000).unwrap();
     env.set_slot(100);
 
-    // Execute zero-fill TradeCpi
+    // Execute zero-fill TradeCpi. The lag gate rejects before CPI, so a
+    // zero fill cannot be used as a no-op index walk.
     let result = env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -5676,8 +5687,8 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
         &lp_idx.1,
     );
     assert!(
-        result.is_ok(),
-        "Zero-fill TradeCpi should succeed as no-op: {:?}",
+        result.is_err(),
+        "Zero-fill TradeCpi should be rejected while target lags: {:?}",
         result
     );
 
@@ -5691,12 +5702,11 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
         )
     };
 
-    // Zero-fill preserves index advancement to prevent dt-accumulation attacks.
-    // The index legitimately moves toward mark during the oracle read, and
-    // reverting it would let an attacker accumulate dt across repeated zero-fills.
-    assert_ne!(
+    // Rejection happens before the matcher CPI/oracle mutation path, so a
+    // zero-fill cannot be used to walk the index while target/effective lags.
+    assert_eq!(
         index_before, index_after,
-        "Zero-fill must preserve index advancement (anti-dt-accumulation)"
+        "Rejected zero-fill must not walk index"
     );
 
     // Also verify no position change (sanity check for zero-fill)
@@ -6334,13 +6344,11 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
         "market must still be live before perm_resolve maturity"
     );
 
-    // Stronger assertion: "market stays live" means more than "push
-    // didn't error" — a subsequent TradeCpi at the same slot must also
-    // succeed. If the market had silently slipped into a frozen state
-    // (e.g. get_engine_oracle_price_e6 refusing price reads on the
-    // trade path), this follow-up trade would fail. This is the
-    // end-to-end recoverability check the original audit flagged.
-    env.try_trade_cpi(
+    // User risk changes are now conservatively blocked while the Hyperp
+    // target/effective price has not caught up. The important liveness
+    // property here is that the market remains live and recoverable, not
+    // that same-slot extraction can bypass target lag.
+    let lagged_trade = env.try_trade_cpi(
         &user,
         &lp.pubkey(),
         lp_idx,
@@ -6348,8 +6356,16 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
         1_000_000,
         &matcher_prog,
         &matcher_ctx,
-    )
-    .expect("TradeCpi must succeed on a freshly-revived market");
+    );
+    assert!(
+        lagged_trade.is_err(),
+        "TradeCpi must wait for target catchup after a fresh push: {:?}",
+        lagged_trade
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "target-lag rejection must not resolve the market"
+    );
 }
 
 // test_hyperp_init_rejects_permissionless_window_past_accrue_envelope deleted:

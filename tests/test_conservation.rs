@@ -14,6 +14,12 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+fn advance_hyperp_target(env: &mut TradeCpiTestEnv, logical_slot: &mut u64) {
+    *logical_slot += 1;
+    env.set_slot(*logical_slot);
+    env.crank();
+}
+
 /// ATTACK: Verify no value is created or destroyed through trading operations.
 /// Expected: Total vault token balance equals total deposits minus total withdrawals.
 #[test]
@@ -254,7 +260,8 @@ fn test_attack_premarket_force_close_pnl_conservation() {
         users.push((user, user_idx));
     }
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Each user takes a different sized position
@@ -270,6 +277,7 @@ fn test_attack_premarket_force_close_pnl_conservation() {
             &matcher_ctx,
         );
         assert!(result.is_ok(), "Trade {} should succeed: {:?}", i, result);
+        advance_hyperp_target(&mut env, &mut slot);
     }
 
     env.set_slot(150);
@@ -366,7 +374,8 @@ fn test_attack_multi_lp_conservation() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     let vault_before = env.read_vault();
@@ -382,6 +391,7 @@ fn test_attack_multi_lp_conservation() {
         &matcher_ctx1,
     );
     assert!(result.is_ok(), "Trade vs LP1 should succeed: {:?}", result);
+    advance_hyperp_target(&mut env, &mut slot);
 
     // Trade against LP2 (long again)
     let result = env.try_trade_cpi(
@@ -397,7 +407,8 @@ fn test_attack_multi_lp_conservation() {
 
     // Price moves
     env.try_push_oracle_price(&admin, 1_200_000, 2000).unwrap();
-    env.set_slot(200);
+    slot = 200;
+    env.set_slot(slot);
     env.crank();
 
     // Close positions
@@ -411,6 +422,7 @@ fn test_attack_multi_lp_conservation() {
         &matcher_ctx1,
     );
     assert!(result.is_ok(), "Close vs LP1 should succeed: {:?}", result);
+    advance_hyperp_target(&mut env, &mut slot);
 
     let result = env.try_trade_cpi(
         &user,
@@ -553,7 +565,8 @@ fn test_attack_premarket_partial_force_close_conservation() {
         users.push((user, user_idx));
     }
 
-    env.set_slot(100);
+    let mut slot = 100;
+    env.set_slot(slot);
     env.crank();
 
     // Each user trades
@@ -568,6 +581,7 @@ fn test_attack_premarket_partial_force_close_conservation() {
             &matcher_ctx,
         )
         .expect("all user pre-resolution TradeCpi operations must succeed");
+        advance_hyperp_target(&mut env, &mut slot);
     }
 
     let vault_before = env.read_vault();

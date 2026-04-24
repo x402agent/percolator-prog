@@ -1512,7 +1512,9 @@ fn setup_bounded_withdrawal(env: &mut TestEnv, insurance: u64, max_bps: u16, coo
     env.svm
         .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
         .unwrap();
-    env.top_up_insurance(&insurance_payer, insurance);
+    if insurance > 0 {
+        env.top_up_insurance(&insurance_payer, insurance);
+    }
 
     // Direct slab edits for config fields that don't yet have UpdateConfig
     // wiring. Safe in tests: we own the slab account.

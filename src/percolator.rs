@@ -1229,7 +1229,7 @@ pub mod error {
         InsuranceWithdrawCooldown,
         /// `WithdrawInsuranceLimited` amount exceeds
         /// `insurance_withdraw_max_bps * insurance_fund.balance / 10_000`
-        /// (with a minimum floor of 1 unit to avoid Zeno's-paradox lockout
+        /// (with a minimum floor of 10 units to avoid Zeno's-paradox lockout
         /// at small bps × small insurance).
         InsuranceWithdrawCapExceeded,
     }
@@ -3680,18 +3680,28 @@ pub mod processor {
         }
     }
 
-    fn reject_pending_external_target(
+    fn reject_any_target_lag(
         config: &MarketConfig,
         engine: &RiskEngine,
     ) -> Result<(), ProgramError> {
-        if external_oracle_target_pending(config, engine) {
+        if oracle_target_pending(config, engine) {
             return Err(PercolatorError::CatchupRequired.into());
         }
         Ok(())
     }
 
-    fn effective_pos_q_or_zero(engine: &RiskEngine, idx: usize) -> i128 {
-        engine.try_effective_pos_q(idx).unwrap_or(0)
+    fn effective_pos_q_checked(engine: &RiskEngine, idx: usize) -> Result<i128, ProgramError> {
+        engine
+            .try_effective_pos_q(idx)
+            .map_err(|_| PercolatorError::EngineCorruptState.into())
+    }
+
+    fn risk_notional_ceil(eff: i128, price: u64) -> u128 {
+        percolator::wide_math::mul_div_ceil_u128(
+            eff.unsigned_abs(),
+            price as u128,
+            percolator::POS_SCALE,
+        )
     }
 
     fn reject_stuck_target_accrual(
@@ -4206,11 +4216,15 @@ pub mod processor {
         Ok(())
     }
 
-    fn compute_current_funding_rate_e9(config: &MarketConfig) -> i128 {
+    fn compute_current_funding_rate_e9(config: &MarketConfig) -> Result<i128, ProgramError> {
+        if config.funding_max_premium_bps < 0 || config.funding_max_e9_per_slot < 0 {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
         let mark = config.mark_ewma_e6;
         let index = config.last_effective_price_e6;
         if mark == 0 || index == 0 || config.funding_horizon_slots == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let diff = mark as i128 - index as i128;
@@ -4229,7 +4243,7 @@ pub mod processor {
 
         // Clamp: funding_max_e9_per_slot is already in engine-native e9 units.
         let max_rate_e9 = config.funding_max_e9_per_slot as i128;
-        per_slot.clamp(-max_rate_e9, max_rate_e9)
+        Ok(per_slot.clamp(-max_rate_e9, max_rate_e9))
     }
 
     fn execute_trade_with_matcher<M: MatchingEngine>(
@@ -4919,10 +4933,6 @@ pub mod processor {
                 let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault_empty(a_vault, &auth, a_mint.key, a_vault.key)?;
 
-                for b in data.iter_mut() {
-                    *b = 0;
-                }
-
                 // Initialize engine in-place (zero-copy) to avoid stack overflow.
                 let a_clock = &accounts[4];
                 let a_oracle = &accounts[5];
@@ -5378,6 +5388,9 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
+                if amount == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -5495,6 +5508,9 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
+                if amount == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -5526,7 +5542,7 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
                 // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
                 let price = {
                     let is_hyperp = oracle::is_hyperp_mode(&config);
                     let px = if is_hyperp {
@@ -5556,7 +5572,6 @@ pub mod processor {
                     px
                 };
 
-                reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, user_idx)?;
@@ -5590,6 +5605,7 @@ pub mod processor {
                     price,
                     funding_rate_e9,
                 )?;
+                reject_any_target_lag(&config, engine)?;
                 // Realize due maintenance fees BEFORE the withdrawal margin
                 // check, so the account can't withdraw against pre-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -5702,7 +5718,7 @@ pub mod processor {
                 // Capture pre-oracle-read funding rate for anti-retroactivity (§5.5).
                 // The rate for interval [last_market_slot, now_slot] must reflect
                 // mark vs index DURING that interval, not the post-read state.
-                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config)?;
 
                 let price = if is_hyperp {
                     // Hyperp mode: update index toward mark with rate limiting
@@ -6033,7 +6049,7 @@ pub mod processor {
                             continue;
                         }
                         let eidx = buf.entries[i].idx as usize;
-                        if !engine.is_used(eidx) || effective_pos_q_or_zero(engine, eidx) == 0 {
+                        if !engine.is_used(eidx) || effective_pos_q_checked(engine, eidx)? == 0 {
                             buf.remove(buf.entries[i].idx);
                         }
                     }
@@ -6041,12 +6057,8 @@ pub mod processor {
                     // Phase B: refresh surviving entries
                     for i in 0..buf.count as usize {
                         let eidx = buf.entries[i].idx as usize;
-                        let eff = effective_pos_q_or_zero(engine, eidx);
-                        let notional = percolator::wide_math::mul_div_floor_u128(
-                            eff.unsigned_abs(),
-                            price as u128,
-                            percolator::POS_SCALE,
-                        );
+                        let eff = effective_pos_q_checked(engine, eidx)?;
+                        let notional = risk_notional_ceil(eff, price);
                         buf.entries[i].notional = notional;
                     }
                     buf.recompute_min();
@@ -6070,15 +6082,11 @@ pub mod processor {
                         if !engine.is_used(idx) {
                             continue;
                         }
-                        let eff = effective_pos_q_or_zero(engine, idx);
+                        let eff = effective_pos_q_checked(engine, idx)?;
                         if eff == 0 {
                             continue;
                         }
-                        let notional = percolator::wide_math::mul_div_floor_u128(
-                            eff.unsigned_abs(),
-                            price as u128,
-                            percolator::POS_SCALE,
-                        );
+                        let notional = risk_notional_ceil(eff, price);
                         buf.upsert(idx as u16, notional);
                     }
                     buf.scan_cursor =
@@ -6090,15 +6098,11 @@ pub mod processor {
                         if ci >= percolator::MAX_ACCOUNTS || !engine.is_used(ci) {
                             continue;
                         }
-                        let eff = effective_pos_q_or_zero(engine, ci);
+                        let eff = effective_pos_q_checked(engine, ci)?;
                         if eff == 0 {
                             buf.remove(cidx);
                         } else {
-                            let notional = percolator::wide_math::mul_div_floor_u128(
-                                eff.unsigned_abs(),
-                                price as u128,
-                                percolator::POS_SCALE,
-                            );
+                            let notional = risk_notional_ceil(eff, price);
                             buf.upsert(cidx, notional);
                         }
                     }
@@ -6125,6 +6129,9 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_signer(a_lp)?;
                 accounts::expect_writable(a_slab)?;
+                if size == 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -6147,7 +6154,7 @@ pub mod processor {
                 }
 
                 // Capture pre-read funding rate for anti-retroactivity (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
 
                 // Read the signed oracle price and let the engine enforce caps.
                 let price = read_price_and_stamp(
@@ -6159,7 +6166,6 @@ pub mod processor {
                 )?;
                 state::write_config(&mut data, &config);
 
-                reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, lp_idx)?;
@@ -6191,6 +6197,7 @@ pub mod processor {
                     price,
                     funding_rate_e9,
                 )?;
+                reject_any_target_lag(&config, engine)?;
 
                 // Pre-sync maintenance fees for both counterparties BEFORE
                 // capturing ins_before for the mark-EWMA fee-weight
@@ -6312,8 +6319,8 @@ pub mod processor {
                 // The next accrual (crank/trade/settle) will use the updated mark EWMA.
 
                 // Collect post-trade positions for risk buffer
-                let user_eff_nocpi = effective_pos_q_or_zero(engine, user_idx as usize);
-                let lp_eff_nocpi = effective_pos_q_or_zero(engine, lp_idx as usize);
+                let user_eff_nocpi = effective_pos_q_checked(engine, user_idx as usize)?;
+                let lp_eff_nocpi = effective_pos_q_checked(engine, lp_idx as usize)?;
                 if !state::is_oracle_initialized(&data) {
                     state::set_oracle_initialized(&mut data);
                 }
@@ -6328,11 +6335,7 @@ pub mod processor {
                         if eff == 0 {
                             buf.remove(idx);
                         } else {
-                            let notional = percolator::wide_math::mul_div_floor_u128(
-                                eff.unsigned_abs(),
-                                price as u128,
-                                percolator::POS_SCALE,
-                            );
+                            let notional = risk_notional_ceil(eff, price);
                             buf.upsert(idx, notional);
                         }
                     }
@@ -6534,7 +6537,7 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(a_clock)?;
                 // Capture pre-read funding rate for anti-retroactivity (§5.5)
-                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config)?;
 
                 // Oracle price: Hyperp mode applies rate-limited index update
                 // via clamp_toward_with_dt (prevents stale-index manipulation).
@@ -6570,7 +6573,7 @@ pub mod processor {
 
                 {
                     let data_ref = a_slab.try_borrow_data()?;
-                    reject_pending_external_target(&config, zc::engine_ref(&data_ref)?)?;
+                    reject_any_target_lag(&config, zc::engine_ref(&data_ref)?)?;
                 }
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -6968,8 +6971,8 @@ pub mod processor {
                     let data = a_slab.try_borrow_data()?;
                     let engine = zc::engine_ref(&data)?;
                     (
-                        effective_pos_q_or_zero(engine, user_idx as usize),
-                        effective_pos_q_or_zero(engine, lp_idx as usize),
+                        effective_pos_q_checked(engine, user_idx as usize)?,
+                        effective_pos_q_checked(engine, lp_idx as usize)?,
                     )
                 };
                 // Write nonce + config + risk buffer + oracle flag.
@@ -6988,11 +6991,7 @@ pub mod processor {
                         if eff == 0 {
                             buf.remove(idx);
                         } else {
-                            let notional = percolator::wide_math::mul_div_floor_u128(
-                                eff.unsigned_abs(),
-                                price as u128,
-                                percolator::POS_SCALE,
-                            );
+                            let notional = risk_notional_ceil(eff, price);
                             buf.upsert(idx, notional);
                         }
                     }
@@ -7020,7 +7019,7 @@ pub mod processor {
                 let clock = Clock::from_account_info(&accounts[1])?;
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
                 let price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
                     let p_last = eng.last_oracle_price;
@@ -7055,7 +7054,7 @@ pub mod processor {
                     sol_log_64(target_idx as u64, price, 0, 0, 0);
                     let acc = &engine.accounts[target_idx as usize];
                     sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1);
-                    let eff = effective_pos_q_or_zero(engine, target_idx as usize);
+                    let eff = effective_pos_q_checked(engine, target_idx as usize)?;
                     let notional = engine.notional(target_idx as usize, price);
                     sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2);
                 }
@@ -7096,7 +7095,7 @@ pub mod processor {
                 sol_log_64(_res as u64, 0, 0, 0, 4);
 
                 // Collect post-liquidation position for risk buffer
-                let liq_eff = effective_pos_q_or_zero(engine, target_idx as usize);
+                let liq_eff = effective_pos_q_checked(engine, target_idx as usize)?;
                 if !state::is_oracle_initialized(&data) {
                     state::set_oracle_initialized(&mut data);
                 }
@@ -7107,11 +7106,7 @@ pub mod processor {
                     if liq_eff == 0 {
                         buf.remove(target_idx);
                     } else {
-                        let notional = percolator::wide_math::mul_div_floor_u128(
-                            liq_eff.unsigned_abs(),
-                            price as u128,
-                            percolator::POS_SCALE,
-                        );
+                        let notional = risk_notional_ceil(liq_eff, price);
                         buf.upsert(target_idx, notional);
                     }
                     state::write_risk_buffer(&mut data, &buf);
@@ -7160,7 +7155,7 @@ pub mod processor {
                 let resolved = zc::engine_ref(&data)?.is_resolved();
                 let clock = Clock::from_account_info(&accounts[6])?;
                 // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
                 let price = if resolved {
                     let eng = zc::engine_ref(&data)?;
                     let (settlement, _) = eng.resolved_context();
@@ -7197,9 +7192,6 @@ pub mod processor {
                     px
                 };
 
-                if !resolved {
-                    reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
-                }
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, user_idx)?;
@@ -7257,6 +7249,7 @@ pub mod processor {
                         price,
                         funding_rate_e9,
                     )?;
+                    reject_any_target_lag(&config, engine)?;
                     // Realize due maintenance fees BEFORE close so the account
                     // cannot escape the unpaid interval by closing between cranks.
                     sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -7326,6 +7319,9 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
+                if amount == 0 {
+                    return Err(ProgramError::InvalidArgument);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -7583,7 +7579,7 @@ pub mod processor {
                 }
 
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
                 // Hard-timeout gate: UpdateConfig must not mutate a
@@ -7728,7 +7724,7 @@ pub mod processor {
                 // it as a staleness reference, Hyperp ignores it.
                 let _ = timestamp;
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
                 // Hard-timeout gate: once clock.slot - last_live_slot >=
                 // permissionless_resolve_stale_slots, the market is
                 // TERMINALLY dead. Reject before any mutation.
@@ -7865,7 +7861,7 @@ pub mod processor {
                 // Per-slot price-move cap (init-immutable via RiskParams).
                 let max_change_bps = zc::engine_ref(&data)?.params.max_price_move_bps_per_slot;
                 // Anti-retroactivity: capture funding rate before any config mutation (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
 
                 let clock_gate = Clock::from_account_info(a_clock)?;
 
@@ -8251,7 +8247,14 @@ pub mod processor {
                 if config.insurance_withdraw_max_bps == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
+                {
+                    let engine = zc::engine_ref(&data)?;
+                    reject_any_target_lag(&config, engine)?;
+                    let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
+                    if oi_any && engine.last_market_slot != clock.slot {
+                        return Err(PercolatorError::CatchupRequired.into());
+                    }
+                }
 
                 // Cooldown: first call (last_slot == 0) bypasses. Subsequent
                 // calls require clock.slot - last ≥ cooldown_slots.
@@ -8510,7 +8513,7 @@ pub mod processor {
 
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
                 let price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
                     let p_last = eng.last_oracle_price;
@@ -8536,7 +8539,6 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
-                reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
                 let engine = zc::engine_mut(&mut data)?;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
@@ -8549,6 +8551,7 @@ pub mod processor {
                     price,
                     funding_rate_e9,
                 )?;
+                reject_any_target_lag(&config, engine)?;
                 // Realize due maintenance fees BEFORE settle so the settle's
                 // equity computation reflects post-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -8683,7 +8686,7 @@ pub mod processor {
 
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
                 let price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
                     let p_last = eng.last_oracle_price;
@@ -8709,7 +8712,6 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
-                reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
                 let engine = zc::engine_mut(&mut data)?;
                 check_idx(engine, user_idx)?;
                 let owner = engine.accounts[user_idx as usize].owner;
@@ -8732,6 +8734,7 @@ pub mod processor {
                     price,
                     funding_rate_e9,
                 )?;
+                reject_any_target_lag(&config, engine)?;
                 // Realize due maintenance fees BEFORE conversion so the
                 // convertible-PnL bound reflects post-fee equity.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -8999,7 +9002,7 @@ pub mod processor {
                 let mut config = config_pre;
 
                 // Pre-read funding rate (anti-retroactivity §5.5).
-                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config);
+                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config)?;
 
                 // Oracle read — proves market is live. Mutates `config`
                 // locally (raw/stamp for non-Hyperp, clamp-toward for Hyperp).
