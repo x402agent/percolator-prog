@@ -91,7 +91,7 @@ pub mod constants {
     // invariant
     //   ADL_ONE * MAX_ORACLE_PRICE * MAX_ABS_FUNDING_E9_PER_SLOT *
     //     MAX_ACCRUAL_DT_SLOTS <= i128::MAX
-    // must hold: 1e15 * 1e12 * 1e4 * 1e7 = 1e38 < i128::MAX (≈1.7e38). ✓
+    // must hold: 1e15 * 1e12 * 1e4 * 100 = 1e33 < i128::MAX (≈1.7e38). ✓
     //
     // Tightened from the prior stress-test values (1e6 rate / 1e5 dt) to the
     // production-aligned trade-off (low rate cap, long accrual window) in
@@ -1518,8 +1518,10 @@ pub mod ix {
                     ) = if rest.is_empty() {
                         // Minimal payload: all extended fields use defaults.
                         // permissionless_resolve_stale_slots seeds to
-                        // DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS so
-                        // abandoned markets always have a permissionless exit.
+                        // DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS. With
+                        // the production default of 0, non-Hyperp markets
+                        // must use the extended tail to opt into a
+                        // permissionless exit.
                         // force_close_delay_slots seeds to 1 slot (minimum
                         // liveness) to satisfy the init-time validation that
                         // permissionless_resolve > 0 ⇒ force_close > 0.
@@ -1884,7 +1886,7 @@ pub mod ix {
     }
 
     fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
-        if input.len() < 32 {
+        if input.len() < 40 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let (bytes, rest) = input.split_at(32);
@@ -3721,7 +3723,8 @@ pub mod processor {
     /// clarity.
     ///
     /// No-op when the engine has no oracle observation yet (price=0
-    /// catchup is unsafe) or when the gap is already zero.
+    /// catchup is unsafe). Same-slot price replacement is allowed only
+    /// for flat markets; live OI still requires elapsed slot budget.
     fn ensure_market_accrued_to_now(
         engine: &mut RiskEngine,
         now_slot: u64,
@@ -3729,7 +3732,12 @@ pub mod processor {
         funding_rate_e9: i128,
     ) -> Result<(), ProgramError> {
         catchup_accrue(engine, now_slot, price, funding_rate_e9)?;
-        if price > 0 && now_slot > engine.last_market_slot {
+        let flat_same_slot_price_update = price > 0
+            && now_slot == engine.last_market_slot
+            && price != engine.last_oracle_price
+            && engine.oi_eff_long_q == 0
+            && engine.oi_eff_short_q == 0;
+        if price > 0 && (now_slot > engine.last_market_slot || flat_same_slot_price_update) {
             engine
                 .accrue_market_to(now_slot, price, funding_rate_e9)
                 .map_err(map_risk_error)?;
@@ -6839,7 +6847,6 @@ pub mod processor {
                     &mint,
                     &Pubkey::new_from_array(config.vault_pubkey),
                 )?;
-                verify_token_account(a_user_ata, a_user.key, &mint)?;
                 accounts::expect_key(a_pda, &auth)?;
 
                 let resolved = zc::engine_ref(&data)?.is_resolved();
@@ -6984,21 +6991,25 @@ pub mod processor {
                     crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
                         .ok_or(PercolatorError::EngineOverflow)?;
 
-                let seed1: &[u8] = b"vault";
-                let seed2: &[u8] = a_slab.key.as_ref();
-                let bump_arr: [u8; 1] = [config.vault_authority_bump];
-                let seed3: &[u8] = &bump_arr;
-                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
-                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+                if base_to_pay > 0 {
+                    verify_token_account(a_user_ata, a_user.key, &mint)?;
 
-                collateral::withdraw(
-                    a_token,
-                    a_vault,
-                    a_user_ata,
-                    a_pda,
-                    base_to_pay,
-                    &signer_seeds,
-                )?;
+                    let seed1: &[u8] = b"vault";
+                    let seed2: &[u8] = a_slab.key.as_ref();
+                    let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                    let seed3: &[u8] = &bump_arr;
+                    let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                    let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                    collateral::withdraw(
+                        a_token,
+                        a_vault,
+                        a_user_ata,
+                        a_pda,
+                        base_to_pay,
+                        &signer_seeds,
+                    )?;
+                }
             }
             Instruction::TopUpInsurance { amount } => {
                 accounts::expect_len(accounts, 6)?;

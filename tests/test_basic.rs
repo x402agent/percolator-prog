@@ -47,6 +47,16 @@ fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     )
 }
 
+fn write_account_fee_credits(env: &mut TestEnv, idx: u16, value: i128) {
+    const ACCOUNT_SIZE: usize = 360;
+    const FEE_CREDITS_OFFSET: usize = 224;
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    let off =
+        ENGINE_OFFSET + ENGINE_ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
+    slab.data[off..off + 16].copy_from_slice(&value.to_le_bytes());
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
 #[test]
 fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     program_path();
@@ -748,6 +758,59 @@ fn test_idle_account_can_close_after_crank() {
     );
 
     println!("Idle account closed successfully - basic zombie prevention works");
+}
+
+/// Zero-payout CloseAccount must not require a valid destination token account.
+#[test]
+fn test_zero_payout_close_account_skips_destination_ata_validation() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.withdraw(&user, user_idx, DEFAULT_INIT_CAPITAL);
+    assert_eq!(
+        env.read_account_capital(user_idx),
+        0,
+        "test setup must create a zero-payout account"
+    );
+
+    let (vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(user.pubkey(), false), // deliberately not an SPL token account
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_close_account(user_idx),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&user.pubkey()),
+        &[&user],
+        env.svm.latest_blockhash(),
+    );
+
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_ok(),
+        "zero-payout CloseAccount must not validate or CPI to the destination ATA: {:?}",
+        result
+    );
+    assert_eq!(
+        env.read_num_used_accounts(),
+        0,
+        "zero-payout close should still reclaim the account"
+    );
 }
 
 /// Test that the matcher context can be initialized with Passive mode
@@ -2698,6 +2761,37 @@ fn test_deposit_fee_credits_rejects_zero_debt() {
     assert!(
         result.is_err(),
         "DepositFeeCredits must reject when fee debt is zero",
+    );
+}
+
+/// DepositFeeCredits must fail closed on corrupt i128::MIN fee debt before
+/// relying on engine-side checks.
+#[test]
+fn test_deposit_fee_credits_rejects_i128_min_fee_credits() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    write_account_fee_credits(&mut env, user_idx, i128::MIN);
+
+    let vault_before = env.vault_balance();
+    let result = env.try_deposit_fee_credits(&user, user_idx, 1);
+    assert!(
+        result.is_err(),
+        "DepositFeeCredits must reject corrupt i128::MIN fee_credits"
+    );
+    assert_custom_error(
+        result.as_ref().unwrap_err(),
+        "0x1c",
+        "DepositFeeCredits corrupt fee_credits",
+    );
+    assert_eq!(
+        env.vault_balance(),
+        vault_before,
+        "rejected corrupt fee-credit repayment must not transfer tokens"
     );
 }
 

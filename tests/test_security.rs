@@ -3312,10 +3312,10 @@ fn test_attack_self_trade_same_index() {
     );
 }
 
-/// ATTACK: In Hyperp mode, crank at same slot should not move index (Bug #9 fix).
-/// Verify that dt=0 returns index unchanged, preventing smoothing bypass.
+/// ATTACK: In Hyperp mode, a same-slot flat-market crank may adopt the
+/// target directly. This is allowed only because there is no live OI to mark.
 #[test]
-fn test_attack_hyperp_same_slot_crank_no_index_movement() {
+fn test_attack_hyperp_same_slot_flat_crank_can_adopt_target() {
     let mut env = TestEnv::new();
     env.init_market_hyperp(1_000_000);
 
@@ -3348,13 +3348,16 @@ fn test_attack_hyperp_same_slot_crank_no_index_movement() {
     let slab_after = env.svm.get_account(&env.slab).unwrap().data;
     let index_after = u64::from_le_bytes(slab_after[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
 
-    // Bug #9 fix: index must NOT move when dt=0 (same slot)
-    // Crank may update other fields (e.g. funding rate), but index stays put
-    assert_eq!(
-        index_before, index_after,
-        "ATTACK: Same-slot crank moved index! Bug #9 regression. \
+    // v12.19.13 wrapper policy: zero-OI markets may adopt the raw target
+    // directly because no live position can lose equity. Exposed-OI paths are
+    // still clamped by dt and covered by target-lag gates.
+    assert!(
+        index_after >= index_before,
+        "flat same-slot crank should not move away from the target. \
          before={}, after={}, crank_result={:?}",
-        index_before, index_after, result
+        index_before,
+        index_after,
+        result
     );
 }
 
