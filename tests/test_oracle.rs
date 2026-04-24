@@ -565,7 +565,7 @@ fn test_comprehensive_oracle_price_impact_on_pnl() {
 /// Test: Hyperp mode index smoothing bypass via multiple cranks in same slot
 ///
 /// SECURITY RESEARCH: In Hyperp mode, the index should smoothly move toward the mark
-/// price, rate-limited by oracle_price_cap_e2bps (default 1% per slot).
+/// price, rate-limited by oracle_price_cap (default 1% per slot).
 ///
 /// Potential issue: If crank is called twice in the same slot:
 /// 1. First crank: dt > 0, index rate-limited toward mark
@@ -746,7 +746,7 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     // Before Bug #9 fix, dt=0 caused clamp_toward_with_dt to return mark
     // instead of index, allowing the index to jump to mark in a single slot.
     let slab_data = svm.get_account(&slab).unwrap().data;
-    const INDEX_OFF: usize = 336; // HEADER_LEN(136) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
     let index_after = u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
     assert_eq!(
         index_after, initial_price_e6,
@@ -756,10 +756,10 @@ fn test_hyperp_index_smoothing_multiple_cranks_same_slot() {
     );
 }
 
-/// Audit gap 1: Hyperp index smoothing is rate-limited by cap_e2bps * dt.
+/// Audit gap 1: Hyperp index smoothing is rate-limited by cap * dt.
 ///
 /// Spec behavior: In Hyperp mode, the index (last_effective_price_e6) moves
-/// toward the mark price by at most `index * cap_e2bps * dt / 1_000_000` per
+/// toward the mark price by at most `index * cap * dt / 1_000_000` per
 /// crank.  A second crank in the same slot (dt=0) must leave the index unchanged.
 ///
 /// This test:
@@ -782,12 +782,16 @@ fn test_hyperp_index_smoothing_rate_limited() {
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .expect("set oracle authority");
 
-    // Read default oracle_price_cap_e2bps (1% per slot = 10_000 e2bps)
+    // Read the engine-level `max_price_move_bps_per_slot` — v12.19
+    // replacement for `oracle_price_cap`.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = 136 + 192; // HEADER_LEN(72) + offset_of!(MarketConfig, oracle_price_cap_e2bps)(192)
-    let cap_e2bps =
+    const CAP_OFF: usize = 720; // ENGINE(520) + RiskParams(32) + 168
+    let cap =
         u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
-    assert_eq!(cap_e2bps, 10_000, "default cap should be 10_000 e2bps (1% per slot)");
+    assert_eq!(
+        cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "default cap must match test fixture",
+    );
 
     // Push $200 after enough time for EWMA to blend significantly.
     // With default halflife=100 and ~100 slots dt, alpha ≈ 50%.
@@ -798,7 +802,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
     env.try_push_oracle_price(&admin, 200_000_000, 200).expect("push");
 
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const INDEX_OFF: usize = 136 + 200; // HEADER_LEN(72) + offset_of!(MarketConfig, last_effective_price_e6)(200)
+    const INDEX_OFF: usize = 136 + 192; // HEADER_LEN + offset_of!(MarketConfig, last_effective_price_e6) (v12.19)
 
     // Advance 10 slots and crank. Index should move toward mark.
     let dt: u64 = 10;
@@ -809,8 +813,8 @@ fn test_hyperp_index_smoothing_rate_limited() {
     let index_after_crank =
         u64::from_le_bytes(slab_data[INDEX_OFF..INDEX_OFF + 8].try_into().unwrap());
 
-    // Max allowed movement: index * cap_e2bps * dt / 1_000_000
-    let max_delta = initial_price as u128 * cap_e2bps as u128 * dt as u128 / 1_000_000;
+    // Max allowed movement: index * cap * dt / 1_000_000
+    let max_delta = initial_price as u128 * cap as u128 * dt as u128 / 1_000_000;
     let actual_delta = if index_after_crank > initial_price {
         (index_after_crank - initial_price) as u128
     } else {
@@ -819,8 +823,8 @@ fn test_hyperp_index_smoothing_rate_limited() {
 
     assert!(
         actual_delta <= max_delta,
-        "index movement {} exceeds rate limit {} (cap_e2bps={}, dt={})",
-        actual_delta, max_delta, cap_e2bps, dt
+        "index movement {} exceeds rate limit {} (cap={}, dt={})",
+        actual_delta, max_delta, cap, dt
     );
     // Index should have moved toward mark (if mark > initial and dt > 0)
     // With EWMA, the mark may be only slightly above initial after pushes.
@@ -1121,7 +1125,7 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
     env.crank();
 
     const LAST_ORACLE_PUB_TS_OFF: usize = 320;     // HEADER_LEN(136) + last_oracle_publish_time(184)
-    const LAST_EFFECTIVE_PRICE_OFF: usize = 336;   // HEADER_LEN(136) + last_effective_price_e6(200)
+    const LAST_EFFECTIVE_PRICE_OFF: usize = 328;   // HEADER_LEN(136) + last_effective_price_e6(192)
     let read_pub_ts = |env: &TestEnv| -> i64 {
         let d = env.svm.get_account(&env.slab).unwrap().data;
         i64::from_le_bytes(
@@ -1187,7 +1191,7 @@ fn test_oracle_older_observation_uses_stored_price_and_does_not_rewind() {
 fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
     let mut env = TestEnv::new();
     // Set a tight 1% cap so each cap-step would be visible.
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     const LAST_ORACLE_PUB_TS_OFF: usize = 320;
     const LAST_EFFECTIVE_PRICE_OFF: usize = 336;
@@ -1252,7 +1256,7 @@ fn test_oracle_equal_publish_time_replay_does_not_walk_baseline() {
 #[test]
 fn test_oracle_replay_does_not_advance_liveness_cursor() {
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 0);
+    env.init_market_with_cap(0, 10_000);
 
     const LAST_GOOD_SLOT_OFF: usize = 136 + 328; // HEADER_LEN(136) + last_good_oracle_slot offset
     let read_last_good = |env: &TestEnv| -> u64 {

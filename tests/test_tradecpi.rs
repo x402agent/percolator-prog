@@ -5951,25 +5951,11 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
     ).expect("TradeCpi must succeed on a freshly-revived market");
 }
 
-/// Test 3: Init rejects Hyperp perm_resolve values too large to
-/// recover within the accrue envelope. The general `perm_resolve <=
-/// risk_params.max_accrual_dt_slots` guard (MAX_ACCRUAL_DT_SLOTS =
-/// 10_000_000) is strictly tighter than the Hyperp catchup-budget guard
-/// (CATCHUP_CHUNKS_MAX × MAX_ACCRUAL_DT_SLOTS), so the general guard
-/// always fires first. The substantive assertion is that init REJECTS
-/// any Hyperp perm_resolve past the accrue envelope — pick a value
-/// above the general bound so the test is meaningful regardless of
-/// which guard fires.
-#[test]
-fn test_hyperp_init_rejects_permissionless_window_past_accrue_envelope() {
-    let mut env = TradeCpiTestEnv::new();
-    let too_large: u64 = 10_000_001; // MAX_ACCRUAL_DT_SLOTS + 1
-    env.try_init_market_hyperp_with_stale(
-        1_000_000,
-        86_400,
-        too_large,
-    ).expect_err("init must reject perm_resolve past the accrue envelope");
-}
+// test_hyperp_init_rejects_permissionless_window_past_accrue_envelope deleted:
+// v12.19 dropped the `perm_resolve <= max_accrual_dt_slots` init guard
+// (see src/percolator.rs: "v12.19: the old 'perm_resolve <=
+// max_accrual_dt_slots' check is dropped"). perm_resolve and
+// max_accrual_dt_slots are independent under the §1.4 envelope.
 
 /// TradeCpi ABI: variadic tail accounts past index 7 are forwarded
 /// verbatim to the matcher CPI. This test exercises the wiring — it

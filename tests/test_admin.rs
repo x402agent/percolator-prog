@@ -269,7 +269,7 @@ fn test_update_admin_zero_accepted_for_burn() {
     let mut env = TestEnv::new();
     // Use init_market_with_cap with permissionless resolve + force_close_delay
     // because admin burn requires both for live markets (liveness guard).
-    env.init_market_with_cap(0, 10_000, 100);
+    env.init_market_with_cap(0, 100);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
@@ -310,12 +310,11 @@ fn test_init_rejects_non_hyperp_with_no_resolve_path() {
         &env.mint,
         &common::TEST_FEED_ID,
         0, // invert=0 (non-Hyperp)
-        0, // min_oracle_price_cap_e2bps
         0, // permissionless_resolve_stale_slots
     );
     let err = env
         .try_init_market_raw(data)
-        .expect_err("init must reject non-Hyperp + cap=0 + perm_resolve=0");
+        .expect_err("init must reject non-Hyperp + perm_resolve=0");
     assert!(
         err.contains("0x1a"),
         "expected InvalidConfigParam, got: {}", err,
@@ -340,11 +339,10 @@ fn test_init_accepts_non_hyperp_cap_zero_with_perm_resolve() {
         &env.mint,
         &common::TEST_FEED_ID,
         0,      // invert (non-Hyperp)
-        0,      // min_oracle_price_cap_e2bps
         perm_resolve,
     );
     env.try_init_market_raw(data)
-        .expect("non-Hyperp + cap=0 + perm_resolve>0 must init OK");
+        .expect("non-Hyperp + perm_resolve>0 must init OK");
 
     // End-to-end check: the whole point of the positive invariant is
     // that ResolvePermissionless actually works on this configuration.
@@ -717,7 +715,7 @@ fn test_update_config_admin_only() {
 fn test_update_authority_init_defaults_match_admin() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
 
     let admin_kp = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -736,7 +734,7 @@ fn test_update_authority_init_defaults_match_admin() {
 fn test_update_authority_insurance_positive_delegation() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let delegate = Keypair::new();
     env.svm.airdrop(&delegate.pubkey(), 1_000_000_000).unwrap();
@@ -757,7 +755,7 @@ fn test_update_authority_insurance_positive_delegation() {
 fn test_update_authority_negative_wrong_current_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let target = Keypair::new();
@@ -777,7 +775,7 @@ fn test_update_authority_negative_wrong_current_signer() {
 fn test_update_authority_negative_new_pubkey_not_signer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let target_pubkey = Pubkey::new_unique();
 
@@ -812,7 +810,7 @@ fn test_update_authority_negative_new_pubkey_not_signer() {
 fn test_update_authority_burn_single_sig_and_then_dead() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Burn insurance_authority (single-sig: only current signs).
@@ -833,7 +831,7 @@ fn test_update_authority_burn_single_sig_and_then_dead() {
 fn test_update_authority_burning_one_kind_leaves_others_intact() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     env.try_update_authority(&admin, AUTHORITY_INSURANCE, None)
@@ -847,28 +845,18 @@ fn test_update_authority_burning_one_kind_leaves_others_intact() {
         .expect("admin transfer still works after insurance_authority burn");
 }
 
-/// Admin-burn liveness guard still applies via UpdateAuthority(kind=ADMIN):
-/// cannot burn admin on a live market without permissionless paths wired.
-#[test]
-fn test_update_authority_admin_burn_requires_permissionless_paths() {
-    program_path();
-    let mut env = TestEnv::new();
-    // permissionless_resolve = 0 → admin burn must reject.
-    env.init_market_with_cap(0, 10_000, 0);
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let err = env
-        .try_update_authority(&admin, AUTHORITY_ADMIN, None)
-        .expect_err("admin burn on live market without perm-resolve must reject");
-    let _ = err;
-}
+// test_update_authority_admin_burn_requires_permissionless_paths deleted:
+// v12.19 enforces the resolvability invariant at InitMarket — a non-Hyperp
+// market can no longer be created with permissionless_resolve_stale_slots = 0,
+// so the "live market without perm-resolve" configuration this test required
+// is unreachable via the public init surface.
 
 /// Bad kind byte rejects.
 #[test]
 fn test_update_authority_negative_invalid_kind() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env
@@ -885,7 +873,7 @@ fn test_update_authority_negative_invalid_kind() {
 fn test_update_authority_insurance_survives_admin_burn() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 10_000, 1000);
+    env.init_market_with_cap(0, 1000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     // Before admin burn: delegate insurance_authority to a dedicated key.

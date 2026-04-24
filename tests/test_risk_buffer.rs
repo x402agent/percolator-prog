@@ -147,19 +147,25 @@ fn test_scan_cursor_wraps() {
     env.top_up_insurance(&admin, 1_000_000_000);
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
 
-    // BPF uses MAX_ACCOUNTS=4096, scan window=32.
-    // Full sweep = 4096/32 = 128 cranks. We just verify cursor advances.
-    for i in 0..5u64 {
+    // BPF uses MAX_ACCOUNTS=4096, scan window=32. Cursor advances by
+    // exactly RISK_SCAN_WINDOW (32) per crank — but `deposit`/`trade`
+    // helpers may internally crank too, so we can't hard-code the final
+    // offset. Snapshot the cursor before and after the explicit crank
+    // loop and assert monotonic advance by exactly `N * 32`.
+    let before = env.read_risk_buffer().scan_cursor as u32;
+    const CRANKS: u32 = 5;
+    for i in 0..CRANKS as u64 {
         env.set_slot(200 + i * 10);
         env.crank();
     }
-
-    let buf = env.read_risk_buffer();
-    // After 5 cranks: cursor = 5 * 32 = 160
+    let after = env.read_risk_buffer().scan_cursor as u32;
+    // The cursor advances mod MAX_ACCOUNTS (4096); on this path it
+    // never wraps within 5 cranks.
     assert_eq!(
-        buf.scan_cursor, 160,
-        "Scan cursor must advance by RISK_SCAN_WINDOW per crank: cursor={}",
-        buf.scan_cursor
+        after,
+        before + CRANKS * 32,
+        "Scan cursor must advance by exactly CRANKS * 32 (= {}): before={} after={}",
+        CRANKS * 32, before, after,
     );
 }
 
@@ -312,7 +318,7 @@ fn test_empty_buffer_first_crank() {
 fn test_liquidation_removes_from_buffer() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // liquidation: max cap (100%/read)
+    env.init_market_with_cap(0, 10_000); // liquidation: max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -334,7 +340,7 @@ fn test_liquidation_removes_from_buffer() {
     assert!(buf.find(user_idx).is_some(), "User must be in buffer after trade");
 
     // Price drop → liquidate
-    env.set_slot_and_price(200, 120_000_000);
+    env.set_slot_and_price(500, 110_000_000);
     env.try_liquidate(user_idx).expect("Liquidation must succeed");
 
     let buf = env.read_risk_buffer();
@@ -430,7 +436,7 @@ fn test_buffer_entries_persist_across_cranks() {
 fn test_buffer_notional_refreshed_on_price_change() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // liquidation: max cap (100%/read)
+    env.init_market_with_cap(0, 10_000); // liquidation: max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -450,22 +456,20 @@ fn test_buffer_notional_refreshed_on_price_change() {
     let slot = buf.find(user_idx).expect("User in buffer");
     let notional_138 = buf.entries[slot].notional;
 
-    // Price up to $200, crank refreshes notional
-    env.set_slot_and_price(200, 200_000_000);
+    // Drive the oracle higher; per-slot price cap compounds over cranks.
+    env.set_slot_and_price(500, 160_000_000);
     env.crank();
 
     let buf = env.read_risk_buffer();
     let slot = buf.find(user_idx).expect("User in buffer after price change");
-    let notional_200 = buf.entries[slot].notional;
+    let notional_up = buf.entries[slot].notional;
 
-    assert!(notional_200 > notional_138,
-        "Notional must increase with price: at_138={} at_200={}",
-        notional_138, notional_200);
-
-    // Ratio ~200/138 ≈ 1.45
-    let ratio = (notional_200 as f64) / (notional_138 as f64);
-    assert!(ratio > 1.3 && ratio < 1.6,
-        "Notional ratio must track price ratio (~1.45): ratio={:.2}", ratio);
+    assert!(notional_up > notional_138,
+        "Notional must increase with price: before={} after={}",
+        notional_138, notional_up);
+    // Don't pin the ratio — the engine clamps the price per slot, so the
+    // achieved ratio tracks the per-slot cap * crank count, not the raw
+    // target ratio. Any strictly-greater notional validates the refresh.
 }
 
 // ============================================================================
@@ -686,7 +690,7 @@ fn test_buffer_with_five_accounts_evicts_smallest() {
 fn test_crank_liquidates_undercollateralized_buffer_entry() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // liquidation: max cap (100%/read)
+    env.init_market_with_cap(0, 10_000); // liquidation: max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -709,7 +713,7 @@ fn test_crank_liquidates_undercollateralized_buffer_entry() {
     assert!(buf.find(user_idx).is_some(), "User must be in buffer after trade");
 
     // Price drop → user undercollateralized
-    env.set_slot_and_price(200, 120_000_000);
+    env.set_slot_and_price(500, 110_000_000);
 
     // Crank should liquidate via buffer candidate
     env.crank();
@@ -737,7 +741,7 @@ fn test_buffer_only_liquidation_no_external_candidates() {
 
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 1_000_000, 0); // liquidation: max cap (100%/read)
+    env.init_market_with_cap(0, 10_000); // liquidation: max cap (100%/read)
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -760,7 +764,7 @@ fn test_buffer_only_liquidation_no_external_candidates() {
     assert!(buf.find(user_idx).is_some(), "User must be in buffer after trade");
 
     // Price drop → user undercollateralized
-    env.set_slot_and_price(200, 120_000_000);
+    env.set_slot_and_price(500, 110_000_000);
 
     // Crank with EMPTY candidate list — only buffer entries drive liquidation
     let caller = Keypair::new();
