@@ -1729,8 +1729,8 @@ fn test_attack_hyperp_mark_manipulation_via_trade() {
         .unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
-    // Set price cap so circuit breaker is active
-    env.try_set_oracle_price_cap(&admin, 500).unwrap(); // 5% per slot
+    // v12.19: price-move cap is an immutable init-time param (TEST_MAX_PRICE_MOVE_BPS_PER_SLOT);
+    // no runtime SetOraclePriceCap call is needed.
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -1797,7 +1797,7 @@ fn test_attack_hyperp_index_lag_exploitation() {
     env.try_set_oracle_authority(&admin, &admin.pubkey())
         .unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
-    env.try_set_oracle_price_cap(&admin, 10_000).unwrap(); // 100% per slot cap
+    // v12.19: price-move cap is immutable init-time; no runtime call.
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -2011,8 +2011,7 @@ fn test_attack_premarket_resolve_extreme_high_price() {
         .unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
 
-    // Set price cap to max (100%) to allow extreme price for resolution scenario
-    env.try_set_oracle_price_cap(&admin, 1_000_000).unwrap();
+    // v12.19: price-move cap is immutable init-time; no runtime call.
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);

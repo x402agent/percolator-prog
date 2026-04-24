@@ -808,9 +808,8 @@ fn test_hyperp_full_lifecycle_init_to_close_slab() {
     env.svm.send_transaction(tx).expect("UpdateConfig");
     println!("5. UpdateConfig succeeded (k=200, horizon=7200)");
 
-    // 6. SetOraclePriceCap
-    env.try_set_oracle_price_cap(&admin, 50_000).expect("SetOraclePriceCap");
-    println!("6. SetOraclePriceCap set to 50_000 (5%/slot)");
+    // 6. v12.19: price-move cap is immutable init-time, no runtime call.
+    println!("6. price cap is init-time (v12.19)");
 
     // 7. Create user + deposit
     let user = Keypair::new();

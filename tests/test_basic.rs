@@ -2010,8 +2010,7 @@ fn test_funding_rate_transfers_pnl_on_premium() {
     let mp = env.matcher_program_id;
     env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
     env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
-    // Widen cap so mark can diverge from index significantly
-    env.try_set_oracle_price_cap(&admin, 500_000).unwrap(); // 50% per slot
+    // Per-slot price-move cap is init-immutable in v12.19; no runtime widening.
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
@@ -3880,7 +3879,8 @@ fn test_funding_bootstrap_default_params() {
     let cap = env.read_oracle_price_cap();
 
     assert_eq!(horizon, 500, "Default funding_horizon_slots should be 500");
-    assert_eq!(cap, 10_000, "Cap should match min_oracle_price_cap_e2bps");
+    assert_eq!(cap, common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT,
+        "Cap should match engine's max_price_move_bps_per_slot");
 }
 
 // ============================================================================
@@ -3893,7 +3893,7 @@ fn test_init_market_custom_funding_horizon() {
     program_path();
     let mut env = TestEnv::new();
     // Custom horizon=1000, k=100 (default), max_premium=500 (default), max_per_slot=5 (default)
-    env.init_market_with_funding(0, 10_000, 0, 1000, 100, 500, 5);
+    env.init_market_with_funding(0, 10_000, 10_000, 1000, 100, 500, 5);
     assert_eq!(env.read_funding_horizon(), 1000, "Custom horizon must be stored");
 }
 
@@ -3902,7 +3902,7 @@ fn test_init_market_custom_funding_horizon() {
 fn test_init_market_custom_funding_k() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 500, 200, 500, 5);
+    env.init_market_with_funding(0, 10_000, 10_000, 500, 200, 500, 5);
     assert_eq!(env.read_funding_k_bps(), 200, "Custom k_bps must be stored");
 }
 
@@ -3911,7 +3911,7 @@ fn test_init_market_custom_funding_k() {
 fn test_init_market_custom_funding_max_premium() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 500, 100, 1000, 5);
+    env.init_market_with_funding(0, 10_000, 10_000, 500, 100, 1000, 5);
     assert_eq!(
         env.read_funding_max_premium_bps(),
         1000,
@@ -3924,7 +3924,7 @@ fn test_init_market_custom_funding_max_premium() {
 fn test_init_market_custom_funding_max_per_slot() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_funding(0, 10_000, 0, 500, 100, 500, 10);
+    env.init_market_with_funding(0, 10_000, 10_000, 500, 100, 500, 10);
     assert_eq!(
         env.read_funding_max_e9_per_slot(),
         10,
@@ -3939,7 +3939,7 @@ fn test_init_market_custom_all_funding_params() {
     let mut env = TestEnv::new();
     // funding_max_e9_per_slot must fit the engine's per-market envelope
     // (max_abs_funding_e9_per_slot = 1_000_000, i.e. 10 bps/slot). Use 10.
-    env.init_market_with_funding(0, 10_000, 0, 2000, 300, 800, 10);
+    env.init_market_with_funding(0, 10_000, 10_000, 2000, 300, 800, 10);
     assert_eq!(env.read_funding_horizon(), 2000);
     assert_eq!(env.read_funding_k_bps(), 300);
     assert_eq!(env.read_funding_max_premium_bps(), 800);
