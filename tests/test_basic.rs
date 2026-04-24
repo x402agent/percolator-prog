@@ -13,14 +13,54 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
+const INIT_MAINTENANCE_FEE_OFFSET: usize = 120;
+const INIT_H_MIN_OFFSET: usize = 136;
+const INIT_NEW_ACCOUNT_FEE_OFFSET: usize = 176;
+const INIT_UNIT_SCALE_OFFSET: usize = 108;
+
+fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(buf: &mut [u8], offset: usize, value: u64) {
+    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u128(buf: &mut [u8], offset: usize, value: u128) {
+    buf[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+}
+
+fn assert_custom_error(err: &str, code_hex: &str, context: &str) {
+    assert!(
+        err.contains(code_hex),
+        "{context}: expected custom program error {code_hex}, got: {err}",
+    );
+}
+
+fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 624;
+    u64::from_le_bytes(
+        d[LAST_ORACLE_PRICE_OFFSET..LAST_ORACLE_PRICE_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
 #[test]
 fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     program_path();
 
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 80);
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     env.crank();
 
     let baseline = env.read_last_effective_price();
@@ -35,12 +75,34 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
         "wrapper must persist the raw oracle target separately"
     );
     let effective = env.read_last_effective_price();
+    let engine_p_last = read_engine_last_oracle_price(&env);
     assert!(
         effective > baseline && effective < target,
         "effective price must move by the dt-capped staircase, got {effective}"
     );
+    assert_ne!(
+        engine_p_last, target,
+        "test setup requires target to remain ahead of engine P_last"
+    );
     env.try_withdraw(&user, user_idx, 1)
         .expect_err("extraction must reject while oracle target is still pending");
+    let settle_err = env
+        .try_settle_account(user_idx)
+        .expect_err("settle must reject while oracle target is still pending");
+    assert_custom_error(
+        &settle_err,
+        "0x1d",
+        "SettleAccount must surface CatchupRequired while target lags P_last",
+    );
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let resolve_err = env
+        .try_resolve_market(&admin, 0)
+        .expect_err("ordinary resolve must reject a lagged effective price");
+    assert_custom_error(
+        &resolve_err,
+        "0x1d",
+        "Ordinary ResolveMarket must not settle at a known-lag effective price",
+    );
 
     for _ in 0..64 {
         if env.read_last_effective_price() == target {
@@ -61,6 +123,57 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
 }
 
 #[test]
+fn test_external_oracle_stuck_target_does_not_advance_slot_last() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let mut data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        1,
+        0,
+    );
+    put_u32(&mut data, INIT_UNIT_SCALE_OFFSET, 1_000_000);
+    env.try_init_market_raw(data).expect("init scaled market");
+    env.crank();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp_with_fee(&lp, 2_000_000);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user_with_fee(&user, 2_000_000);
+    env.deposit(&user, user_idx, 10_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "test setup must create live OI"
+    );
+
+    let slot_before = env.read_last_market_slot();
+    let p_last = env.read_last_effective_price();
+    assert_eq!(p_last, 138, "scaled setup should seed P_last=138");
+
+    env.set_slot_and_price_raw_no_walk(slot_before + 1, 139_000_000);
+    let err = env
+        .try_catchup_accrue()
+        .expect_err("dt-capped max_delta=0 with live OI must require catchup/recovery");
+    assert_custom_error(
+        &err,
+        "0x1d",
+        "CatchupAccrue must reject unchanged effective price while raw target is pending",
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before,
+        "slot_last must not advance by feeding unchanged P_last while target catch-up is stuck",
+    );
+}
+
+#[test]
 fn test_zero_oi_no_oracle_topup_can_cross_accrual_envelope() {
     program_path();
 
@@ -77,6 +190,63 @@ fn test_zero_oi_no_oracle_topup_can_cross_accrual_envelope() {
 
     env.try_top_up_insurance(&admin, 1_000)
         .expect("zero-OI no-oracle paths may fast-forward without requiring catchup");
+}
+
+#[test]
+fn test_init_market_rejects_zero_public_warmup() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let mut data =
+        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 80);
+    put_u64(&mut data, INIT_H_MIN_OFFSET, 0);
+
+    let err = env
+        .try_init_market_raw(data)
+        .expect_err("public wrapper must reject h_min=0");
+    assert_custom_error(
+        &err,
+        "0x1a",
+        "InitMarket must enforce nonzero public live warmup",
+    );
+}
+
+#[test]
+fn test_init_market_rejects_zero_materialization_cost_on_all_market_types() {
+    program_path();
+
+    let mut external_env = TestEnv::new();
+    let mut external = encode_init_market_with_cap(
+        &external_env.payer.pubkey(),
+        &external_env.mint,
+        &TEST_FEED_ID,
+        0,
+        80,
+    );
+    put_u128(&mut external, INIT_MAINTENANCE_FEE_OFFSET, 0);
+    put_u128(&mut external, INIT_NEW_ACCOUNT_FEE_OFFSET, 0);
+    let external_err = external_env
+        .try_init_market_raw(external)
+        .expect_err("external market with no materialization cost must reject");
+    assert_custom_error(
+        &external_err,
+        "0x1a",
+        "External InitMarket must enforce materialization anti-spam",
+    );
+
+    let mut hyperp_env = TestEnv::new();
+    let mut hyperp =
+        encode_init_market_hyperp(&hyperp_env.payer.pubkey(), &hyperp_env.mint, 138_000_000);
+    put_u128(&mut hyperp, INIT_MAINTENANCE_FEE_OFFSET, 0);
+    put_u128(&mut hyperp, INIT_NEW_ACCOUNT_FEE_OFFSET, 0);
+    let hyperp_err = hyperp_env
+        .try_init_market_raw(hyperp)
+        .expect_err("Hyperp admin-resolve market with no materialization cost must reject");
+    assert_custom_error(
+        &hyperp_err,
+        "0x1a",
+        "Hyperp InitMarket must enforce materialization anti-spam",
+    );
 }
 /// Test that an inverted market can successfully run crank operations.
 ///
@@ -4774,7 +4944,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
         data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
                                                       // RiskParams with 10 bps trading fee
-        data.extend_from_slice(&0u64.to_le_bytes()); // h_min (warmup floor)
+        data.extend_from_slice(&1u64.to_le_bytes()); // h_min (public warmup floor)
         data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
         data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
         data.extend_from_slice(&10u64.to_le_bytes()); // trading_fee_bps = 10 (0.1%)
@@ -6103,14 +6273,14 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.push(0u8); // invert
     payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
     payload.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark
-    payload.extend_from_slice(&0u128.to_le_bytes()); // maint_fee
+    payload.extend_from_slice(&1u128.to_le_bytes()); // maintenance_fee_per_slot (anti-spam satisfied)
     payload.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap
-    payload.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    payload.extend_from_slice(&1u64.to_le_bytes()); // h_min
     payload.extend_from_slice(&500u64.to_le_bytes());
     payload.extend_from_slice(&1000u64.to_le_bytes());
     payload.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
-    payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee (maintenance fee provides anti-spam)
     payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
     payload.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=80 <= 100)
     payload.extend_from_slice(&50u64.to_le_bytes());
@@ -6157,7 +6327,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     payload.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark
     payload.extend_from_slice(&1u128.to_le_bytes()); // maintenance_fee_per_slot=1 (F3 gate)
                                                      // RiskParams
-    payload.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    payload.extend_from_slice(&1u64.to_le_bytes()); // h_min
     payload.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     payload.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     payload.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps

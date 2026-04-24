@@ -32,11 +32,11 @@ use std::path::PathBuf;
 // tests) has been removed; integration tests go through the BPF binary.
 // BPF-target SLAB_LEN, cfg-gated by deployment-size feature.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-const SLAB_LEN: usize = 96688;
+const SLAB_LEN: usize = 96664;
 #[cfg(all(feature = "medium", not(feature = "small")))]
-const SLAB_LEN: usize = 382480;
+const SLAB_LEN: usize = 382456;
 #[cfg(not(any(feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1525648;
+const SLAB_LEN: usize = 1525624;
 const MAX_ACCOUNTS: usize = 2048;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
@@ -133,13 +133,13 @@ fn encode_init_market_with_params(
                                                  // RiskParams entry (see max_price_move_bps_per_slot below).
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
                                                   // RiskParams
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_min
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_min
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee (anti-spam floor)
-    data.extend_from_slice(&warmup_period_slots.to_le_bytes()); // h_max (must be >= h_min)
+    data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
     data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (< perm_resolve <= MAX_ACCRUAL_DT_SLOTS)
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap

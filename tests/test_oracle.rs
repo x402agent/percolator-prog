@@ -116,7 +116,7 @@ fn test_hyperp_rejects_zero_initial_mark_price() {
     // Snapshot state before the failing init attempt.
     // Header+config region should remain unchanged on rejected tx.
     const HEADER_CONFIG_LEN: usize = 584;
-    let NUM_USED_OFF: usize = 520 + common::ENGINE_NUM_USED_OFFSET;
+    let NUM_USED_OFF: usize = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let slab_before = svm.get_account(&slab).unwrap().data;
     let vault_before = {
         let vault_data = svm.get_account(&vault).unwrap().data;
@@ -289,11 +289,11 @@ fn test_hyperp_init_market_with_valid_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap_off = 520 + 200;
+    let cap_off = common::ENGINE_OFFSET + 32 + 160;
     let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used_off = 520 + common::ENGINE_NUM_USED_OFFSET;
+    let used_off = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -456,11 +456,11 @@ fn test_hyperp_init_market_with_inverted_price() {
     let config = percolator_prog::state::read_config(&slab_data);
     let mark = config.hyperp_mark_e6;
     let index = config.last_effective_price_e6;
-    let cap_off = 520 + 200;
+    let cap_off = common::ENGINE_OFFSET + 32 + 160;
     let cap = u64::from_le_bytes(slab_data[cap_off..cap_off + 8].try_into().unwrap());
     const FEED_ID_OFF: usize = 136 + 64;
     const INVERT_OFF: usize = 136 + 107;
-    let used_off = 520 + common::ENGINE_NUM_USED_OFFSET;
+    let used_off = common::ENGINE_OFFSET + common::ENGINE_NUM_USED_OFFSET;
     let used = u16::from_le_bytes(slab_data[used_off..used_off + 2].try_into().unwrap());
 
     assert_ne!(magic, 0, "InitMarket must write a non-zero slab magic");
@@ -821,7 +821,7 @@ fn test_hyperp_index_smoothing_rate_limited() {
     // Read the engine-level `max_price_move_bps_per_slot` — v12.19
     // replacement for `oracle_price_cap`.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const CAP_OFF: usize = 720; // ENGINE(520) + RiskParams(32) + 168
+    const CAP_OFF: usize = common::ENGINE_OFFSET + 32 + 160;
     let cap = u64::from_le_bytes(slab_data[CAP_OFF..CAP_OFF + 8].try_into().unwrap());
     assert_eq!(
         cap,

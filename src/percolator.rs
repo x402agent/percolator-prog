@@ -2125,7 +2125,7 @@ pub mod ix {
         // account capital. Engine never sees the fee. Zero disables.
         let new_account_fee = read_u128(input)?;
         let h_max = read_u64(input)?;
-        let max_crank_staleness_slots = read_u64(input)?;
+        let _max_crank_staleness_slots = read_u64(input)?;
         let liquidation_fee_bps = read_u64(input)?;
         let liquidation_fee_cap = U128::new(read_u128(input)?);
         let resolve_price_deviation_bps = read_u64(input)?; // was _liquidation_buffer_bps
@@ -2142,7 +2142,7 @@ pub mod ix {
         // §1.4 requires `cfg_max_price_move_bps_per_slot > 0`. Reject before
         // any engine call so the error surfaces as `InvalidConfigParam`
         // rather than an engine-side panic.
-        if max_price_move_bps_per_slot == 0 {
+        if h_min == 0 || h_max < h_min || max_price_move_bps_per_slot == 0 {
             return Err(crate::error::PercolatorError::InvalidConfigParam.into());
         }
 
@@ -2151,7 +2151,6 @@ pub mod ix {
             initial_margin_bps,
             trading_fee_bps,
             max_accounts,
-            max_crank_staleness_slots,
             liquidation_fee_bps,
             liquidation_fee_cap,
             min_liquidation_abs,
@@ -3244,7 +3243,8 @@ pub mod oracle {
     ///   Mark staleness enforced via last_mark_push_slot.
     /// In external mode: reads the signed Pyth/Chainlink observation directly.
     pub fn get_engine_oracle_price_e6(
-        engine_last_slot: u64,
+        engine_last_oracle_price: u64,
+        price_move_dt_slots: u64,
         now_slot: u64,
         now_unix_ts: i64,
         config: &mut super::state::MarketConfig,
@@ -3286,30 +3286,38 @@ pub mod oracle {
                 }
             }
 
-            let prev_index = config.last_effective_price_e6;
-            // Use dedicated last_hyperp_index_slot, not engine.current_slot.
-            // This tracks exactly when the index was last updated, preventing
-            // both under-counting dt (unrelated user activity) and over-counting
-            // dt (admin flush without engine.current_slot advance).
-            let last_idx_slot = config.last_hyperp_index_slot;
-            let dt = now_slot.saturating_sub(last_idx_slot);
-            let new_index = clamp_toward_with_dt(prev_index.max(1), mark, max_change_bps, dt);
+            // Hyperp uses the same target/effective split as external
+            // oracles: mark/EWMA is the target, and the engine-fed index
+            // moves from engine P_last over the residual dt that the next
+            // accrue may legally consume. Do not key this off
+            // last_hyperp_index_slot; repeated partial catchups must advance
+            // from the engine's stored price and remaining accrual window.
+            let anchor = if engine_last_oracle_price != 0 {
+                engine_last_oracle_price
+            } else if config.last_effective_price_e6 != 0 {
+                config.last_effective_price_e6
+            } else {
+                mark
+            };
+            let new_index =
+                clamp_toward_engine_dt(anchor, mark, max_change_bps, price_move_dt_slots);
 
             config.last_effective_price_e6 = new_index;
-            config.last_hyperp_index_slot = now_slot;
+            if new_index != anchor || new_index == mark {
+                config.last_hyperp_index_slot = now_slot;
+            }
             return Ok(new_index);
         }
 
         // Non-Hyperp: source signed Pyth/Chainlink price; the engine enforces
         // the dt-scaled movement cap during accrual.
-        let p_last = config.last_effective_price_e6;
         read_price_clamped(
             config,
             a_oracle,
             now_unix_ts,
             max_change_bps,
-            p_last,
-            now_slot.saturating_sub(engine_last_slot),
+            engine_last_oracle_price,
+            price_move_dt_slots,
         )
     }
 }
@@ -3627,10 +3635,21 @@ pub mod processor {
         engine: &RiskEngine,
         wallclock_slot: u64,
     ) -> Result<u64, ProgramError> {
+        price_move_residual_dt_from_parts(
+            engine.last_market_slot,
+            engine.params.max_accrual_dt_slots,
+            wallclock_slot,
+        )
+    }
+
+    fn price_move_residual_dt_from_parts(
+        last_market_slot: u64,
+        max_dt: u64,
+        wallclock_slot: u64,
+    ) -> Result<u64, ProgramError> {
         let gap = wallclock_slot
-            .checked_sub(engine.last_market_slot)
+            .checked_sub(last_market_slot)
             .ok_or(PercolatorError::EngineOverflow)?;
-        let max_dt = engine.params.max_accrual_dt_slots;
         if max_dt == 0 || gap <= max_dt {
             return Ok(gap);
         }
@@ -3644,11 +3663,52 @@ pub mod processor {
             && config.oracle_target_price_e6 != engine.last_oracle_price
     }
 
+    fn hyperp_target_price(config: &MarketConfig) -> u64 {
+        if config.mark_ewma_e6 > 0 {
+            config.mark_ewma_e6
+        } else {
+            config.hyperp_mark_e6
+        }
+    }
+
+    fn oracle_target_pending(config: &MarketConfig, engine: &RiskEngine) -> bool {
+        if oracle::is_hyperp_mode(config) {
+            let target = hyperp_target_price(config);
+            target != 0 && target != engine.last_oracle_price
+        } else {
+            external_oracle_target_pending(config, engine)
+        }
+    }
+
     fn reject_pending_external_target(
         config: &MarketConfig,
         engine: &RiskEngine,
     ) -> Result<(), ProgramError> {
         if external_oracle_target_pending(config, engine) {
+            return Err(PercolatorError::CatchupRequired.into());
+        }
+        Ok(())
+    }
+
+    fn effective_pos_q_or_zero(engine: &RiskEngine, idx: usize) -> i128 {
+        engine.try_effective_pos_q(idx).unwrap_or(0)
+    }
+
+    fn reject_stuck_target_accrual(
+        config: &MarketConfig,
+        engine: &RiskEngine,
+        now_slot: u64,
+        price: u64,
+    ) -> Result<(), ProgramError> {
+        let dt = now_slot
+            .checked_sub(engine.last_market_slot)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
+        if dt > 0
+            && oi_any
+            && oracle_target_pending(config, engine)
+            && price == engine.last_oracle_price
+        {
             return Err(PercolatorError::CatchupRequired.into());
         }
         Ok(())
@@ -3684,7 +3744,7 @@ pub mod processor {
         {
             return Err(ProgramError::InvalidInstructionData);
         }
-        if params.h_max == 0 || params.h_min > params.h_max {
+        if params.h_min == 0 || params.h_max < params.h_min {
             return Err(ProgramError::InvalidInstructionData);
         }
         if params.resolve_price_deviation_bps > percolator::MAX_RESOLVE_PRICE_DEVIATION_BPS {
@@ -3784,96 +3844,53 @@ pub mod processor {
             return Err(PercolatorError::OracleInvalid.into());
         }
 
-        engine.vault = percolator::U128::ZERO;
-        engine.insurance_fund = percolator::InsuranceFund {
-            balance: percolator::U128::ZERO,
-        };
+        // InitMarket runs on a freshly-created, zero-filled slab. Do not
+        // sweep MAX_ACCOUNTS account slots here; zero memory is the canonical
+        // unused-account state and materialization initializes a slot when it
+        // becomes live.
         engine.params = params;
         engine.current_slot = init_slot;
-        engine.market_mode = percolator::MarketMode::Live;
-        engine.resolved_price = 0;
-        engine.resolved_slot = 0;
-        engine.resolved_payout_h_num = 0;
-        engine.resolved_payout_h_den = 0;
-        engine.resolved_payout_ready = 0;
-        engine.resolved_k_long_terminal_delta = 0;
-        engine.resolved_k_short_terminal_delta = 0;
-        engine.resolved_live_price = 0;
-        engine.last_crank_slot = init_slot;
-        engine.c_tot = percolator::U128::ZERO;
-        engine.pnl_pos_tot = 0;
-        engine.pnl_matured_pos_tot = 0;
-        engine.gc_cursor = 0;
         engine.adl_mult_long = percolator::ADL_ONE;
         engine.adl_mult_short = percolator::ADL_ONE;
-        engine.adl_coeff_long = 0;
-        engine.adl_coeff_short = 0;
-        engine.adl_epoch_long = 0;
-        engine.adl_epoch_short = 0;
-        engine.adl_epoch_start_k_long = 0;
-        engine.adl_epoch_start_k_short = 0;
-        engine.oi_eff_long_q = 0;
-        engine.oi_eff_short_q = 0;
-        engine.side_mode_long = percolator::SideMode::Normal;
-        engine.side_mode_short = percolator::SideMode::Normal;
-        engine.stored_pos_count_long = 0;
-        engine.stored_pos_count_short = 0;
-        engine.stale_account_count_long = 0;
-        engine.stale_account_count_short = 0;
-        engine.phantom_dust_bound_long_q = 0;
-        engine.phantom_dust_bound_short_q = 0;
-        engine.materialized_account_count = 0;
-        engine.neg_pnl_account_count = 0;
-        engine.rr_cursor_position = 0;
-        engine.sweep_generation = 0;
-        engine.price_move_consumed_bps_this_generation = 0;
         engine.last_oracle_price = init_oracle_price;
         engine.fund_px_last = init_oracle_price;
         engine.last_market_slot = init_slot;
-        engine.f_long_num = 0;
-        engine.f_short_num = 0;
-        engine.f_epoch_start_long_num = 0;
-        engine.f_epoch_start_short_num = 0;
-        engine.used = [0; percolator::BITMAP_WORDS];
-        engine.num_used_accounts = 0;
-        engine.free_head = 0;
+        Ok(())
+    }
 
-        for i in 0..percolator::MAX_ACCOUNTS {
-            engine.next_free[i] = if i + 1 < percolator::MAX_ACCOUNTS {
+    fn prepare_lazy_free_head(engine: &mut RiskEngine) -> Result<u16, ProgramError> {
+        let max_accounts = core::cmp::min(
+            engine.params.max_accounts as usize,
+            percolator::MAX_ACCOUNTS,
+        );
+        let idx = engine.free_head;
+        if idx == u16::MAX || (idx as usize) >= max_accounts || engine.is_used(idx as usize) {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+
+        let i = idx as usize;
+        let valid_head = engine.prev_free[i] == u16::MAX
+            && (engine.next_free[i] == u16::MAX
+                || ((engine.next_free[i] as usize) < max_accounts
+                    && !engine.is_used(engine.next_free[i] as usize)
+                    && engine.prev_free[engine.next_free[i] as usize] == idx));
+        if !valid_head {
+            if idx as u64 != engine.num_used_accounts as u64 {
+                return Err(PercolatorError::EngineOverflow.into());
+            }
+            let next = if i + 1 < max_accounts {
                 (i + 1) as u16
             } else {
                 u16::MAX
             };
-            engine.prev_free[i] = if i == 0 { u16::MAX } else { (i - 1) as u16 };
-
-            let account = &mut engine.accounts[i];
-            account.kind = percolator::Account::KIND_USER;
-            account.capital = percolator::U128::ZERO;
-            account.pnl = 0;
-            account.reserved_pnl = 0;
-            account.position_basis_q = 0;
-            account.adl_a_basis = percolator::ADL_ONE;
-            account.adl_k_snap = 0;
-            account.f_snap = 0;
-            account.adl_epoch_snap = 0;
-            account.matcher_program = [0; 32];
-            account.matcher_context = [0; 32];
-            account.owner = [0; 32];
-            account.fee_credits = percolator::I128::ZERO;
-            account.last_fee_slot = 0;
-            account.sched_present = 0;
-            account.sched_remaining_q = 0;
-            account.sched_anchor_q = 0;
-            account.sched_start_slot = 0;
-            account.sched_horizon = 0;
-            account.sched_release_q = 0;
-            account.pending_present = 0;
-            account.pending_remaining_q = 0;
-            account.pending_horizon = 0;
-            account.pending_created_slot = 0;
+            engine.prev_free[i] = u16::MAX;
+            engine.next_free[i] = next;
+            if next != u16::MAX {
+                engine.prev_free[next as usize] = idx;
+            }
         }
 
-        Ok(())
+        Ok(idx)
     }
 
     /// Maximum number of max_dt chunks the in-line catchup can advance per
@@ -4050,6 +4067,17 @@ pub mod processor {
                 .map_err(map_risk_error)?;
         }
         Ok(())
+    }
+
+    fn ensure_market_accrued_to_now_with_policy(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        reject_stuck_target_accrual(config, engine, now_slot, price)?;
+        ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
     }
 
     /// Incrementally sweep maintenance fees from the current cursor position.
@@ -4685,20 +4713,10 @@ pub mod processor {
                 if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // Spec §12.21: public wrappers MUST NOT admit the combination
-                //   (admit_h_min == 0 && admit_h_max_consumption_threshold_bps == None)
-                // at any admission call site. The wrapper's runtime default
-                // passes `Some(maintenance_margin_bps)` as the threshold
-                // (see `admit_threshold = Some(engine.params
-                // .maintenance_margin_bps as u128)` in every execute_trade /
-                // withdraw / convert / settle call site). maintenance_margin_bps
-                // is validated > 0 immediately above, so the forbidden
-                // combination cannot arise at runtime. This assert makes the
-                // invariant explicit at init so a future change that relaxes
-                // the `maintenance_margin_bps == 0` reject (or swaps the
-                // runtime threshold to `None`) trips here, not silently via
-                // a §12.21-violating admission.
-                if risk_params.h_min == 0 && risk_params.maintenance_margin_bps == 0 {
+                // Public live markets must have a nonzero warmup floor.
+                // A stress threshold is additive; it is not a substitute
+                // for h_min on untrusted oracle/execution PnL.
+                if risk_params.h_min == 0 || risk_params.h_max < risk_params.h_min {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 // insurance_withdraw_max_bps is a percentage (0..=10_000)
@@ -4762,13 +4780,6 @@ pub mod processor {
                 // decoded and prevalidated by read_risk_params. InitMarket
                 // returns a ProgramError on bad config; it must not rely on
                 // an engine-side panic for public input validation.
-                // Permissionless resolve: if enabled, must exceed max_crank_staleness
-                // to prevent accidental instant-resolution from one missed crank.
-                if permissionless_resolve_stale_slots > 0
-                    && permissionless_resolve_stale_slots <= risk_params.max_crank_staleness_slots
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
                 // Liveness: if permissionless resolution is enabled, force_close must
                 // also be enabled. Otherwise abandoned accounts on resolved markets
                 // with burned admin have no cleanup path.
@@ -4881,18 +4892,10 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // §12.19.6 F8 (anti-spam wrapper obligation): permissionless
-                // markets must gate account materialization with either a
-                // per-creation fee or ongoing maintenance cost. Otherwise an
-                // attacker can fill `max_accounts` slots with zero-cost dust
-                // deposits and DoS further entrants. Admin-only markets
-                // (permissionless_resolve_stale_slots == 0) retain the
-                // trusted-deployment escape — admins accept the risk or gate
-                // off-chain. Permissionless markets have no such backstop.
-                if permissionless_resolve_stale_slots > 0
-                    && new_account_fee == 0
-                    && maintenance_fee_per_slot == 0
-                {
+                // Public account materialization must be economically costly
+                // on every market. Resolution mode does not protect the live
+                // account table from zero-cost slot exhaustion.
+                if new_account_fee == 0 && maintenance_fee_per_slot == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
@@ -4983,12 +4986,7 @@ pub mod processor {
                     {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    // new_account_fee removed in engine v12.18.1 (§10.2).
-                    // Warmup horizon: 0 < h_min <= h_max. h_max == 0 would
-                    // zero-width the warmup cohort and break reserve logic
-                    // at admission; the engine asserts this but we pre
-                    // -validate for clearer errors at init time.
-                    if p.h_max == 0 || p.h_min > p.h_max {
+                    if p.h_min == 0 || p.h_max < p.h_min {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     // Settlement deviation band: 0 <= bps <= MAX per spec
@@ -5227,10 +5225,7 @@ pub mod processor {
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
-                let idx = engine.free_head;
-                if idx as usize >= percolator::MAX_ACCOUNTS {
-                    return Err(PercolatorError::EngineOverflow.into());
-                }
+                let idx = prepare_lazy_free_head(engine)?;
                 engine
                     .deposit_not_atomic(idx, capital_units as u128, clock.slot)
                     .map_err(map_risk_error)?;
@@ -5352,10 +5347,7 @@ pub mod processor {
                 }
 
                 let engine = zc::engine_mut(&mut data)?;
-                let idx = engine.free_head;
-                if idx as usize >= percolator::MAX_ACCOUNTS {
-                    return Err(PercolatorError::EngineOverflow.into());
-                }
+                let idx = prepare_lazy_free_head(engine)?;
                 engine
                     .deposit_not_atomic(idx, capital_units as u128, clock.slot)
                     .map_err(map_risk_error)?;
@@ -5539,10 +5531,12 @@ pub mod processor {
                     let is_hyperp = oracle::is_hyperp_mode(&config);
                     let px = if is_hyperp {
                         let eng = zc::engine_ref(&data)?;
-                        let last_slot = eng.current_slot;
+                        let p_last = eng.last_oracle_price;
+                        let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
                         let cap_bps = eng.params.max_price_move_bps_per_slot;
                         oracle::get_engine_oracle_price_e6(
-                            last_slot,
+                            p_last,
+                            price_move_dt,
                             clock.slot,
                             clock.unix_timestamp,
                             &mut config,
@@ -5589,7 +5583,13 @@ pub mod processor {
                 // all ambiguity and aligns with the auditor-requested
                 // pattern. The main op's internal accrue then no-ops
                 // (same slot + same price, engine §5.4 early return).
-                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine,
+                    &config,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                )?;
                 // Realize due maintenance fees BEFORE the withdrawal margin
                 // check, so the account can't withdraw against pre-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -5690,10 +5690,11 @@ pub mod processor {
                 // Hyperp mode updates the internal index toward mark; external
                 // mode reads the signed oracle and lets the engine enforce caps.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
-                let (engine_last_slot, cap_bps) = {
+                let (engine_last_oracle_price, price_move_dt, cap_bps) = {
                     let engine = zc::engine_ref(&data)?;
                     (
-                        engine.current_slot,
+                        engine.last_oracle_price,
+                        price_move_residual_dt(engine, clock.slot)?,
                         engine.params.max_price_move_bps_per_slot,
                     )
                 };
@@ -5706,7 +5707,8 @@ pub mod processor {
                 let price = if is_hyperp {
                     // Hyperp mode: update index toward mark with rate limiting
                     oracle::get_engine_oracle_price_e6(
-                        engine_last_slot,
+                        engine_last_oracle_price,
+                        price_move_dt,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
@@ -5807,7 +5809,13 @@ pub mod processor {
                 // Explicit ordering so sweep_maintenance_fees + keeper_crank
                 // run on a fully-accrued market. keeper_crank_not_atomic's
                 // internal accrue then no-ops on dt=0+same-price.
-                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9_pre)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine,
+                    &config,
+                    clock.slot,
+                    price,
+                    funding_rate_e9_pre,
+                )?;
 
                 // Shared per-instruction fee-sync budget (audit #2).
                 // Candidate syncs run FIRST so the engine's crank sees
@@ -6025,7 +6033,7 @@ pub mod processor {
                             continue;
                         }
                         let eidx = buf.entries[i].idx as usize;
-                        if !engine.is_used(eidx) || engine.effective_pos_q(eidx) == 0 {
+                        if !engine.is_used(eidx) || effective_pos_q_or_zero(engine, eidx) == 0 {
                             buf.remove(buf.entries[i].idx);
                         }
                     }
@@ -6033,7 +6041,7 @@ pub mod processor {
                     // Phase B: refresh surviving entries
                     for i in 0..buf.count as usize {
                         let eidx = buf.entries[i].idx as usize;
-                        let eff = engine.effective_pos_q(eidx);
+                        let eff = effective_pos_q_or_zero(engine, eidx);
                         let notional = percolator::wide_math::mul_div_floor_u128(
                             eff.unsigned_abs(),
                             price as u128,
@@ -6062,7 +6070,7 @@ pub mod processor {
                         if !engine.is_used(idx) {
                             continue;
                         }
-                        let eff = engine.effective_pos_q(idx);
+                        let eff = effective_pos_q_or_zero(engine, idx);
                         if eff == 0 {
                             continue;
                         }
@@ -6082,7 +6090,7 @@ pub mod processor {
                         if ci >= percolator::MAX_ACCOUNTS || !engine.is_used(ci) {
                             continue;
                         }
-                        let eff = engine.effective_pos_q(ci);
+                        let eff = effective_pos_q_or_zero(engine, ci);
                         if eff == 0 {
                             buf.remove(cidx);
                         } else {
@@ -6176,7 +6184,13 @@ pub mod processor {
                 // Fully accrue market to clock.slot BEFORE execute_trade_with
                 // _matcher, which internally syncs both counterparties' fees
                 // before the trade. Explicit accrue→sync→trade ordering.
-                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine,
+                    &config,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                )?;
 
                 // Pre-sync maintenance fees for both counterparties BEFORE
                 // capturing ins_before for the mark-EWMA fee-weight
@@ -6298,8 +6312,8 @@ pub mod processor {
                 // The next accrual (crank/trade/settle) will use the updated mark EWMA.
 
                 // Collect post-trade positions for risk buffer
-                let user_eff_nocpi = engine.effective_pos_q(user_idx as usize);
-                let lp_eff_nocpi = engine.effective_pos_q(lp_idx as usize);
+                let user_eff_nocpi = effective_pos_q_or_zero(engine, user_idx as usize);
+                let lp_eff_nocpi = effective_pos_q_or_zero(engine, lp_idx as usize);
                 if !state::is_oracle_initialized(&data) {
                     state::set_oracle_initialized(&mut data);
                 }
@@ -6431,7 +6445,9 @@ pub mod processor {
                     req_id,
                     lp_matcher_prog,
                     lp_matcher_ctx,
-                    engine_current_slot,
+                    engine_last_oracle_price,
+                    engine_last_market_slot,
+                    engine_max_accrual_dt_slots,
                     engine_cap_bps,
                 ) = {
                     let data = a_slab.try_borrow_data()?;
@@ -6499,7 +6515,9 @@ pub mod processor {
                         req_id,
                         lp_acc.matcher_program,
                         lp_acc.matcher_context,
-                        engine.current_slot,
+                        engine.last_oracle_price,
+                        engine.last_market_slot,
+                        engine.params.max_accrual_dt_slots,
                         engine.params.max_price_move_bps_per_slot,
                     )
                 };
@@ -6523,8 +6541,14 @@ pub mod processor {
                 // Non-Hyperp: signed external price; the engine enforces caps.
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let price = if is_hyperp {
+                    let price_move_dt = price_move_residual_dt_from_parts(
+                        engine_last_market_slot,
+                        engine_max_accrual_dt_slots,
+                        clock.slot,
+                    )?;
                     oracle::get_engine_oracle_price_e6(
-                        engine_current_slot,
+                        engine_last_oracle_price,
+                        price_move_dt,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
@@ -6702,6 +6726,7 @@ pub mod processor {
                 if ret.exec_size == 0 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
+                    reject_stuck_target_accrual(&config, engine, clock.slot, price)?;
                     // Pre-chunk catch-up so the single accrue_market_to below
                     // sees dt ≤ max_accrual_dt_slots (Finding 3). Use the
                     // pre-read funding rate for catchup chunks (Finding 2).
@@ -6776,7 +6801,13 @@ pub mod processor {
                     // Fully accrue market to clock.slot BEFORE execute_trade
                     // _with_matcher, which internally syncs both sides' fees
                     // before the trade. Explicit accrue→sync→trade ordering.
-                    ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9_pre)?;
+                    ensure_market_accrued_to_now_with_policy(
+                        engine,
+                        &config,
+                        clock.slot,
+                        price,
+                        funding_rate_e9_pre,
+                    )?;
 
                     // Pre-sync fees BEFORE the ins_before snapshot to
                     // prevent maintenance-fee-inflated EWMA weight on
@@ -6937,8 +6968,8 @@ pub mod processor {
                     let data = a_slab.try_borrow_data()?;
                     let engine = zc::engine_ref(&data)?;
                     (
-                        engine.effective_pos_q(user_idx as usize),
-                        engine.effective_pos_q(lp_idx as usize),
+                        effective_pos_q_or_zero(engine, user_idx as usize),
+                        effective_pos_q_or_zero(engine, lp_idx as usize),
                     )
                 };
                 // Write nonce + config + risk buffer + oracle flag.
@@ -6992,10 +7023,12 @@ pub mod processor {
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 let price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
+                    let p_last = eng.last_oracle_price;
+                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
                     let cap_bps = eng.params.max_price_move_bps_per_slot;
                     oracle::get_engine_oracle_price_e6(
-                        last_slot,
+                        p_last,
+                        price_move_dt,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
@@ -7022,7 +7055,7 @@ pub mod processor {
                     sol_log_64(target_idx as u64, price, 0, 0, 0);
                     let acc = &engine.accounts[target_idx as usize];
                     sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1);
-                    let eff = engine.effective_pos_q(target_idx as usize);
+                    let eff = effective_pos_q_or_zero(engine, target_idx as usize);
                     let notional = engine.notional(target_idx as usize, price);
                     sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2);
                 }
@@ -7036,7 +7069,13 @@ pub mod processor {
                 let admit_h_max = engine.params.h_max;
                 // Fully accrue market to clock.slot BEFORE fee sync +
                 // liquidate_at_oracle_not_atomic. Explicit accrue→sync→op.
-                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine,
+                    &config,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                )?;
                 // Realize due maintenance fees on the target BEFORE liquidation
                 // so the maintenance-margin check sees post-fee equity.
                 sync_account_fee(engine, &config, target_idx, clock.slot)?;
@@ -7057,7 +7096,7 @@ pub mod processor {
                 sol_log_64(_res as u64, 0, 0, 0, 4);
 
                 // Collect post-liquidation position for risk buffer
-                let liq_eff = engine.effective_pos_q(target_idx as usize);
+                let liq_eff = effective_pos_q_or_zero(engine, target_idx as usize);
                 if !state::is_oracle_initialized(&data) {
                     state::set_oracle_initialized(&mut data);
                 }
@@ -7133,10 +7172,12 @@ pub mod processor {
                     let is_hyperp = oracle::is_hyperp_mode(&config);
                     let px = if is_hyperp {
                         let eng = zc::engine_ref(&data)?;
-                        let last_slot = eng.current_slot;
+                        let p_last = eng.last_oracle_price;
+                        let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
                         let cap_bps = eng.params.max_price_move_bps_per_slot;
                         oracle::get_engine_oracle_price_e6(
-                            last_slot,
+                            p_last,
+                            price_move_dt,
                             clock.slot,
                             clock.unix_timestamp,
                             &mut config,
@@ -7209,7 +7250,13 @@ pub mod processor {
                     let admit_h_max = engine.params.h_max;
                     // Fully accrue market to clock.slot BEFORE fee sync +
                     // close_account_not_atomic. Explicit accrue→sync→op.
-                    ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+                    ensure_market_accrued_to_now_with_policy(
+                        engine,
+                        &config,
+                        clock.slot,
+                        price,
+                        funding_rate_e9,
+                    )?;
                     // Realize due maintenance fees BEFORE close so the account
                     // cannot escape the unpaid interval by closing between cranks.
                     sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -7550,24 +7597,24 @@ pub mod processor {
                 // (admin recovery path; the hard-timeout gate above
                 // handles the terminal case).
                 if oracle::is_hyperp_mode(&config) {
-                    let max_change_bps = zc::engine_ref(&data)?.params.max_price_move_bps_per_slot;
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 {
-                        config.mark_ewma_e6
-                    } else {
-                        config.hyperp_mark_e6
-                    };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1),
-                            mark,
-                            max_change_bps,
-                            dt,
-                        );
+                    let engine = zc::engine_ref(&data)?;
+                    let max_change_bps = engine.params.max_price_move_bps_per_slot;
+                    let mark = hyperp_target_price(&config);
+                    if mark > 0 {
+                        let anchor = if engine.last_oracle_price != 0 {
+                            engine.last_oracle_price
+                        } else if config.last_effective_price_e6 != 0 {
+                            config.last_effective_price_e6
+                        } else {
+                            mark
+                        };
+                        let dt = price_move_residual_dt(engine, clock.slot)?;
+                        let new_index =
+                            oracle::clamp_toward_engine_dt(anchor, mark, max_change_bps, dt);
                         config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
+                        if new_index != anchor || new_index == mark {
+                            config.last_hyperp_index_slot = clock.slot;
+                        }
                     }
                     state::write_config(&mut data, &config);
                 }
@@ -7616,6 +7663,12 @@ pub mod processor {
                     if accrual_price > 0 {
                         {
                             let engine = zc::engine_mut(&mut data)?;
+                            reject_stuck_target_accrual(
+                                &config,
+                                engine,
+                                clock.slot,
+                                accrual_price,
+                            )?;
                             // Pre-chunk catch-up so accrue_market_to below sees
                             // dt ≤ max_accrual_dt_slots (Finding 4). Use the
                             // same (price, rate) the final accrue uses so the
@@ -7687,23 +7740,23 @@ pub mod processor {
                 // (the hard-timeout gate above covers mark staleness).
                 let max_change_bps = zc::engine_ref(&data)?.params.max_price_move_bps_per_slot;
                 {
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 {
-                        config.mark_ewma_e6
-                    } else {
-                        config.hyperp_mark_e6
-                    };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = push_clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1),
-                            mark,
-                            max_change_bps,
-                            dt,
-                        );
+                    let engine = zc::engine_ref(&data)?;
+                    let mark = hyperp_target_price(&config);
+                    if mark > 0 {
+                        let anchor = if engine.last_oracle_price != 0 {
+                            engine.last_oracle_price
+                        } else if config.last_effective_price_e6 != 0 {
+                            config.last_effective_price_e6
+                        } else {
+                            mark
+                        };
+                        let dt = price_move_residual_dt(engine, push_clock.slot)?;
+                        let new_index =
+                            oracle::clamp_toward_engine_dt(anchor, mark, max_change_bps, dt);
                         config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = push_clock.slot;
+                        if new_index != anchor || new_index == mark {
+                            config.last_hyperp_index_slot = push_clock.slot;
+                        }
                     }
                     state::write_config(&mut data, &config);
                     config = state::read_config(&data);
@@ -7736,6 +7789,12 @@ pub mod processor {
                 //   within the catchup envelope.
                 {
                     let engine = zc::engine_mut(&mut data)?;
+                    reject_stuck_target_accrual(
+                        &config,
+                        engine,
+                        push_clock.slot,
+                        config.last_effective_price_e6,
+                    )?;
                     catchup_accrue(
                         engine,
                         push_clock.slot,
@@ -7915,23 +7974,23 @@ pub mod processor {
                 // Flush Hyperp index to resolution slot WITHOUT staleness check.
                 // Admin must be able to resolve even if mark is stale.
                 if oracle::is_hyperp_mode(&config) {
-                    let prev_index = config.last_effective_price_e6;
-                    let mark = if config.mark_ewma_e6 > 0 {
-                        config.mark_ewma_e6
-                    } else {
-                        config.hyperp_mark_e6
-                    };
-                    if mark > 0 && prev_index > 0 {
-                        let last_idx_slot = config.last_hyperp_index_slot;
-                        let dt = clock.slot.saturating_sub(last_idx_slot);
-                        let new_index = oracle::clamp_toward_with_dt(
-                            prev_index.max(1),
-                            mark,
-                            max_change_bps,
-                            dt,
-                        );
+                    let engine = zc::engine_ref(&data)?;
+                    let mark = hyperp_target_price(&config);
+                    if mark > 0 {
+                        let anchor = if engine.last_oracle_price != 0 {
+                            engine.last_oracle_price
+                        } else if config.last_effective_price_e6 != 0 {
+                            config.last_effective_price_e6
+                        } else {
+                            mark
+                        };
+                        let dt = price_move_residual_dt(engine, clock.slot)?;
+                        let new_index =
+                            oracle::clamp_toward_engine_dt(anchor, mark, max_change_bps, dt);
                         config.last_effective_price_e6 = new_index;
-                        config.last_hyperp_index_slot = clock.slot;
+                        if new_index != anchor || new_index == mark {
+                            config.last_hyperp_index_slot = clock.slot;
+                        }
                     }
                     state::write_config(&mut data, &config);
                 }
@@ -8000,14 +8059,19 @@ pub mod processor {
                 // Hyperp mark silent beyond 3× max_staleness, or external
                 // oracle missing on non-Hyperp) the caller must switch to
                 // mode = 1 (Degenerate); we no longer silently promote.
-                let (live_oracle, rate_for_final_accrual): (u64, i128) =
-                    if let Some(fresh) = fresh_live_oracle {
-                        (fresh, funding_rate_e9)
-                    } else if is_hyperp_local && !hyperp_stale {
-                        (config.last_effective_price_e6, funding_rate_e9)
-                    } else {
-                        return Err(PercolatorError::OracleStale.into());
-                    };
+                let (live_oracle, rate_for_final_accrual): (u64, i128) = if let Some(fresh) =
+                    fresh_live_oracle
+                {
+                    if config.oracle_target_price_e6 != 0 && fresh != config.oracle_target_price_e6
+                    {
+                        return Err(PercolatorError::CatchupRequired.into());
+                    }
+                    (fresh, funding_rate_e9)
+                } else if is_hyperp_local && !hyperp_stale {
+                    (config.last_effective_price_e6, funding_rate_e9)
+                } else {
+                    return Err(PercolatorError::OracleStale.into());
+                };
                 let _ = oracle_initialized;
                 // Engine v12.18.5+: resolve_market_not_atomic takes an explicit
                 // ResolveMode selector (Goal 51). This arm is always Ordinary;
@@ -8017,6 +8081,7 @@ pub mod processor {
                 // and would otherwise hit Overflow when the gap exceeds
                 // max_dt. Catchup uses the same (price, rate) the final
                 // accrue will use, preserving anti-retroactivity (Finding 2).
+                reject_stuck_target_accrual(&config, engine, clock.slot, live_oracle)?;
                 catchup_accrue(engine, clock.slot, live_oracle, rate_for_final_accrual)?;
                 engine
                     .resolve_market_not_atomic(
@@ -8448,10 +8513,12 @@ pub mod processor {
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 let price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
+                    let p_last = eng.last_oracle_price;
+                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
                     let cap_bps = eng.params.max_price_move_bps_per_slot;
                     oracle::get_engine_oracle_price_e6(
-                        last_slot,
+                        p_last,
+                        price_move_dt,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
@@ -8469,12 +8536,19 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
+                reject_pending_external_target(&config, zc::engine_ref(&data)?)?;
                 let engine = zc::engine_mut(&mut data)?;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
                 // Fully accrue market to clock.slot BEFORE fee sync +
                 // settle_account_not_atomic. Explicit accrue→sync→op.
-                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine,
+                    &config,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                )?;
                 // Realize due maintenance fees BEFORE settle so the settle's
                 // equity computation reflects post-fee capital.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -8612,10 +8686,12 @@ pub mod processor {
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config);
                 let price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
+                    let p_last = eng.last_oracle_price;
+                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
                     let cap_bps = eng.params.max_price_move_bps_per_slot;
                     oracle::get_engine_oracle_price_e6(
-                        last_slot,
+                        p_last,
+                        price_move_dt,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
@@ -8649,7 +8725,13 @@ pub mod processor {
                 let admit_h_max = engine.params.h_max;
                 // Fully accrue market to clock.slot BEFORE fee sync +
                 // convert_released_pnl_not_atomic. Explicit accrue→sync→op.
-                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+                ensure_market_accrued_to_now_with_policy(
+                    engine,
+                    &config,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                )?;
                 // Realize due maintenance fees BEFORE conversion so the
                 // convertible-PnL bound reflects post-fee equity.
                 sync_account_fee(engine, &config, user_idx, clock.slot)?;
@@ -8925,10 +9007,12 @@ pub mod processor {
                 let is_hyperp = oracle::is_hyperp_mode(&config);
                 let fresh_price = if is_hyperp {
                     let eng = zc::engine_ref(&data)?;
-                    let last_slot = eng.current_slot;
+                    let p_last = eng.last_oracle_price;
+                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
                     let cap_bps = eng.params.max_price_move_bps_per_slot;
                     oracle::get_engine_oracle_price_e6(
-                        last_slot,
+                        p_last,
+                        price_move_dt,
                         clock.slot,
                         clock.unix_timestamp,
                         &mut config,
@@ -8958,6 +9042,7 @@ pub mod processor {
                     }
                     return Ok(());
                 }
+                reject_stuck_target_accrual(&config, engine, clock.slot, fresh_price)?;
 
                 // Decide COMPLETE vs PARTIAL based on whether one call can
                 // close the full gap. The engine's §5.5 clause-6 predicate

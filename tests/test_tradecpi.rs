@@ -622,10 +622,11 @@ fn test_premarket_resolution_full_lifecycle() {
 
     // The resolved crank only settles PnL; position zeroing and account freeing
     // happen when users call CloseAccount or admin calls AdminForceCloseAccount.
-    env.try_admin_force_close_account(&admin, lp_idx, &lp.pubkey())
-        .expect("AdminForceCloseAccount LP must succeed");
-    env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
-        .expect("AdminForceCloseAccount user must succeed");
+    env.force_close_accounts_fully(
+        &admin,
+        &[(lp_idx, &lp.pubkey()), (user_idx, &user.pubkey())],
+    )
+    .expect("AdminForceCloseAccount must fully close both accounts");
     println!("Positions force-closed via AdminForceCloseAccount");
 
     // Verify positions are closed
@@ -5719,9 +5720,9 @@ fn test_tradecpi_zero_fill_does_not_walk_index() {
 /// the config with the pre-read funding rate.
 ///
 /// This test verifies the engine boundary advanced by reading
-/// `last_market_slot` from the slab after a zero-fill. Offsets are absolute
-/// byte offsets within the slab (ENGINE_OFF=480, last_market_slot at
-/// offset_of!(RiskEngine, last_market_slot)=672, so 480+672=1152).
+/// `last_market_slot` from the slab after a zero-fill. The integration
+/// account stores the SBF layout, so this must use the SBF offset rather
+/// than `zc::engine_ref`, whose native alignment differs.
 #[test]
 fn test_tradecpi_zero_fill_advances_engine_time() {
     // Layout-stable accessor: reads through `zc::engine_ref` rather than
@@ -5729,9 +5730,8 @@ fn test_tradecpi_zero_fill_advances_engine_time() {
     // engine struct changes.
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;
-        percolator_prog::zc::engine_ref(&data)
-            .unwrap()
-            .last_market_slot
+        let off = ENGINE_OFFSET + 640;
+        u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
     };
 
     let mut env = TradeCpiTestEnv::new();

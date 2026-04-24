@@ -1241,8 +1241,9 @@ fn test_deposit_cap_enable_via_update_config() {
     assert_eq!(cfg.tvl_insurance_cap_mult, 20, "cap must persist");
 }
 
-/// Cap enabled with k=20 and insurance=1_000 must reject a deposit of
-/// 20_001 (exceeds 20 * 1_000 = 20_000) and accept a deposit of 20_000.
+/// Cap enabled with k=20 and insurance=1_000 must include the mandatory
+/// account-open fee in post-init insurance. InitUser adds 1 insurance unit
+/// and 99 capital units, so the post-init ceiling is 20 * 1_001 = 20_020.
 #[test]
 fn test_deposit_cap_enforced() {
     program_path();
@@ -1257,19 +1258,20 @@ fn test_deposit_cap_enforced() {
     env.top_up_insurance(&insurance_payer, 1_000);
     assert_eq!(env.read_insurance_balance(), 1_000);
 
-    // Enable the cap at k=20 → ceiling = 20_000 units of c_tot.
+    // Enable the cap at k=20. After InitUser's anti-spam split, the
+    // ceiling is 20_020 units of c_tot.
     send_update_config(&mut env, &admin, 20).expect("enable cap");
 
-    // init_user itself deposits a 100-unit account-open fee, so c_tot = 100
-    // immediately after onboarding. Cap ceiling is 20_000 units.
+    // init_user splits 100 into 1 insurance + 99 capital, so c_tot = 99
+    // immediately after onboarding and insurance = 1_001.
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
 
-    // Exact-at-ceiling deposit: 100 (already there) + 19_900 = 20_000 = cap.
-    env.try_deposit(&user, user_idx, 19_900)
+    // Exact-at-ceiling deposit: 99 (already there) + 19_921 = 20_020 = cap.
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("deposit at ceiling must succeed");
 
-    // Next deposit of 1 would push c_tot to 20_001 > 20_000 → reject.
+    // Next deposit of 1 would push c_tot to 20_021 > 20_020 → reject.
     let over = env.try_deposit(&user, user_idx, 1);
     assert!(
         over.is_err(),
@@ -1358,27 +1360,28 @@ fn test_deposit_cap_widened_unblocks_deposit() {
         .unwrap();
     env.top_up_insurance(&insurance_payer, 1_000);
 
-    // Tight cap: k=20 → ceiling = 20_000.
+    // Tight cap: k=20 → post-init ceiling = 20_020 after the 1-unit
+    // anti-spam fee lands in insurance.
     send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
 
     let user = Keypair::new();
-    let user_idx = env.init_user(&user); // c_tot = 100
+    let user_idx = env.init_user(&user); // c_tot = 99, insurance = 1_001
 
-    // c_tot = 100; try to deposit 19_901 → c_tot_new = 20_001 > 20_000 → reject.
-    let blocked = env.try_deposit(&user, user_idx, 19_901);
+    // c_tot = 99; try to deposit 19_922 → c_tot_new = 20_021 > 20_020 → reject.
+    let blocked = env.try_deposit(&user, user_idx, 19_922);
     assert!(blocked.is_err(), "deposit must be blocked at k=20");
 
     // Admin widens: k=40 → ceiling = 40_000.
     send_update_config(&mut env, &admin, 40).expect("widen cap to k=40");
 
-    // Previously-blocked deposit of 19_901 now fits within the 40_000 cap.
-    env.try_deposit(&user, user_idx, 19_901)
+    // Previously-blocked deposit of 19_922 now fits within the widened cap.
+    env.try_deposit(&user, user_idx, 19_922)
         .expect("widened cap must unblock the previously-rejected deposit");
 }
 
 /// Positive: the alternative widening path — top up insurance rather than
-/// raising k. If insurance grows from 1_000 to 2_000 with k=20, the cap
-/// doubles from 20_000 to 40_000 without any config change.
+/// raising k. InitUser adds the mandatory anti-spam fee to insurance, so
+/// this path starts at 1_001 insurance and grows to 2_001.
 #[test]
 fn test_deposit_cap_topping_up_insurance_unblocks_deposit() {
     program_path();
@@ -1394,19 +1397,19 @@ fn test_deposit_cap_topping_up_insurance_unblocks_deposit() {
     send_update_config(&mut env, &admin, 20).expect("enable cap");
 
     let user = Keypair::new();
-    let user_idx = env.init_user(&user); // c_tot = 100
+    let user_idx = env.init_user(&user); // c_tot = 99, insurance = 1_001
 
-    let blocked = env.try_deposit(&user, user_idx, 19_901);
+    let blocked = env.try_deposit(&user, user_idx, 19_922);
     assert!(
         blocked.is_err(),
-        "deposit must be blocked at insurance=1000"
+        "deposit must be blocked at insurance=1001"
     );
 
-    // Grow insurance: 1_000 → 2_000. Cap rises 20_000 → 40_000.
+    // Grow insurance: 1_001 → 2_001. Cap rises 20_020 → 40_020.
     env.top_up_insurance(&insurance_payer, 1_000);
-    assert_eq!(env.read_insurance_balance(), 2_000);
+    assert_eq!(env.read_insurance_balance(), 2_001);
 
-    env.try_deposit(&user, user_idx, 19_901)
+    env.try_deposit(&user, user_idx, 19_922)
         .expect("topped-up insurance must unblock the deposit");
 }
 
@@ -1431,13 +1434,13 @@ fn test_deposit_cap_tightened_blocks_further_deposits() {
     send_update_config(&mut env, &admin, 40).expect("enable cap k=40");
 
     let user = Keypair::new();
-    let user_idx = env.init_user(&user); // c_tot = 100
+    let user_idx = env.init_user(&user); // c_tot = 99, insurance = 1_001
 
-    // Deposit 19_900 → c_tot = 20_000. Fits under 40_000 cap.
-    env.try_deposit(&user, user_idx, 19_900)
+    // Deposit 19_921 → c_tot = 20_020. Fits under the loose cap.
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("initial deposit must succeed under loose cap");
 
-    // Admin tightens: k=20 → new ceiling = 20_000. c_tot already there.
+    // Admin tightens: k=20 → new ceiling = 20_020. c_tot already there.
     send_update_config(&mut env, &admin, 20).expect("tighten to k=20");
 
     // Any further deposit now over-cap → rejected.
@@ -1789,21 +1792,21 @@ fn test_bounded_withdrawal_tightens_deposit_cap() {
     // Enable deposit cap at k=20. UpdateConfig also sets funding params.
     send_update_config(&mut env, &admin, 20).expect("enable deposit cap k=20");
 
-    // Fill up to the cap: c_tot = init_user_fee(100) + user_deposit(19_900)
-    // = 20_000 = k × insurance (1000 × 20).
+    // Fill up to the cap: c_tot = init capital(99) + user_deposit(19_921)
+    // = 20_020 = k × insurance (1001 × 20).
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.try_deposit(&user, user_idx, 19_900)
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("initial deposit at ceiling must succeed");
     let ins_before = env.read_insurance_balance();
-    assert_eq!(ins_before, 1_000);
+    assert_eq!(ins_before, 1_001);
 
     // Operator withdraws 500 insurance (exactly at the 50% bps cap).
     send_withdraw_limited(&mut env, &admin, 500).expect("operator withdraws 500");
     let ins_after = env.read_insurance_balance();
-    assert_eq!(ins_after, 500, "insurance must drop by withdrawal amount");
+    assert_eq!(ins_after, 501, "insurance must drop by withdrawal amount");
 
-    // Cap shrank: 500 × 20 = 10_000 < c_tot (20_000). Further deposit blocked.
+    // Cap shrank: 501 × 20 = 10_020 < c_tot (20_020). Further deposit blocked.
     let blocked = env.try_deposit(&user, user_idx, 1);
     assert!(
         blocked.is_err(),
@@ -1831,19 +1834,18 @@ fn test_deposit_cap_bypassed_via_init_user() {
     env.top_up_insurance(&insurance_payer, 1_000);
     send_update_config(&mut env, &admin, 20).expect("enable cap k=20");
 
-    // First user fills to ceiling via init_user (100) + deposit (19_800)
-    // → c_tot = 19_900. One more unit via normal deposit would exceed
-    // 20_000 — so the deposit path is blocked.
+    // First user fills to ceiling via init_user (99 capital, 1 insurance)
+    // + deposit (19_921) → c_tot = 20_020. One more unit via normal
+    // deposit would exceed the post-init cap.
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.try_deposit(&user, user_idx, 19_800)
+    env.try_deposit(&user, user_idx, 19_921)
         .expect("fill close to ceiling");
-    let blocked = env.try_deposit(&user, user_idx, 101);
+    let blocked = env.try_deposit(&user, user_idx, 1);
     assert!(blocked.is_err(), "DepositCollateral correctly enforces cap");
 
     // SECURITY CHECK: a FRESH account created via init_user with a large
-    // fee_payment should ALSO be blocked — c_tot_new = 19_900 + 10_000 =
-    // 29_900, which exceeds the 20_000 cap. The cap must apply to every
+    // fee_payment should ALSO be blocked. The cap must apply to every
     // capital-adding path, not just DepositCollateral.
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
