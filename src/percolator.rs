@@ -6676,22 +6676,17 @@ pub mod processor {
                 // Convert base tokens to units for engine
                 let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
-                // No-oracle path. bounded_now:
-                //   - upper-bounded by last_market_slot so we don't
-                //     advance current_slot past the accrue envelope,
-                //   - floored at current_slot so the engine's
-                //     monotonicity guard (`now_slot >= current_slot`)
-                //     still holds after a prior no-oracle op (InitUser,
-                //     DepositCollateral, ReclaimEmptyAccount) has
-                //     advanced current_slot past last_market_slot.
-                // Full accrue for the tail `(last_market_slot,
-                // clock.slot]` happens on the next oracle-backed op.
-                let bounded_now = core::cmp::max(
-                    core::cmp::min(clock.slot, engine.last_market_slot),
-                    engine.current_slot,
-                );
+                // §9.2 envelope gate on no-oracle paths: if the market's
+                // `last_market_slot` lags clock beyond the single-accrue
+                // envelope, this op would silently advance `current_slot`
+                // into a region whose funding/mark has never been accrued.
+                // Require the caller to run `CatchupAccrue` first.
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                if gap > engine.params.max_accrual_dt_slots {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
                 engine
-                    .top_up_insurance_fund(units as u128, bounded_now)
+                    .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
 
@@ -7828,18 +7823,12 @@ pub mod processor {
                 sync_account_fee_bounded_to_market(
                     engine, &config, user_idx, clock.slot,
                 )?;
-                // No-oracle path: cap anchor at last_market_slot but
-                // floor at current_slot so the engine's monotonicity
-                // guard (now_slot >= current_slot) holds even in the
-                // transient state where a previous no-oracle op (e.g.
-                // InitUser / DepositCollateral) has advanced current
-                // _slot past last_market_slot. Full accrue still
-                // happens on the next oracle-backed op.
-                let bounded_now = core::cmp::max(
-                    core::cmp::min(clock.slot, engine.last_market_slot),
-                    engine.current_slot,
-                );
-                engine.reclaim_empty_account_not_atomic(user_idx, bounded_now)
+                // §9.2 envelope gate on no-oracle paths.
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                if gap > engine.params.max_accrual_dt_slots {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
+                engine.reclaim_empty_account_not_atomic(user_idx, clock.slot)
                     .map_err(map_risk_error)?;
                 // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
             }
@@ -7973,25 +7962,19 @@ pub mod processor {
                 // Phase 3: SPL transfer (only after validation)
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Phase 4: book the repayment in the engine. The engine's
-                // deposit_fee_credits self-advances current_slot; bound its
-                // now_slot at last_market_slot BUT floor at current_slot
-                // so the engine monotonicity guard (`now_slot >= current
-                // _slot`) holds after any prior no-oracle self-advance
-                // (InitUser, DepositCollateral, ReclaimEmptyAccount,
-                // TopUpInsurance). Full accrue for the residual tail
-                // happens on the next oracle-backed op.
+                // Phase 4: book the repayment in the engine.
                 let mut data = state::slab_data_mut(a_slab)?;
                 let config = state::read_config(&data);
                 let clock = Clock::from_account_info(a_clock)?;
                 let (units2, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
                 let _ = &config; // Phase 1 synced; no second sync needed.
-                let bounded_now = core::cmp::max(
-                    core::cmp::min(clock.slot, engine.last_market_slot),
-                    engine.current_slot,
-                );
-                engine.deposit_fee_credits(user_idx, units2 as u128, bounded_now)
+                // §9.2 envelope gate on no-oracle paths.
+                let gap = clock.slot.saturating_sub(engine.last_market_slot);
+                if gap > engine.params.max_accrual_dt_slots {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
+                engine.deposit_fee_credits(user_idx, units2 as u128, clock.slot)
                     .map_err(map_risk_error)?;
             }
 
