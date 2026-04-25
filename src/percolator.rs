@@ -229,6 +229,11 @@ pub mod constants {
     /// admin was burned. 10_000_000 slots is ~50 days at 2 slots/s, far beyond
     /// any reasonable grace period but well short of the saturation regime.
     pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
+    /// InitMarket wire flag packed into insurance_withdraw_max_bps. When set,
+    /// WithdrawInsuranceLimited can withdraw only explicit TopUpInsurance
+    /// principal; insurance growth from fees/liquidations remains behind.
+    pub const INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG: u16 = 0x8000;
+    pub const INSURANCE_WITHDRAW_MAX_BPS_MASK: u16 = 0x7FFF;
 }
 
 // =============================================================================
@@ -1289,6 +1294,8 @@ pub mod ix {
             /// Periodic maintenance fee per slot per account (engine units). 0 = disabled.
             maintenance_fee_per_slot: u128,
             /// Insurance withdrawal: max bps per withdrawal (0 = no live withdrawals)
+            /// High bit enables deposits-only mode for WithdrawInsuranceLimited;
+            /// low 15 bits store the bps value.
             insurance_withdraw_max_bps: u16,
             /// Insurance withdrawal: cooldown slots between withdrawals
             insurance_withdraw_cooldown_slots: u64,
@@ -2134,9 +2141,14 @@ pub mod state {
         /// Tuned by admin via UpdateConfig; typical production values are
         /// 10–100 (mature perp DEXs run ~20× insurance coverage).
         pub tvl_insurance_cap_mult: u16,
-        /// Padding for alignment (was [u8; 6]; shrunk when
-        /// tvl_insurance_cap_mult claimed 2 bytes of the former slot).
-        pub _iw_padding: [u8; 4],
+        /// Optional bounded-withdrawal mode. 0 = legacy bounded withdrawals
+        /// may withdraw live insurance subject to bps/cooldown. 1 = tag 23
+        /// may withdraw only the remaining amount deposited through
+        /// TopUpInsurance; fee/trading/liquidation growth stays behind.
+        pub insurance_withdraw_deposits_only: u8,
+        /// Padding for alignment (was [u8; 4]; shrunk when deposit-only mode
+        /// claimed 1 byte of the former slot).
+        pub _iw_padding: [u8; 3],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
         /// Latest raw external oracle target in engine-space e6. Non-Hyperp
@@ -2149,11 +2161,12 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// Padding slot previously occupied by `first_observed_stale_slot`
-        /// (legacy two-phase resolve telemetry). Removed; kept as u64
-        /// padding for u128-alignment of the downstream `maintenance_fee_
-        /// per_slot` and `last_mark_push_slot` fields.
-        pub _pad_obsolete_stale_slot: u64,
+        /// Remaining TopUpInsurance principal withdrawable through tag 23
+        /// when `insurance_withdraw_deposits_only == 1`. This tracks only
+        /// explicit top-ups: it increases on TopUpInsurance and decreases on
+        /// WithdrawInsuranceLimited. Insurance growth from fees/liquidations
+        /// never increments this budget.
+        pub insurance_withdraw_deposit_remaining: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -3528,11 +3541,8 @@ pub mod processor {
         if notional == 0 {
             return Ok(0);
         }
-        let one_side_fee = percolator::wide_math::mul_div_ceil_u128(
-            notional,
-            trading_fee_bps as u128,
-            10_000,
-        );
+        let one_side_fee =
+            percolator::wide_math::mul_div_ceil_u128(notional, trading_fee_bps as u128, 10_000);
         one_side_fee
             .checked_mul(2)
             .ok_or_else(|| PercolatorError::EngineOverflow.into())
@@ -4088,6 +4098,15 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn insurance_withdraw_deposits_only(config: &MarketConfig) -> Result<bool, ProgramError> {
+        match config.insurance_withdraw_deposits_only {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(PercolatorError::InvalidConfigParam.into()),
+        }
+    }
+
     fn verify_vault(
         a_vault: &AccountInfo,
         expected_owner: &Pubkey,
@@ -4452,7 +4471,13 @@ pub mod processor {
                 if risk_params.h_min == 0 || risk_params.h_max < risk_params.h_min {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                // insurance_withdraw_max_bps is a percentage (0..=10_000)
+                let insurance_withdraw_deposits_only = (insurance_withdraw_max_bps
+                    & crate::constants::INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG)
+                    != 0;
+                let insurance_withdraw_max_bps =
+                    insurance_withdraw_max_bps & crate::constants::INSURANCE_WITHDRAW_MAX_BPS_MASK;
+                // insurance_withdraw_max_bps is a percentage (0..=10_000);
+                // the top wire bit is reserved for deposit-only mode.
                 if insurance_withdraw_max_bps > 10_000 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -4781,7 +4806,8 @@ pub mod processor {
                     // Insurance withdrawal limits (immutable after init)
                     insurance_withdraw_max_bps,
                     tvl_insurance_cap_mult: 0, // disabled at init; admin opts in via UpdateConfig
-                    _iw_padding: [0u8; 4],
+                    insurance_withdraw_deposits_only: insurance_withdraw_deposits_only as u8,
+                    _iw_padding: [0u8; 3],
                     insurance_withdraw_cooldown_slots,
                     oracle_target_price_e6: init_price,
                     oracle_target_publish_time: init_publish_time,
@@ -4790,7 +4816,7 @@ pub mod processor {
                     // Non-Hyperp: 0 (no mark push concept).
                     last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
                     last_insurance_withdraw_slot: 0,
-                    _pad_obsolete_stale_slot: 0,
+                    insurance_withdraw_deposit_remaining: 0,
                     // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
                     mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
@@ -7096,7 +7122,8 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
+                insurance_withdraw_deposits_only(&config)?;
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -7127,15 +7154,22 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // Convert base tokens to units for engine
+                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+                let new_deposit_remaining = config
+                    .insurance_withdraw_deposit_remaining
+                    .checked_add(units)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
                 engine
                     .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
+                config.insurance_withdraw_deposit_remaining = new_deposit_remaining;
+                state::write_config(&mut data, &config);
             }
 
             Instruction::CloseSlab => {
@@ -8014,6 +8048,7 @@ pub mod processor {
                 if config.insurance_withdraw_max_bps == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                let deposits_only = insurance_withdraw_deposits_only(&config)?;
                 {
                     let engine = zc::engine_ref(&data)?;
                     reject_any_target_lag(&config, engine)?;
@@ -8046,7 +8081,10 @@ pub mod processor {
                 let bps_cap =
                     ins.saturating_mul(config.insurance_withdraw_max_bps as u128) / 10_000;
                 let cap = core::cmp::max(bps_cap, MIN_WITHDRAW_FLOOR_UNITS);
-                let cap = core::cmp::min(cap, ins);
+                let mut cap = core::cmp::min(cap, ins);
+                if deposits_only {
+                    cap = core::cmp::min(cap, config.insurance_withdraw_deposit_remaining as u128);
+                }
                 if (amount_units as u128) > cap {
                     return Err(PercolatorError::InsuranceWithdrawCapExceeded.into());
                 }
@@ -8078,6 +8116,16 @@ pub mod processor {
                         .map_err(map_risk_error)?;
                 }
                 config.last_insurance_withdraw_slot = clock.slot;
+                if deposits_only {
+                    config.insurance_withdraw_deposit_remaining = config
+                        .insurance_withdraw_deposit_remaining
+                        .checked_sub(amount_units)
+                        .ok_or(PercolatorError::InsuranceWithdrawCapExceeded)?;
+                } else {
+                    config.insurance_withdraw_deposit_remaining = config
+                        .insurance_withdraw_deposit_remaining
+                        .saturating_sub(amount_units);
+                }
                 state::write_config(&mut data, &config);
                 drop(data);
 
