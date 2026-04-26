@@ -199,6 +199,17 @@ pub mod constants {
     /// unit_scale=0 disables scaling (1:1 base tokens to units, dust=0 always).
     /// unit_scale=1..=1_000_000_000 enables scaling with dust tracking.
     pub const MAX_UNIT_SCALE: u32 = 1_000_000_000;
+    /// InitMarket confidence-filter range for external oracle markets.
+    /// Zero used to mean "disabled"; new deployments must carry an explicit
+    /// nonzero confidence bound so a stale/misconfigured wide-conf feed cannot
+    /// silently become the market's accepted oracle.
+    pub const MIN_CONF_FILTER_BPS: u16 = 50;
+    pub const MAX_CONF_FILTER_BPS: u16 = 1_000;
+    /// InitMarket upper bound on oracle staleness. Kept intentionally short:
+    /// a market that tolerates hours/days of stale oracle data lets the admin
+    /// or deployer choose a liveness footgun that users cannot distinguish at
+    /// runtime from an intentionally permissive market.
+    pub const MAX_ORACLE_STALENESS_SECS: u64 = 600;
 
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
@@ -4447,8 +4458,13 @@ pub mod processor {
                 if invert > 1 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
-                if conf_filter_bps > 10_000 {
+                // Confidence filter: require a nonzero, operationally sane
+                // range. Disabling confidence checks is too sharp for public
+                // deployments; wide confidence bands are equivalent to
+                // accepting a low-quality oracle.
+                if conf_filter_bps < crate::constants::MIN_CONF_FILTER_BPS
+                    || conf_filter_bps > crate::constants::MAX_CONF_FILTER_BPS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Validate unit_scale: reject huge values that make most deposits credit 0 units
@@ -4487,11 +4503,12 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // max_staleness_secs: reject 0 (would brick oracle reads —
-                // any non-zero age > 0 fails the staleness check).
-                // max_staleness_secs: reject 0 and unreasonable values.
-                // 0 would brick oracle reads. >7 days is clearly misconfigured.
-                if max_staleness_secs == 0 || max_staleness_secs > 7 * 86400 {
+                // max_staleness_secs: reject 0 (would brick oracle reads) and
+                // reject long stale windows that make oracle liveness a
+                // deployer-controlled footgun.
+                if max_staleness_secs == 0
+                    || max_staleness_secs > crate::constants::MAX_ORACLE_STALENESS_SECS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 

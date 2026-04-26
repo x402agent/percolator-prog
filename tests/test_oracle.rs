@@ -894,55 +894,87 @@ fn test_hyperp_index_smoothing_rate_limited() {
     );
 }
 
-/// Bug #1: conf_filter_bps = 0 should mean "disabled" (no confidence check).
-///
-/// Spec/init validation treats 0 as disabled, but the runtime check
-/// `conf * 10_000 > price * conf_bps` always rejects nonzero conf when
-/// conf_bps == 0. This bricks Pyth oracle reads for any market configured
-/// with conf_filter_bps = 0.
-///
-/// This test initializes a market with conf_filter_bps = 0, sets up a Pyth
-/// oracle with nonzero confidence, and verifies a crank (which reads the
-/// oracle) succeeds.
+/// InitMarket rejects disabling or widening the Pyth confidence filter.
 #[test]
-fn test_conf_filter_bps_zero_does_not_brick_pyth() {
+fn test_conf_filter_bps_init_range_enforced() {
+    let bad_values = [
+        0,
+        percolator_prog::constants::MIN_CONF_FILTER_BPS - 1,
+        percolator_prog::constants::MAX_CONF_FILTER_BPS + 1,
+    ];
+    for conf_bps in bad_values {
+        let mut env = TestEnv::new();
+        let data = encode_init_market_with_conf_bps(
+            &env.payer.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            0,
+            0,
+            0,
+            conf_bps,
+        );
+        assert!(
+            env.try_init_market_raw(data).is_err(),
+            "InitMarket must reject conf_filter_bps={}",
+            conf_bps
+        );
+    }
+
+    for conf_bps in [
+        percolator_prog::constants::MIN_CONF_FILTER_BPS,
+        percolator_prog::constants::MAX_CONF_FILTER_BPS,
+    ] {
+        let mut env = TestEnv::new();
+        let data = encode_init_market_with_conf_bps(
+            &env.payer.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            0,
+            0,
+            0,
+            conf_bps,
+        );
+        env.try_init_market_raw(data)
+            .unwrap_or_else(|e| panic!("InitMarket must accept conf_filter_bps={conf_bps}: {e}"));
+    }
+}
+
+/// InitMarket rejects long oracle staleness windows.
+#[test]
+fn test_max_staleness_secs_init_cap_enforced() {
+    const MAX_STALENESS_OFFSET: usize = 1 + 32 + 32 + 32;
+
     let mut env = TestEnv::new();
-    // Init with conf_filter_bps = 0 (should mean "disabled")
-    env.init_market_with_conf_bps(0);
+    let mut data = encode_init_market_with_conf_bps(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        0,
+        0,
+        0,
+        percolator_prog::constants::MIN_CONF_FILTER_BPS,
+    );
+    data[MAX_STALENESS_OFFSET..MAX_STALENESS_OFFSET + 8]
+        .copy_from_slice(&percolator_prog::constants::MAX_ORACLE_STALENESS_SECS.to_le_bytes());
+    env.try_init_market_raw(data)
+        .expect("InitMarket must accept max staleness at the cap");
 
-    // Set oracle with nonzero confidence (conf=1000 is realistic for Pyth)
-    let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1000, 100);
-    env.svm
-        .set_account(
-            env.pyth_index,
-            Account {
-                lamports: 1_000_000,
-                data: pyth_data.clone(),
-                owner: PYTH_RECEIVER_PROGRAM_ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-    env.svm
-        .set_account(
-            env.pyth_col,
-            Account {
-                lamports: 1_000_000,
-                data: pyth_data,
-                owner: PYTH_RECEIVER_PROGRAM_ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    // Crank reads the oracle — must succeed with conf_filter_bps=0
-    let result = env.try_crank();
+    let mut env = TestEnv::new();
+    let mut data = encode_init_market_with_conf_bps(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        0,
+        0,
+        0,
+        percolator_prog::constants::MIN_CONF_FILTER_BPS,
+    );
+    data[MAX_STALENESS_OFFSET..MAX_STALENESS_OFFSET + 8].copy_from_slice(
+        &(percolator_prog::constants::MAX_ORACLE_STALENESS_SECS + 1).to_le_bytes(),
+    );
     assert!(
-        result.is_ok(),
-        "conf_filter_bps=0 should disable confidence check, but crank failed: {:?}",
-        result
+        env.try_init_market_raw(data).is_err(),
+        "InitMarket must reject staleness above the cap"
     );
 }
 
