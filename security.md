@@ -1458,3 +1458,150 @@ live policy.
 - `test_oracle_publish_time_equal_observation_succeeds`: regression
   guard that equal-timestamp re-reads (e.g., two txs in the same
   slot reading the same on-chain Pyth account) keep working.
+
+## Session 2026-04-26 — A1 unlock-vector sweep on v12.19.13
+
+### Threat model
+
+The 5_000_000_000-unit insurance seed in
+`tests/test_a1_siphon_regression.rs` is the only pool an attacker can
+extract without owning a matching deposit (every other vault balance
+belongs to a specific user/LP whose owner-binding signer is required
+to release it). The whole v12.19.x rework on this branch hardens the
+three layers that defend that seed:
+
+1. `max_price_move_bps_per_slot` — per-slot oracle-move cap
+   (immutable RiskParam).
+2. §1.4 solvency envelope —
+   `max_price_move·max_accrual_dt + funding + liq_fee ≤ maint_margin`.
+3. §12.21 admission-threshold gate —
+   `admit_h_max_consumption_threshold_bps`.
+
+This session re-probes the four highest-leverage angles where a
+regression in those layers could land an unlock. All discarded.
+
+### D76. c447686 same-slot catchup leaves a stale-engine read window
+
+**Hypothesis**: The new `flat_same_slot_price_update` flag in
+`ensure_market_accrued_to_now` (src/percolator.rs:3735–3744) covers
+the flat-market case (oi=0) but not `gap == 0 ∧ non-flat OI ∧
+fresh_price ≠ P_last`. If an attacker can land a fresh observation in
+the same slot a Trade* lands in, the engine's `last_oracle_price`
+stays stale until the next slot — a same-tx follow-up op then prices
+against the stale value and extracts the discrepancy.
+
+**Why discarded**:
+- Within a single tx the oracle account's `publish_time` is constant,
+  so a follow-up op reads the same `fresh_price` the Trade already
+  installed; the discrepancy never arises.
+- Cross-tx: the next slot's accrue runs `catchup_accrue` (chunked
+  per-slot-cap) which respects the §1.4 cap. The flat-only fix is a
+  bookkeeping correction (engine `last_oracle_price` ← config
+  `last_effective_price_e6`), not a value-extraction surface — the
+  fresh price applies via the next op's mandatory accrue regardless.
+- Same-slot non-flat ⇒ Trade* itself called `accrue_market_to`
+  (src/percolator.rs:6516, 6523, 5905, 5912 etc.), so the engine sees
+  the price.
+
+### D77. UpdateConfig fast-forward bypasses §1.4 envelope
+
+**Hypothesis**: UpdateConfig (Tag 16, src/percolator.rs:7222–7405)
+mutates funding params; an admin attacker pairs it with a stale
+oracle / omitted oracle / cap-evading argument shape to advance the
+clock past the envelope without chunking, then opens a position
+priced against the now-stale `last_oracle_price`.
+
+**Why discarded** — the handler is fortified on every angle I tried:
+- `accounts::expect_len(accounts, 4)` (line 7240) makes the oracle
+  account mandatory; admin cannot select Degenerate by omission.
+- `permissionless_stale_matured` gate (line 7293–7295): UpdateConfig
+  on a terminally-stale market is rejected with `OracleStale`.
+- f11dca2: `read_price_and_stamp` errors propagate (line 7363); a
+  stale oracle no longer falls through to a rate=0 degenerate arm.
+- Anti-retroactivity: `funding_rate_e9` captured BEFORE any config
+  mutation (line 7286) and used in the boundary accrue (line 7382).
+- Funding cap gated against `engine.params.max_abs_funding_e9_per_slot`
+  (line 7273–7275), with explicit i128-space comparison to defeat
+  `as u64` wrap.
+- `catchup_accrue` (line 7380) chunks the gap before the boundary
+  accrue, so even a wide jump respects the per-slot cap.
+- `reject_any_target_lag` (line 7392) blocks any post-mutation state
+  whose target lag exceeds the safety budget.
+- The §1.4 terms `max_price_move_bps_per_slot` and
+  `maintenance_margin_bps` are init-immutable RiskParams; no
+  UpdateConfig field shifts the envelope.
+
+### D78. Sibling no-oracle paths missed by 7e82eb0's §9.2 gate
+
+**Hypothesis**: 7e82eb0 added §9.2 stale-gap gates to TopUpInsurance,
+ReclaimEmptyAccount, and DepositFeeCredits. Sibling no-oracle paths
+that mutate engine state (InitUser fee→insurance line 4935, InitLP
+fee→insurance line 5060, DepositCollateral line 5182,
+ReclaimEmptyAccount post-5e0b55c, DepositFeeCredits post-5e0b55c) may
+have been missed; an attacker advances `current_slot` past the
+envelope on a flat market, then opens a position to extract the
+discrepancy.
+
+**Why discarded**:
+- DepositCollateral / InitUser-deposit / InitLP-deposit pass
+  `clock.slot` directly to `engine.deposit_not_atomic`; the engine's
+  internal `check_live_accrual_envelope` enforces
+  `gap ≤ max_accrual_dt_slots` (per the comment at
+  src/percolator.rs:5170–5173). If the gap exceeds the envelope,
+  `deposit_not_atomic` rejects, so the inline `top_up_insurance_fund`
+  call afterward (lines 4935 / 5060) is unreachable on a stale gap.
+- TopUpInsurance (line 7061), ReclaimEmptyAccount (line 8194), and
+  DepositFeeCredits (line 8352) all call `check_no_oracle_live_envelope`
+  — the OI-qualified §9.2 gate at src/percolator.rs:3415–3427.
+- 5e0b55c's relaxation from a strict gap-only gate (per 7e82eb0) to
+  the OI-qualified `check_no_oracle_live_envelope` is intentional and
+  safe: when `oi_any == false`, neither funding nor price-move accrual
+  is active (catchup_accrue itself early-returns at
+  src/percolator.rs:3654 in that state), so advancing `current_slot`
+  past `last_market_slot + max_dt` on a flat market loses no
+  funding/mark window. The next oracle-backed op chunks the gap via
+  `catchup_accrue` regardless, respecting the per-slot cap.
+- Cross-tx attacker who flips flat → non-flat: the position-opening
+  Trade goes through `ensure_market_accrued_to_now_with_policy`
+  (e.g. line 5885) which calls `catchup_accrue` (chunked) before
+  admitting the trade — the per-slot cap still binds.
+
+### D79. ResolveMarket Degenerate-arm forced on healthy market
+
+**Hypothesis**: a7186d5 made `ResolveMarket` take an explicit `mode`
+per §9.8. ed04539 cleaned up dead Ordinary-arm logic. If admin can
+select `mode = 1` (Degenerate, settles at rate=0) on a healthy market
+with non-flat OI, the §1.4 envelope is short-circuited at settlement —
+positions are paid out at `engine.last_oracle_price` regardless of
+the live mark.
+
+**Why discarded** — the Degenerate gate (src/percolator.rs:7586–7622)
+requires the oracle to be *genuinely dead*, not admin-asserted-dead:
+- `permissionless_stale_matured(&config, clock_gate.slot)` true
+  (hard timeout reached), OR
+- Hyperp: `clock.slot - last_update > 3 × max_staleness_secs ∧
+  oracle_initialized`, OR
+- Non-Hyperp: a live `oracle::read_engine_price_e6` returns
+  `OracleStale` or `OracleConfTooWide`.
+
+If none hold, the handler returns `OracleInvalid`. A live oracle on
+the same slot defeats the Degenerate arm entirely. Mode values
+outside {0, 1} fall through to the Ordinary arm, which requires a
+live oracle and rejects on `permissionless_stale_matured`. Admin
+cannot pick a settlement mode that bypasses the envelope.
+
+### Conclusion
+
+Four probes, four discards. The three v12.19 defense layers
+(per-slot cap, §1.4 envelope, admission threshold) are intact across
+every wrapper-side mutation path I walked. The 5_000_000_000-unit
+insurance seed is not extractable through:
+- same-slot catchup interleaving (D76),
+- UpdateConfig fast-forward (D77),
+- no-oracle path stale-gap bypass (D78), or
+- ResolveMarket mode confusion (D79).
+
+Residual surface (not probed this session) — same as the prior
+session's "next sweep targets": funding rate at envelope boundary
+with bilateral OI at MAX_VAULT_TVL, multi-block keeper-timing
+collusion, and any future cross-market/multi-slab deployment.
