@@ -57,6 +57,7 @@ pub const MAX_ACCOUNTS: usize = 4096;
 /// accrual dt) or rely on idle (no-OI) markets where the envelope
 /// check does not fire.
 pub const TEST_MAX_PRICE_MOVE_BPS_PER_SLOT: u64 = 4;
+pub const TEST_MAX_STALENESS_SECS: u64 = percolator_prog::constants::MAX_ORACLE_STALENESS_SECS;
 pub const DEFAULT_NEW_ACCOUNT_FEE: u64 = 1;
 pub const DEFAULT_INIT_PAYMENT: u64 = 100;
 pub const DEFAULT_INIT_CAPITAL: u64 = DEFAULT_INIT_PAYMENT - DEFAULT_NEW_ACCOUNT_FEE;
@@ -185,6 +186,7 @@ pub fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    data[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
     // VerificationLevel::Full = 1-byte discriminant 0x01 at offset 40.
     data[40] = 1;
     // PriceFeedMessage starts at byte 41.
@@ -391,7 +393,7 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&conf_filter_bps.to_le_bytes()); // conf_filter_bps
     data.push(invert); // invert flag
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -434,7 +436,7 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert); // invert flag
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -486,7 +488,7 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -627,7 +629,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -688,7 +690,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -907,7 +909,7 @@ impl TestEnv {
         }
     }
 
-    /// Initialize market with custom conf_filter_bps (0 = disabled)
+    /// Initialize market with custom conf_filter_bps.
     pub fn init_market_with_conf_bps(&mut self, conf_filter_bps: u16) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
@@ -1841,7 +1843,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&unit_scale.to_le_bytes());
@@ -1899,7 +1901,7 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale = 0 (no scaling)
@@ -5248,7 +5250,7 @@ impl TestEnv {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+        data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(0u8); // invert
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -5337,7 +5339,7 @@ impl TestEnv {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+        data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(0u8); // invert
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -7536,7 +7538,7 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -7583,7 +7585,7 @@ pub fn encode_init_market_with_maintenance_fee(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(invert);
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale

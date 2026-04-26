@@ -31,6 +31,7 @@ const SLAB_LEN: usize = 96664;
 const SLAB_LEN: usize = 382456;
 #[cfg(not(any(feature = "small", feature = "medium")))]
 const SLAB_LEN: usize = 1525624;
+const TEST_MAX_STALENESS_SECS: u64 = percolator_prog::constants::MAX_ORACLE_STALENESS_SECS;
 #[cfg(all(feature = "small", not(feature = "medium")))]
 const MAX_ACCOUNTS: usize = 256;
 #[cfg(all(feature = "medium", not(feature = "small")))]
@@ -372,6 +373,7 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    data[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
     // VerificationLevel::Full = 1-byte discriminant at offset 40. Borsh
     // enum variants are variable-size; Full carries no payload, so
     // PriceFeedMessage begins at byte 41.
@@ -389,7 +391,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale

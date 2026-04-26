@@ -5075,7 +5075,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(env.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+        data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(1u8); // invert=1 (SOL/USD)
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -6393,9 +6393,9 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
         &env.payer.pubkey(),
         &env.mint,
         1_000_000, // initial_mark_price
-        86_400,    // max_staleness_secs
-        0,         // trading_fee_bps
-        0,         // mark_min_fee (THE HOLE)
+        TEST_MAX_STALENESS_SECS,
+        0, // trading_fee_bps
+        0, // mark_min_fee (THE HOLE)
     );
     // The helper's perm_resolve = 0 in its default tail — need a
     // variant with perm_resolve > 0. For this test, craft inline.
@@ -6406,7 +6406,7 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.extend_from_slice(env.payer.pubkey().as_ref());
     payload.extend_from_slice(env.mint.as_ref());
     payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
-    payload.extend_from_slice(&86_400u64.to_le_bytes());
+    payload.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes());
     payload.extend_from_slice(&500u16.to_le_bytes());
     payload.push(0u8); // invert
     payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -6458,7 +6458,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     payload.extend_from_slice(env.payer.pubkey().as_ref());
     payload.extend_from_slice(env.mint.as_ref());
     payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
-    payload.extend_from_slice(&86_400u64.to_le_bytes()); // max_staleness_secs
+    payload.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     payload.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     payload.push(0u8); // invert
     payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale

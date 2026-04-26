@@ -1986,9 +1986,7 @@ fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
     }
 
     // Kill the Pyth feed by advancing the clock far beyond the
-    // fixture's published_time (TestEnv's fixture uses clock slot 0;
-    // max_staleness_secs default is 86_400). Moving unix_timestamp by
-    // 200_000 seconds guarantees a stale observation.
+    // fixture's published_time and the configured staleness cap.
     env.svm.set_sysvar(&Clock {
         slot: 500,
         unix_timestamp: 200_000,

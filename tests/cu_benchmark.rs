@@ -38,6 +38,7 @@ const SLAB_LEN: usize = 382456;
 #[cfg(not(any(feature = "small", feature = "medium")))]
 const SLAB_LEN: usize = 1525624;
 const MAX_ACCOUNTS: usize = 2048;
+const TEST_MAX_STALENESS_SECS: u64 = percolator_prog::constants::MAX_ORACLE_STALENESS_SECS;
 
 // Pyth Receiver program ID (rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ)
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -99,6 +100,7 @@ fn make_pyth_data(
     publish_time: i64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    data[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
     // VerificationLevel::Full = 1-byte discriminant 0x01 at offset 40.
     // PriceFeedMessage begins at byte 41 (Borsh enum variants are
     // variable-size; Full has no payload).
@@ -123,7 +125,7 @@ fn encode_init_market_with_params(
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
     data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day)
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)

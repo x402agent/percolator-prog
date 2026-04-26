@@ -1034,7 +1034,7 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(admin.pubkey().as_ref());
     data.extend_from_slice(env.mint.as_ref());
     data.extend_from_slice(&[0xABu8; 32]); // feed_id
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -1464,6 +1464,8 @@ fn test_deposit_cap_tightened_blocks_further_deposits() {
 // AUTHORITY_CLOSE=3, AUTHORITY_INSURANCE_OPERATOR=4.
 
 const AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
+const INSURANCE_WITHDRAW_DEPOSITS_ONLY_SLAB_OFF: usize = 136 + 204;
+const INSURANCE_WITHDRAW_DEPOSIT_REMAINING_SLAB_OFF: usize = 136 + 264;
 
 fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
     let mut data = vec![23u8]; // Tag 23
@@ -1527,16 +1529,74 @@ fn setup_bounded_withdrawal(env: &mut TestEnv, insurance: u64, max_bps: u16, coo
     //   offset 192..200: last_effective_price_e6 (u64)
     //   offset 200..202: insurance_withdraw_max_bps (u16)
     //   offset 202..204: tvl_insurance_cap_mult (u16)
-    //   offset 204..208: _iw_padding
+    //   offset 204     : insurance_withdraw_deposits_only (u8)
+    //   offset 205..208: _iw_padding
     //   offset 208..216: insurance_withdraw_cooldown_slots (u64)
+    //   offset 264..272: insurance_withdraw_deposit_remaining (u64)
     //
     // With HEADER_LEN = 136:
     //   slab[336..338] = insurance_withdraw_max_bps
+    //   slab[340]      = insurance_withdraw_deposits_only
     //   slab[344..352] = insurance_withdraw_cooldown_slots
+    //   slab[400..408] = insurance_withdraw_deposit_remaining
     let mut slab = env.svm.get_account(&env.slab).unwrap();
     slab.data[336..338].copy_from_slice(&max_bps.to_le_bytes());
     slab.data[344..352].copy_from_slice(&cooldown_slots.to_le_bytes());
     env.svm.set_account(env.slab, slab).unwrap();
+}
+
+fn init_market_with_deposit_only_limited_withdrawal(
+    env: &mut TestEnv,
+    max_bps: u16,
+    cooldown_slots: u64,
+) {
+    let admin = &env.payer;
+    let mut data = encode_init_market_with_cap(&admin.pubkey(), &env.mint, &TEST_FEED_ID, 0, 80);
+    const EXTENDED_TAIL_LEN: usize = 2 + 8 * 8;
+    let tail = data.len() - EXTENDED_TAIL_LEN;
+    let encoded_max_bps =
+        max_bps | percolator_prog::constants::INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG;
+    data[tail..tail + 2].copy_from_slice(&encoded_max_bps.to_le_bytes());
+    data[tail + 2..tail + 10].copy_from_slice(&cooldown_slots.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("init deposit-only limited-withdrawal market");
+}
+
+fn set_withdraw_deposits_only_raw(env: &mut TestEnv, value: u8) {
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    slab.data[INSURANCE_WITHDRAW_DEPOSITS_ONLY_SLAB_OFF] = value;
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
+fn read_withdraw_deposit_remaining_raw(env: &TestEnv) -> u64 {
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    u64::from_le_bytes(
+        slab.data[INSURANCE_WITHDRAW_DEPOSIT_REMAINING_SLAB_OFF
+            ..INSURANCE_WITHDRAW_DEPOSIT_REMAINING_SLAB_OFF + 8]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// 1. Positive: default insurance_operator (=admin) signs, amount within bps
@@ -1747,6 +1807,273 @@ fn test_withdraw_limited_rotation_swaps_authority() {
     // New operator accepted.
     send_withdraw_limited(&mut env, &new_op, 100)
         .expect("new operator must be accepted post-rotation");
+}
+
+/// 10b. Deposit-only mode: TopUpInsurance creates a principal withdrawal budget
+///      and WithdrawInsuranceLimited consumes that budget exactly.
+#[test]
+fn test_withdraw_limited_deposit_only_tracks_topups_and_withdrawals() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 10_000, 1);
+    set_withdraw_deposits_only_raw(&mut env, 1);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        10_000,
+        "TopUpInsurance must seed the deposit-only withdrawal budget"
+    );
+
+    send_withdraw_limited(&mut env, &admin, 4_000)
+        .expect("deposit-only withdrawal inside remaining budget must succeed");
+    assert_eq!(env.read_insurance_balance(), 6_000);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 6_000);
+
+    let insurance_payer = Keypair::new();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
+    env.top_up_insurance(&insurance_payer, 2_500);
+    assert_eq!(env.read_insurance_balance(), 8_500);
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        8_500,
+        "additional topups must increase the remaining principal budget"
+    );
+
+    env.set_slot(10);
+    send_withdraw_limited(&mut env, &admin, 8_500)
+        .expect("operator may withdraw the remaining deposited principal");
+    assert_eq!(env.read_insurance_balance(), 0);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 0);
+}
+
+/// 10ba. Failed or out-of-order withdrawals must not consume the deposited-
+///       principal budget. Later TopUpInsurance calls should still add to the
+///       exact remaining principal.
+#[test]
+fn test_withdraw_limited_deposit_only_failed_withdrawals_preserve_budget() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 0, 10_000, 1);
+    set_withdraw_deposits_only_raw(&mut env, 1);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let empty_withdraw = send_withdraw_limited(&mut env, &admin, 1);
+    assert!(
+        empty_withdraw.is_err(),
+        "withdrawal before any topup must fail"
+    );
+    assert_eq!(env.read_insurance_balance(), 0);
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        0,
+        "failed pre-topup withdrawal must not create or consume budget"
+    );
+
+    let insurance_payer = Keypair::new();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+    assert_eq!(env.read_insurance_balance(), 1_000);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 1_000);
+
+    send_withdraw_limited(&mut env, &admin, 400)
+        .expect("partial principal withdrawal must succeed");
+    assert_eq!(env.read_insurance_balance(), 600);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 600);
+
+    env.set_slot(2);
+    let over_budget = send_withdraw_limited(&mut env, &admin, 601);
+    assert!(
+        over_budget.is_err(),
+        "withdrawal above remaining deposited principal must fail"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        600,
+        "failed over-budget withdrawal must preserve insurance"
+    );
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        600,
+        "failed over-budget withdrawal must preserve remaining budget"
+    );
+
+    env.top_up_insurance(&insurance_payer, 500);
+    assert_eq!(env.read_insurance_balance(), 1_100);
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        1_100,
+        "later topup must add to the preserved remaining budget"
+    );
+
+    env.set_slot(4);
+    send_withdraw_limited(&mut env, &admin, 1_100)
+        .expect("operator may withdraw the exact remaining deposited principal");
+    assert_eq!(env.read_insurance_balance(), 0);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 0);
+}
+
+/// 10bb. Optionality at the public ABI: the deposit-only boolean is encoded in
+///       InitMarket's insurance-withdraw field, and defaults off unless that
+///       flag is present.
+#[test]
+fn test_withdraw_limited_deposit_only_can_be_enabled_at_init() {
+    program_path();
+    let mut env = TestEnv::new();
+    init_market_with_deposit_only_limited_withdrawal(&mut env, 10_000, 1);
+
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    assert_eq!(
+        slab.data[INSURANCE_WITHDRAW_DEPOSITS_ONLY_SLAB_OFF], 1,
+        "InitMarket high-bit flag must persist deposit-only mode"
+    );
+
+    let insurance_payer = Keypair::new();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 1_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    send_withdraw_limited(&mut env, &admin, 1_000)
+        .expect("init-enabled deposit-only mode must allow principal withdrawal");
+    assert_eq!(env.read_insurance_balance(), 0);
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 0);
+}
+
+/// 10c. Deposit-only mode must leave fee/new-account growth behind. Once the
+///      top-up principal budget is exhausted, further bounded withdrawals fail
+///      even though the insurance fund still has non-deposited growth.
+#[test]
+fn test_withdraw_limited_deposit_only_leaves_fee_growth_behind() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_trading_fee(100); // 1% trading fee
+    set_withdraw_deposits_only_raw(&mut env, 1);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let insurance_payer = Keypair::new();
+    env.svm
+        .airdrop(&insurance_payer.pubkey(), 10_000_000_000)
+        .unwrap();
+    env.top_up_insurance(&insurance_payer, 1_000);
+
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    slab.data[336..338].copy_from_slice(&10_000u16.to_le_bytes());
+    slab.data[344..352].copy_from_slice(&1u64.to_le_bytes());
+    env.svm.set_account(env.slab, slab).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    env.set_slot(200);
+    env.crank();
+
+    let insurance_with_growth = env.read_insurance_balance();
+    assert!(
+        insurance_with_growth > 1_000,
+        "test setup must create non-deposited insurance growth"
+    );
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        1_000,
+        "new-account fees and trading fees must not increase deposit-only budget"
+    );
+
+    send_withdraw_limited(&mut env, &admin, 1_000)
+        .expect("operator may withdraw deposited principal");
+    assert_eq!(read_withdraw_deposit_remaining_raw(&env), 0);
+    let profits_left = env.read_insurance_balance();
+    assert!(
+        profits_left > 0,
+        "fee growth must remain in insurance after principal withdrawal"
+    );
+
+    env.set_slot(201);
+    let over = send_withdraw_limited(&mut env, &admin, 1);
+    assert!(
+        over.is_err(),
+        "deposit-only mode must reject withdrawing non-deposited fee growth"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        profits_left,
+        "rejected profit withdrawal must preserve insurance"
+    );
+}
+
+/// 10d. Corrupt non-boolean deposit-only flag must fail closed.
+#[test]
+fn test_withdraw_limited_deposit_only_invalid_flag_rejected() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 10_000, 1);
+    set_withdraw_deposits_only_raw(&mut env, 2);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let before = env.read_insurance_balance();
+    let result = send_withdraw_limited(&mut env, &admin, 1);
+    assert!(result.is_err(), "invalid deposit-only flag must reject");
+    assert_eq!(
+        env.read_insurance_balance(),
+        before,
+        "invalid flag rejection must preserve insurance"
+    );
+}
+
+/// 10e. Optionality: with the boolean left at its default 0, tag 23 keeps the
+///      legacy behavior and may withdraw fee-grown insurance even when no
+///      TopUpInsurance principal budget exists.
+#[test]
+fn test_withdraw_limited_default_mode_not_capped_by_deposit_budget() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_trading_fee(100); // 1% trading fee
+
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    slab.data[336..338].copy_from_slice(&10_000u16.to_le_bytes());
+    slab.data[344..352].copy_from_slice(&1u64.to_le_bytes());
+    env.svm.set_account(env.slab, slab).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    env.set_slot(200);
+    env.crank();
+
+    assert_eq!(
+        read_withdraw_deposit_remaining_raw(&env),
+        0,
+        "no explicit TopUpInsurance means no deposited-principal budget"
+    );
+    let insurance_before = env.read_insurance_balance();
+    assert!(insurance_before > 0, "test setup must create fee insurance");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    send_withdraw_limited(&mut env, &admin, 1)
+        .expect("default mode must remain uncapped by deposit-only budget");
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before - 1,
+        "default mode withdrawal must preserve legacy live-withdraw behavior"
+    );
 }
 
 /// 11. Resolved markets reject bounded withdrawal (unbounded tag 20 owns

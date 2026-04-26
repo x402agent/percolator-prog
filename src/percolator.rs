@@ -185,6 +185,10 @@ pub mod constants {
     pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 10_000_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     pub const MATCHER_CONTEXT_LEN: usize = 320;
+    /// Maximum variadic accounts forwarded by TradeCpi to the matcher.
+    /// Transaction account limits are an outer bound; this protocol cap keeps
+    /// wrapper heap/CU and matcher ABI expectations explicit.
+    pub const MAX_MATCHER_TAIL_ACCOUNTS: usize = 32;
     pub const MATCHER_CALL_TAG: u8 = 0;
     pub const MATCHER_CALL_LEN: usize = 67;
 
@@ -195,6 +199,17 @@ pub mod constants {
     /// unit_scale=0 disables scaling (1:1 base tokens to units, dust=0 always).
     /// unit_scale=1..=1_000_000_000 enables scaling with dust tracking.
     pub const MAX_UNIT_SCALE: u32 = 1_000_000_000;
+    /// InitMarket confidence-filter range for external oracle markets.
+    /// Zero used to mean "disabled"; new deployments must carry an explicit
+    /// nonzero confidence bound so a stale/misconfigured wide-conf feed cannot
+    /// silently become the market's accepted oracle.
+    pub const MIN_CONF_FILTER_BPS: u16 = 50;
+    pub const MAX_CONF_FILTER_BPS: u16 = 1_000;
+    /// InitMarket upper bound on oracle staleness. Kept intentionally short:
+    /// a market that tolerates hours/days of stale oracle data lets the admin
+    /// or deployer choose a liveness footgun that users cannot distinguish at
+    /// runtime from an intentionally permissive market.
+    pub const MAX_ORACLE_STALENESS_SECS: u64 = 600;
 
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
@@ -225,6 +240,11 @@ pub mod constants {
     /// admin was burned. 10_000_000 slots is ~50 days at 2 slots/s, far beyond
     /// any reasonable grace period but well short of the saturation regime.
     pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
+    /// InitMarket wire flag packed into insurance_withdraw_max_bps. When set,
+    /// WithdrawInsuranceLimited can withdraw only explicit TopUpInsurance
+    /// principal; insurance growth from fees/liquidations remains behind.
+    pub const INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG: u16 = 0x8000;
+    pub const INSURANCE_WITHDRAW_MAX_BPS_MASK: u16 = 0x7FFF;
 }
 
 // =============================================================================
@@ -1285,6 +1305,8 @@ pub mod ix {
             /// Periodic maintenance fee per slot per account (engine units). 0 = disabled.
             maintenance_fee_per_slot: u128,
             /// Insurance withdrawal: max bps per withdrawal (0 = no live withdrawals)
+            /// High bit enables deposits-only mode for WithdrawInsuranceLimited;
+            /// low 15 bits store the bps value.
             insurance_withdraw_max_bps: u16,
             /// Insurance withdrawal: cooldown slots between withdrawals
             insurance_withdraw_cooldown_slots: u64,
@@ -1956,9 +1978,6 @@ pub mod ix {
             min_funding_lifetime_slots: crate::constants::MIN_FUNDING_LIFETIME_SLOTS,
             max_price_move_bps_per_slot,
         };
-        if percolator::RiskEngine::try_validate_params(&params).is_err() {
-            return Err(crate::error::PercolatorError::InvalidConfigParam.into());
-        }
         Ok((params, new_account_fee))
     }
 }
@@ -2133,9 +2152,14 @@ pub mod state {
         /// Tuned by admin via UpdateConfig; typical production values are
         /// 10–100 (mature perp DEXs run ~20× insurance coverage).
         pub tvl_insurance_cap_mult: u16,
-        /// Padding for alignment (was [u8; 6]; shrunk when
-        /// tvl_insurance_cap_mult claimed 2 bytes of the former slot).
-        pub _iw_padding: [u8; 4],
+        /// Optional bounded-withdrawal mode. 0 = legacy bounded withdrawals
+        /// may withdraw live insurance subject to bps/cooldown. 1 = tag 23
+        /// may withdraw only the remaining amount deposited through
+        /// TopUpInsurance; fee/trading/liquidation growth stays behind.
+        pub insurance_withdraw_deposits_only: u8,
+        /// Padding for alignment (was [u8; 4]; shrunk when deposit-only mode
+        /// claimed 1 byte of the former slot).
+        pub _iw_padding: [u8; 3],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
         /// Latest raw external oracle target in engine-space e6. Non-Hyperp
@@ -2148,11 +2172,12 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// Padding slot previously occupied by `first_observed_stale_slot`
-        /// (legacy two-phase resolve telemetry). Removed; kept as u64
-        /// padding for u128-alignment of the downstream `maintenance_fee_
-        /// per_slot` and `last_mark_push_slot` fields.
-        pub _pad_obsolete_stale_slot: u64,
+        /// Remaining TopUpInsurance principal withdrawable through tag 23
+        /// when `insurance_withdraw_deposits_only == 1`. This tracks only
+        /// explicit top-ups: it increases on TopUpInsurance and decreases on
+        /// WithdrawInsuranceLimited. Insurance growth from fees/liquidations
+        /// never increments this budget.
+        pub insurance_withdraw_deposit_remaining: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -2503,6 +2528,9 @@ pub mod oracle {
     /// discriminator. The wrapper rejects Partial upstream; offset 41
     /// is correct for every price-message the wrapper ever deserializes.
     const OFF_PRICE_FEED_MESSAGE: usize = 41;
+    /// Anchor discriminator for `PriceUpdateV2`: sha256("account:PriceUpdateV2")[0..8].
+    const PYTH_PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] =
+        [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd];
     /// Pyth VerificationLevel::Full — enum tag value the Anchor
     /// serializer emits for the Full variant. Anchor writes the
     /// variant discriminant as one u8 followed by the variant payload
@@ -2561,6 +2589,9 @@ pub mod oracle {
         let data = price_ai.try_borrow_data()?;
         if data.len() < PRICE_UPDATE_V2_MIN_LEN {
             return Err(ProgramError::InvalidAccountData);
+        }
+        if data[..8] != PYTH_PRICE_UPDATE_V2_DISCRIMINATOR {
+            return Err(PercolatorError::OracleInvalid.into());
         }
 
         // Reject partially verified Pyth updates (only Full is safe).
@@ -3189,7 +3220,7 @@ pub mod processor {
         constants::{
             DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_E9_PER_SLOT,
             DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_MARK_EWMA_HALFLIFE_SLOTS, MAGIC,
-            MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN,
+            MATCHER_CALL_LEN, MATCHER_CALL_TAG, MAX_MATCHER_TAIL_ACCOUNTS, SLAB_LEN,
         },
         error::{map_risk_error, PercolatorError},
         ix::Instruction,
@@ -3394,19 +3425,16 @@ pub mod processor {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
-        // Anchor: upper-bound by last_market_slot (no accrue in this
-        // path) but floor at current_slot so sync_account_fee_to_slot_
-        // not_atomic's monotonicity guard (now_slot >= current_slot)
-        // holds even in the transient state where a no-oracle path
-        // (InitUser/deposit) has advanced current_slot past last_market
-        // _slot. In that state the account's last_fee_slot was seeded at
-        // current_slot, so the anchor == current_slot case is a harmless
-        // dt=0 no-op; the real fee realization happens on the next
-        // oracle-backed op via ensure_market_accrued_to_now.
-        let anchor = core::cmp::max(
-            core::cmp::min(wallclock_slot, engine.last_market_slot),
-            engine.current_slot,
-        );
+        check_idx(engine, idx)?;
+        let anchor = core::cmp::min(wallclock_slot, engine.last_market_slot);
+        // No-oracle paths must not move fee time beyond the market's
+        // accrued slot. If engine.current_slot or this account's fee
+        // cursor is already past that boundary, there is nothing safe
+        // to realize here; the next oracle-backed op will accrue the
+        // market and cover the tail.
+        if anchor < engine.current_slot || anchor < engine.accounts[idx as usize].last_fee_slot {
+            return Ok(());
+        }
         engine
             .sync_account_fee_to_slot_not_atomic(idx, anchor, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
@@ -3506,6 +3534,29 @@ pub mod processor {
             price as u128,
             percolator::POS_SCALE,
         )
+    }
+
+    fn current_trade_fee_paid_cap(
+        size: i128,
+        exec_price: u64,
+        trading_fee_bps: u64,
+    ) -> Result<u128, ProgramError> {
+        if trading_fee_bps == 0 || size == 0 {
+            return Ok(0);
+        }
+        let notional = percolator::wide_math::mul_div_floor_u128(
+            size.unsigned_abs(),
+            exec_price as u128,
+            percolator::POS_SCALE,
+        );
+        if notional == 0 {
+            return Ok(0);
+        }
+        let one_side_fee =
+            percolator::wide_math::mul_div_ceil_u128(notional, trading_fee_bps as u128, 10_000);
+        one_side_fee
+            .checked_mul(2)
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
     }
 
     fn reject_stuck_target_accrual(
@@ -3818,7 +3869,7 @@ pub mod processor {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let idx = word_cursor * 64 + bit;
-                if idx >= percolator::MAX_ACCOUNTS {
+                if !idx_within_market_capacity(engine, idx) {
                     continue;
                 }
                 engine
@@ -4041,11 +4092,30 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn idx_within_market_capacity(engine: &RiskEngine, idx: usize) -> bool {
+        idx < MAX_ACCOUNTS && (idx as u64) < engine.params.max_accounts
+    }
+
+    #[inline]
+    fn idx_used_in_market(engine: &RiskEngine, idx: usize) -> bool {
+        idx_within_market_capacity(engine, idx) && engine.is_used(idx)
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
-        if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
+        if !idx_used_in_market(engine, idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
         }
         Ok(())
+    }
+
+    #[inline]
+    fn insurance_withdraw_deposits_only(config: &MarketConfig) -> Result<bool, ProgramError> {
+        match config.insurance_withdraw_deposits_only {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(PercolatorError::InvalidConfigParam.into()),
+        }
     }
 
     fn verify_vault(
@@ -4388,8 +4458,13 @@ pub mod processor {
                 if invert > 1 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
-                if conf_filter_bps > 10_000 {
+                // Confidence filter: require a nonzero, operationally sane
+                // range. Disabling confidence checks is too sharp for public
+                // deployments; wide confidence bands are equivalent to
+                // accepting a low-quality oracle.
+                if conf_filter_bps < crate::constants::MIN_CONF_FILTER_BPS
+                    || conf_filter_bps > crate::constants::MAX_CONF_FILTER_BPS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Validate unit_scale: reject huge values that make most deposits credit 0 units
@@ -4412,7 +4487,13 @@ pub mod processor {
                 if risk_params.h_min == 0 || risk_params.h_max < risk_params.h_min {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                // insurance_withdraw_max_bps is a percentage (0..=10_000)
+                let insurance_withdraw_deposits_only = (insurance_withdraw_max_bps
+                    & crate::constants::INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG)
+                    != 0;
+                let insurance_withdraw_max_bps =
+                    insurance_withdraw_max_bps & crate::constants::INSURANCE_WITHDRAW_MAX_BPS_MASK;
+                // insurance_withdraw_max_bps is a percentage (0..=10_000);
+                // the top wire bit is reserved for deposit-only mode.
                 if insurance_withdraw_max_bps > 10_000 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -4422,11 +4503,12 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // max_staleness_secs: reject 0 (would brick oracle reads —
-                // any non-zero age > 0 fails the staleness check).
-                // max_staleness_secs: reject 0 and unreasonable values.
-                // 0 would brick oracle reads. >7 days is clearly misconfigured.
-                if max_staleness_secs == 0 || max_staleness_secs > 7 * 86400 {
+                // max_staleness_secs: reject 0 (would brick oracle reads) and
+                // reject long stale windows that make oracle liveness a
+                // deployer-controlled footgun.
+                if max_staleness_secs == 0
+                    || max_staleness_secs > crate::constants::MAX_ORACLE_STALENESS_SECS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
@@ -4469,10 +4551,9 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // Per-slot price-move cap and exact solvency envelope are
-                // decoded and prevalidated by read_risk_params. InitMarket
-                // returns a ProgramError on bad config; it must not rely on
-                // an engine-side panic for public input validation.
+                // Cheap wrapper policy checks happen here; exact RiskParams
+                // validation is left to engine.init_in_place so InitMarket
+                // does not run the heavy envelope verifier twice.
                 // Liveness: if permissionless resolution is enabled, force_close must
                 // also be enabled. Otherwise abandoned accounts on resolved markets
                 // with burned admin have no cleanup path.
@@ -4742,7 +4823,8 @@ pub mod processor {
                     // Insurance withdrawal limits (immutable after init)
                     insurance_withdraw_max_bps,
                     tvl_insurance_cap_mult: 0, // disabled at init; admin opts in via UpdateConfig
-                    _iw_padding: [0u8; 4],
+                    insurance_withdraw_deposits_only: insurance_withdraw_deposits_only as u8,
+                    _iw_padding: [0u8; 3],
                     insurance_withdraw_cooldown_slots,
                     oracle_target_price_e6: init_price,
                     oracle_target_publish_time: init_publish_time,
@@ -4751,7 +4833,7 @@ pub mod processor {
                     // Non-Hyperp: 0 (no mark push concept).
                     last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
                     last_insurance_withdraw_slot: 0,
-                    _pad_obsolete_stale_slot: 0,
+                    insurance_withdraw_deposit_remaining: 0,
                     // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
                     mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
@@ -4959,6 +5041,9 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
+                if matcher_program == Pubkey::default() || matcher_context == Pubkey::default() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -5604,10 +5689,7 @@ pub mod processor {
                             break;
                         }
                         let i = idx as usize;
-                        if i >= percolator::MAX_ACCOUNTS {
-                            continue;
-                        }
-                        if !engine.is_used(i) {
+                        if !idx_used_in_market(engine, i) {
                             continue;
                         }
                         attempts += 1;
@@ -5680,7 +5762,7 @@ pub mod processor {
                 if !permissionless
                     && config.maintenance_fee_per_slot > 0
                     && sweep_delta > 0
-                    && engine.is_used(caller_idx as usize)
+                    && idx_used_in_market(engine, caller_idx as usize)
                 {
                     // 50 / 50 split: half to caller, half stays in insurance.
                     let mut reward =
@@ -5741,7 +5823,9 @@ pub mod processor {
                             continue;
                         }
                         let eidx = buf.entries[i].idx as usize;
-                        if !engine.is_used(eidx) || effective_pos_q_checked(engine, eidx)? == 0 {
+                        if !idx_used_in_market(engine, eidx)
+                            || effective_pos_q_checked(engine, eidx)? == 0
+                        {
                             buf.remove(buf.entries[i].idx);
                         }
                     }
@@ -5771,7 +5855,7 @@ pub mod processor {
                     let scan_start = (buf.scan_cursor as usize) % scan_mod;
                     for offset in 0..crate::constants::RISK_SCAN_WINDOW {
                         let idx = (scan_start + offset) % scan_mod;
-                        if !engine.is_used(idx) {
+                        if !idx_used_in_market(engine, idx) {
                             continue;
                         }
                         let eff = effective_pos_q_checked(engine, idx)?;
@@ -5787,7 +5871,7 @@ pub mod processor {
                     // Phase D: ingest caller-supplied candidates
                     for &(cidx, _) in candidates.iter() {
                         let ci = cidx as usize;
-                        if ci >= percolator::MAX_ACCOUNTS || !engine.is_used(ci) {
+                        if !idx_used_in_market(engine, ci) {
                             continue;
                         }
                         let eff = effective_pos_q_checked(engine, ci)?;
@@ -5924,6 +6008,8 @@ pub mod processor {
                 // delta undercounts the actual fee. This is the conservative direction:
                 // mark is stickier during volatile loss-absorption events, never
                 // more manipulable. A future engine API could expose fee_paid directly.
+                let current_fee_paid_cap =
+                    current_trade_fee_paid_cap(size, price, engine.params.trading_fee_bps)?;
                 let ins_before = engine.insurance_fund.balance.get();
 
                 #[cfg(feature = "cu-audit")]
@@ -5965,7 +6051,9 @@ pub mod processor {
                     // This is exact: no overestimate from pre-trade capital snapshot.
                     let fee_paid_nocpi = if config.mark_min_fee > 0 {
                         let ins_after = engine.insurance_fund.balance.get();
-                        let delta = ins_after.saturating_sub(ins_before);
+                        let delta = ins_after
+                            .saturating_sub(ins_before)
+                            .min(current_fee_paid_cap);
                         core::cmp::min(delta, u64::MAX as u128) as u64
                     } else {
                         0u64
@@ -6090,6 +6178,9 @@ pub mod processor {
                 let a_matcher_ctx = &accounts[6];
                 let a_lp_pda = &accounts[7];
                 let a_tail = &accounts[8..];
+                if a_tail.len() > MAX_MATCHER_TAIL_ACCOUNTS {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 accounts::expect_signer(a_user)?;
                 // Reject zero-size requests at entry — zero-fill path should only
@@ -6097,6 +6188,9 @@ pub mod processor {
                 // Also reject i128::MIN before oracle/CPI work; it has no positive
                 // counterpart and the engine would reject it later.
                 if size == 0 || size == i128::MIN {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                if lp_idx == user_idx {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
@@ -6529,6 +6623,11 @@ pub mod processor {
                     }
 
                     let trade_size = crate::policy::cpi_trade_size(ret.exec_size, size);
+                    let current_fee_paid_cap = current_trade_fee_paid_cap(
+                        trade_size,
+                        exec_price,
+                        engine.params.trading_fee_bps,
+                    )?;
 
                     // Snapshot insurance for fee-weighted EWMA (delta approach).
                     // delta now captures ONLY trading_fees - losses_absorbed
@@ -6586,7 +6685,9 @@ pub mod processor {
                         // fee_paid = actual fee collected into insurance (post - pre).
                         let fee_paid_cpi = if config.mark_min_fee > 0 {
                             let ins_after_cpi = engine.insurance_fund.balance.get();
-                            let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                            let delta = ins_after_cpi
+                                .saturating_sub(ins_before_cpi)
+                                .min(current_fee_paid_cap);
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else {
                             0u64
@@ -6649,7 +6750,9 @@ pub mod processor {
                         // binding is in the cap>0 branch's scope.
                         let fee_paid_hyperp = if config.mark_min_fee > 0 {
                             let ins_after_cpi = engine.insurance_fund.balance.get();
-                            let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                            let delta = ins_after_cpi
+                                .saturating_sub(ins_before_cpi)
+                                .min(current_fee_paid_cap);
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else {
                             0u64
@@ -7036,7 +7139,8 @@ pub mod processor {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
+                insurance_withdraw_deposits_only(&config)?;
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -7067,15 +7171,22 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // Convert base tokens to units for engine
+                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+                let new_deposit_remaining = config
+                    .insurance_withdraw_deposit_remaining
+                    .checked_add(units)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
                 engine
                     .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
+                config.insurance_withdraw_deposit_remaining = new_deposit_remaining;
+                state::write_config(&mut data, &config);
             }
 
             Instruction::CloseSlab => {
@@ -7088,6 +7199,7 @@ pub mod processor {
                 let a_token = &accounts[5];
 
                 accounts::expect_signer(a_dest)?;
+                accounts::expect_writable(a_dest)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
@@ -7121,6 +7233,7 @@ pub mod processor {
                         &mint,
                         &Pubkey::new_from_array(config.vault_pubkey),
                     )?;
+                    accounts::expect_key(a_vault_auth, &auth)?;
 
                     let engine = zc::engine_ref(&data)?;
                     if !engine.vault.is_zero() {
@@ -7144,19 +7257,6 @@ pub mod processor {
                     if stranded > 0 {
                         // Validate admin's token account before drain
                         verify_token_account(a_dest_ata, a_dest.key, &mint)?;
-                        // Verify vault authority PDA
-                        let expected_auth = Pubkey::create_program_address(
-                            &[
-                                b"vault",
-                                a_slab.key.as_ref(),
-                                &[config.vault_authority_bump],
-                            ],
-                            program_id,
-                        )
-                        .map_err(|_| ProgramError::InvalidSeeds)?;
-                        if a_vault_auth.key != &expected_auth {
-                            return Err(ProgramError::InvalidSeeds);
-                        }
 
                         let seed1: &[u8] = b"vault";
                         let seed2: &[u8] = a_slab.key.as_ref();
@@ -7965,6 +8065,7 @@ pub mod processor {
                 if config.insurance_withdraw_max_bps == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                let deposits_only = insurance_withdraw_deposits_only(&config)?;
                 {
                     let engine = zc::engine_ref(&data)?;
                     reject_any_target_lag(&config, engine)?;
@@ -7997,7 +8098,10 @@ pub mod processor {
                 let bps_cap =
                     ins.saturating_mul(config.insurance_withdraw_max_bps as u128) / 10_000;
                 let cap = core::cmp::max(bps_cap, MIN_WITHDRAW_FLOOR_UNITS);
-                let cap = core::cmp::min(cap, ins);
+                let mut cap = core::cmp::min(cap, ins);
+                if deposits_only {
+                    cap = core::cmp::min(cap, config.insurance_withdraw_deposit_remaining as u128);
+                }
                 if (amount_units as u128) > cap {
                     return Err(PercolatorError::InsuranceWithdrawCapExceeded.into());
                 }
@@ -8029,6 +8133,16 @@ pub mod processor {
                         .map_err(map_risk_error)?;
                 }
                 config.last_insurance_withdraw_slot = clock.slot;
+                if deposits_only {
+                    config.insurance_withdraw_deposit_remaining = config
+                        .insurance_withdraw_deposit_remaining
+                        .checked_sub(amount_units)
+                        .ok_or(PercolatorError::InsuranceWithdrawCapExceeded)?;
+                } else {
+                    config.insurance_withdraw_deposit_remaining = config
+                        .insurance_withdraw_deposit_remaining
+                        .saturating_sub(amount_units);
+                }
                 state::write_config(&mut data, &config);
                 drop(data);
 
@@ -8581,7 +8695,7 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 let clock = Clock::from_account_info(a_clock)?;
-                if clock.slot < resolved_slot.saturating_add(config.force_close_delay_slots) {
+                if clock.slot.saturating_sub(resolved_slot) < config.force_close_delay_slots {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
