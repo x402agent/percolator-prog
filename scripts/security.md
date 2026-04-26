@@ -1198,3 +1198,73 @@ RUSTFLAGS='-Awarnings' cargo test -q
 Results:
 - Economic-attack regression file: PASS (`10` tests).
 - Full Rust/LiteSVM/CU test suite: PASS.
+
+---
+
+## Seventh pass — 2026-04-26 v12.19 hardened-public-path probes
+
+Sweep targeted the recently-landed v12.19 surfaces not on MEMORY.md's
+*Verified Secure* list:
+
+- `c175ec4` — bounded-withdrawal deposits-only mode (new
+  `insurance_withdraw_deposit_remaining` u64 + `insurance_withdraw_
+  deposits_only` u8 packed into the prior padding slots).
+- `83078bb` — wrapper-side rejection of `max_price_move_bps_per_slot
+  == 0` before §1.4 envelope validation.
+- `5e0b55c` / `b64d294` — §9.2 `check_no_oracle_live_envelope` and
+  `permissionless_stale_matured` gates on the public mutation paths
+  (`InitUser`, `InitLP`, `DepositCollateral`, `TopUpInsurance`).
+
+### Code-reading findings (no new exploit)
+
+- **Deposits-only mode**: 12 dedicated tests cover top-up/withdraw
+  accounting (`tests/test_insurance.rs:1605-2152`). Every accounting
+  edge I considered (bps masking, mode toggle attempts, third-party
+  TopUpInsurance + operator drain, fee-growth left behind, corrupt
+  flag rejection, cooldown, anti-Zeno floor) is already exercised.
+  `UpdateConfig` does NOT expose `insurance_withdraw_deposits_only` or
+  `insurance_withdraw_max_bps`, so the mode is fixed at `InitMarket`
+  for the slab's lifetime. PASS_SAFE.
+- **§9.2 reachability**: with the wrapper's `permissionless_resolve_
+  stale_slots <= max_accrual_dt_slots` invariant, the
+  `check_no_oracle_live_envelope` `CatchupRequired` gate on
+  `InitUser` / `TopUpInsurance` is structurally shadowed by
+  `permissionless_stale_matured` (`OracleStale`) on the steady-state
+  path. §9.2 is reachable only after a partial `CatchupAccrue`
+  advances `last_good_oracle_slot` ahead of `engine.last_market_slot`
+  (covered indirectly by the F1 partial-catchup regression). The
+  shadow ordering is correct: the matured gate is the operator-
+  visible "market is dead" signal; §9.2 is the structural backstop.
+
+### Fresh loop iteration
+
+1. **Target:** Public-path stale-matured gate
+   (`permissionless_stale_matured` on `InitUser` and
+   `TopUpInsurance`).
+   **Attacker model:** attacker (or honest user with stale UI) tries
+   to move tokens into a market that has already matured into the
+   permissionless-resolve window. Goal: leave funds stranded behind a
+   resolution flow they did not anticipate, or pad insurance ahead of
+   resolution to skew payouts.
+   **Probes:** `tests/test_envelope_gate.rs::
+   test_attack_top_up_insurance_rejected_after_stale_matured` and
+   `test_attack_init_user_rejected_after_stale_matured`.
+   **Disposition:** PASS_SAFE. Both probes fire `OracleStale`
+   (`Custom(6)`) before any token movement; insurance is observed
+   unchanged after the rejected `TopUpInsurance`. No previous test
+   covered the negative case on either public path, so both
+   regressions were kept.
+
+Single-iteration pass; no new F-series finding. Returning the loop to
+the user for next-target guidance per the "easy attacks out" stop
+heuristic.
+
+### Commands run
+
+```text
+cargo build-sbf
+RUSTFLAGS='-Awarnings' cargo test --release --test test_envelope_gate -- --nocapture
+```
+
+Results:
+- New envelope-gate regression file: PASS (`2` tests).
