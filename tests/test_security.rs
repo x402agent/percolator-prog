@@ -13107,6 +13107,8 @@ const MAX_RISK_INSURANCE: u64 = 1_000_000_000;
 const MAX_RISK_LEVERAGE_MILLI: u128 = 19_900;
 const MAX_RISK_CLAMP_BPS: u64 = 49;
 const MAX_RISK_H_MAX: u64 = 86_400;
+const MAX_RISK_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 =
+    percolator_prog::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS;
 
 #[derive(Debug, Clone, Copy)]
 enum MaxRiskCrankSchedule {
@@ -13131,10 +13133,11 @@ struct MaxRiskActor {
     direction: i8,
 }
 
-fn encode_init_market_bounty_sol_20x_with_h_max(
+fn encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
     admin: &Pubkey,
     mint: &Pubkey,
     h_max: u64,
+    permissionless_resolve_stale_slots: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
     data.extend_from_slice(admin.as_ref());
@@ -13169,7 +13172,7 @@ fn encode_init_market_bounty_sol_20x_with_h_max(
 
     data.extend_from_slice(&0u16.to_le_bytes());
     data.extend_from_slice(&0u64.to_le_bytes());
-    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&permissionless_resolve_stale_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes());
     data.extend_from_slice(&100u64.to_le_bytes());
     data.extend_from_slice(&500i64.to_le_bytes());
@@ -13180,7 +13183,12 @@ fn encode_init_market_bounty_sol_20x_with_h_max(
 }
 
 fn encode_init_market_bounty_sol_20x_max(admin: &Pubkey, mint: &Pubkey) -> Vec<u8> {
-    encode_init_market_bounty_sol_20x_with_h_max(admin, mint, MAX_RISK_H_MAX)
+    encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
+        admin,
+        mint,
+        MAX_RISK_H_MAX,
+        MAX_RISK_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+    )
 }
 
 fn try_crank_with_candidate_indices(env: &mut TestEnv, candidates: &[u16]) -> Result<(), String> {
@@ -13653,25 +13661,57 @@ fn test_attack_profit_maturity_cap_independent_from_accrual_window() {
 
     let mut env = TestEnv::new();
     env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
-    let data = encode_init_market_bounty_sol_20x_with_h_max(
+    let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
         &env.payer.pubkey(),
         &env.mint,
         percolator_prog::constants::MAX_PROFIT_MATURITY_SLOTS,
+        MAX_RISK_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
     );
     env.try_init_market_raw(data)
-        .expect("10-day profit maturity cap should be accepted independently from max_dt=10");
+        .expect("30-day profit maturity cap should be accepted independently from max_dt=10");
 
     let mut env = TestEnv::new();
     env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
-    let data = encode_init_market_bounty_sol_20x_with_h_max(
+    let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
         &env.payer.pubkey(),
         &env.mint,
         percolator_prog::constants::MAX_PROFIT_MATURITY_SLOTS + 1,
+        MAX_RISK_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
     );
     let err = env
         .try_init_market_raw(data)
         .expect_err("profit maturity beyond wrapper cap should be rejected");
     println!("profit maturity above cap rejected as expected: {err}");
+}
+
+#[test]
+fn test_attack_permissionless_resolve_cap_independent_from_accrual_window() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
+    let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
+        &env.payer.pubkey(),
+        &env.mint,
+        MAX_RISK_H_MAX,
+        percolator_prog::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+    );
+    env.try_init_market_raw(data).expect(
+        "30-day permissionless stale horizon should be accepted independently from max_dt=10",
+    );
+
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
+    let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
+        &env.payer.pubkey(),
+        &env.mint,
+        MAX_RISK_H_MAX,
+        percolator_prog::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS + 1,
+    );
+    let err = env
+        .try_init_market_raw(data)
+        .expect_err("permissionless stale horizon beyond wrapper cap should be rejected");
+    println!("permissionless stale horizon above cap rejected as expected: {err}");
 }
 
 fn run_max_risk_pingpong_probe(label: &str, first_direction: i8) -> (u128, u128, u128) {
@@ -13935,17 +13975,11 @@ fn test_attack_max_risk_8_slot_oracle_crank_orderings_do_not_drain_insurance() {
             );
         }
 
-        // A no-crank gap of exactly 10 slots is already terminally stale for
-        // this probe config (`permissionless_resolve_stale_slots = 10`, and
-        // the stale check is inclusive). Probe the last admissible no-crank
-        // value-moving path at 9 slots; the 10-slot gap rejects before the
-        // profitable side can close, which is a safe outcome rather than an
-        // insurance-drain path.
         let (start, min, end) =
-            run_max_risk_profit_take_probe_steps(label, dir, 9, MaxRiskCrankSchedule::GapThenFull);
+            run_max_risk_profit_take_probe_steps(label, dir, 10, MaxRiskCrankSchedule::GapThenFull);
         assert!(
             min >= start,
-            "EXPLOIT: 9-slot gap profit-take {label} drained insurance below start: start={start}, min={min}, end={end}"
+            "EXPLOIT: 10-slot gap profit-take {label} drained insurance below start: start={start}, min={min}, end={end}"
         );
     }
 }

@@ -206,18 +206,16 @@ pub fn make_pyth_data(
 /// v12.19.6: non-Hyperp markets MUST carry `permissionless_resolve_stale_slots > 0`
 /// to satisfy the wrapper's resolvability invariant (a non-Hyperp market with
 /// perm_resolve==0 is un-resolvable once the admin is burned). perm_resolve
-/// must also satisfy the single-accrue envelope: `perm_resolve <=
-/// MAX_ACCRUAL_DT_SLOTS (=100)`. We pick 80 for non-Hyperp markets — well
-/// inside the envelope and still larger than the (adjusted) default
-/// max_crank_staleness_slots of 50 used by the outer encoders below. Hyperp
+/// is independent from the single-accrue envelope and may be much longer; the
+/// default test value stays short so stale-resolution tests run quickly. Hyperp
 /// deployments keep perm_resolve=0 (they resolve from the stored mark without
 /// a live oracle read).
 fn append_default_extended_tail_for(data: &mut Vec<u8>, is_hyperp: bool) {
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
 
-    // Must be > max_crank_staleness_slots (= 50, below) AND <= 100
-    // (MAX_ACCRUAL_DT_SLOTS). Pick 80.
+    // Short test default; production deployments can use a much longer
+    // permissionless stale horizon up to the wrapper product cap.
     let perm_resolve: u64 = if is_hyperp { 0 } else { 80 };
     data.extend_from_slice(&perm_resolve.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots (default)
