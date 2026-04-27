@@ -565,6 +565,43 @@ pub mod policy {
         !price_move_active && !funding_active
     }
 
+    /// Pure funding-rate policy from mark/index premium.
+    ///
+    /// Returns `None` for corrupt negative caps. Otherwise returns the e9
+    /// per-slot funding rate after premium clamp, k scaling, horizon division,
+    /// and final per-slot rate clamp.
+    #[inline]
+    pub fn funding_rate_e9_from_mark_index(
+        mark_ewma_e6: u64,
+        last_effective_price_e6: u64,
+        funding_horizon_slots: u64,
+        funding_k_bps: u64,
+        funding_max_premium_bps: i64,
+        funding_max_e9_per_slot: i64,
+    ) -> Option<i128> {
+        if funding_max_premium_bps < 0 || funding_max_e9_per_slot < 0 {
+            return None;
+        }
+
+        let mark = mark_ewma_e6;
+        let index = last_effective_price_e6;
+        if mark == 0 || index == 0 || funding_horizon_slots == 0 {
+            return Some(0);
+        }
+
+        let diff = mark as i128 - index as i128;
+        let mut premium_e9 = diff.saturating_mul(1_000_000_000) / (index as i128);
+
+        let max_prem_e9 = (funding_max_premium_bps as i128) * 100_000;
+        premium_e9 = premium_e9.clamp(-max_prem_e9, max_prem_e9);
+
+        let scaled = premium_e9.saturating_mul(funding_k_bps as i128) / 100;
+        let per_slot = scaled / (funding_horizon_slots as i128);
+
+        let max_rate_e9 = funding_max_e9_per_slot as i128;
+        Some(per_slot.clamp(-max_rate_e9, max_rate_e9))
+    }
+
     /// KeeperCrank partial-catchup decision. When the market clock is too far
     /// behind for one full inline catchup, the crank may commit one bounded
     /// chunk at stored P_last only if price/funding progress is equity-active.
@@ -4294,33 +4331,15 @@ pub mod processor {
     }
 
     fn compute_current_funding_rate_e9(config: &MarketConfig) -> Result<i128, ProgramError> {
-        if config.funding_max_premium_bps < 0 || config.funding_max_e9_per_slot < 0 {
-            return Err(PercolatorError::InvalidConfigParam.into());
-        }
-
-        let mark = config.mark_ewma_e6;
-        let index = config.last_effective_price_e6;
-        if mark == 0 || index == 0 || config.funding_horizon_slots == 0 {
-            return Ok(0);
-        }
-
-        let diff = mark as i128 - index as i128;
-        // premium in e9: diff * 1_000_000_000 / index
-        let mut premium_e9 = diff.saturating_mul(1_000_000_000) / (index as i128);
-
-        // Clamp premium: max_premium_bps * 100_000 converts bps to e9
-        let max_prem_e9 = (config.funding_max_premium_bps as i128) * 100_000;
-        premium_e9 = premium_e9.clamp(-max_prem_e9, max_prem_e9);
-
-        // Apply k multiplier (100 = 1.00x)
-        let scaled = premium_e9.saturating_mul(config.funding_k_bps as i128) / 100;
-
-        // Per-slot: divide by horizon
-        let per_slot = scaled / (config.funding_horizon_slots as i128);
-
-        // Clamp: funding_max_e9_per_slot is already in engine-native e9 units.
-        let max_rate_e9 = config.funding_max_e9_per_slot as i128;
-        Ok(per_slot.clamp(-max_rate_e9, max_rate_e9))
+        crate::policy::funding_rate_e9_from_mark_index(
+            config.mark_ewma_e6,
+            config.last_effective_price_e6,
+            config.funding_horizon_slots,
+            config.funding_k_bps,
+            config.funding_max_premium_bps,
+            config.funding_max_e9_per_slot,
+        )
+        .ok_or(PercolatorError::InvalidConfigParam.into())
     }
 
     fn execute_trade_with_matcher<M: MatchingEngine>(

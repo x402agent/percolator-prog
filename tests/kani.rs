@@ -45,6 +45,7 @@ use percolator_prog::policy::{
     ewma_update,
     // Account validation helpers
     fee_sync_anchor_within_accrued_boundary,
+    funding_rate_e9_from_mark_index,
     // New: InitMarket scale validation
     init_market_scale_ok,
     // New: Oracle inversion math
@@ -2872,6 +2873,116 @@ fn kani_clamp_oracle_price_universal() {
         raw_price.clamp(lo, hi),
         "clamped result must equal raw_price.clamp(lo, hi)"
     );
+}
+
+// ============================================================================
+// Funding Rate Proofs
+// ============================================================================
+
+/// Invalid negative funding caps are rejected before any clamp call.
+#[kani::proof]
+fn kani_funding_rate_rejects_negative_caps() {
+    let mark: u64 = kani::any();
+    let index: u64 = kani::any();
+    let horizon: u64 = kani::any();
+    let k_bps: u64 = kani::any();
+    let max_premium_bps: i64 = kani::any();
+    let max_rate_e9: i64 = kani::any();
+
+    kani::assume(max_premium_bps < 0 || max_rate_e9 < 0);
+
+    assert_eq!(
+        funding_rate_e9_from_mark_index(mark, index, horizon, k_bps, max_premium_bps, max_rate_e9),
+        None,
+        "negative funding caps must reject instead of reaching clamp(min > max)"
+    );
+}
+
+/// Zero mark, zero index, or zero horizon must return zero funding.
+#[kani::proof]
+fn kani_funding_rate_zero_inputs_return_zero() {
+    let mark: u64 = kani::any();
+    let index: u64 = kani::any();
+    let horizon: u64 = kani::any();
+    let k_bps: u64 = kani::any();
+    let max_premium_bps: i64 = kani::any();
+    let max_rate_e9: i64 = kani::any();
+
+    kani::assume(max_premium_bps >= 0);
+    kani::assume(max_rate_e9 >= 0);
+    kani::assume(mark == 0 || index == 0 || horizon == 0);
+
+    assert_eq!(
+        funding_rate_e9_from_mark_index(mark, index, horizon, k_bps, max_premium_bps, max_rate_e9),
+        Some(0),
+        "zero mark/index/horizon must produce zero funding"
+    );
+}
+
+/// The final rate clamp must bound output magnitude by funding_max_e9_per_slot.
+#[kani::proof]
+fn kani_funding_rate_output_respects_rate_cap() {
+    let mark: u16 = kani::any();
+    let index: u16 = kani::any();
+    let horizon: u16 = kani::any();
+    let k_bps: u16 = kani::any();
+    let max_premium_bps: i16 = kani::any();
+    let max_rate_e9: i16 = kani::any();
+
+    kani::assume(mark > 0);
+    kani::assume(index > 0);
+    kani::assume(horizon > 0);
+    kani::assume(max_premium_bps >= 0);
+    kani::assume(max_rate_e9 >= 0);
+
+    let rate = funding_rate_e9_from_mark_index(
+        mark as u64,
+        index as u64,
+        horizon as u64,
+        k_bps as u64,
+        max_premium_bps as i64,
+        max_rate_e9 as i64,
+    )
+    .expect("nonnegative caps must be accepted");
+
+    let cap = max_rate_e9 as i128;
+    assert!(rate >= -cap, "funding rate must be >= -cap");
+    assert!(rate <= cap, "funding rate must be <= cap");
+}
+
+/// Funding sign follows mark-index premium direction after symmetric clamps.
+#[kani::proof]
+fn kani_funding_rate_sign_matches_premium_direction() {
+    let mark: u16 = kani::any();
+    let index: u16 = kani::any();
+    let horizon: u16 = kani::any();
+    let k_bps: u16 = kani::any();
+    let max_premium_bps: i16 = kani::any();
+    let max_rate_e9: i16 = kani::any();
+
+    kani::assume(mark > 0);
+    kani::assume(index > 0);
+    kani::assume(horizon > 0);
+    kani::assume(max_premium_bps >= 0);
+    kani::assume(max_rate_e9 >= 0);
+
+    let rate = funding_rate_e9_from_mark_index(
+        mark as u64,
+        index as u64,
+        horizon as u64,
+        k_bps as u64,
+        max_premium_bps as i64,
+        max_rate_e9 as i64,
+    )
+    .expect("nonnegative caps must be accepted");
+
+    if mark > index {
+        assert!(rate >= 0, "positive premium must not produce negative rate");
+    } else if mark < index {
+        assert!(rate <= 0, "negative premium must not produce positive rate");
+    } else {
+        assert_eq!(rate, 0, "zero premium must produce zero rate");
+    }
 }
 
 // ============================================================================
