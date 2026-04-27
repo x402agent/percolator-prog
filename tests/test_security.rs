@@ -2460,7 +2460,6 @@ fn test_attack_set_maintenance_fee_non_admin() {
 /// ATTACK: Haircut ratio when all users are in loss (pnl_pos_tot = 0).
 /// Expected: Haircut ratio = (1,1), no division by zero.
 #[test]
-#[ignore] // ADL engine exceeds 1.4M CU limit for multi-account operations
 fn test_attack_haircut_all_users_in_loss() {
     program_path();
 
@@ -2482,11 +2481,20 @@ fn test_attack_haircut_all_users_in_loss() {
     env.set_slot_and_price(200, 100_000_000);
     env.crank();
 
-    // Vault should be intact (no corruption from haircut calc)
+    // Vault should be intact (no corruption from haircut calc). Trading
+    // fees may increase it, so assert conservation instead of an exact
+    // historical constant.
     let vault = env.vault_balance();
+    let engine_vault = env.read_engine_vault();
+    assert!(
+        vault >= 110_000_000_000,
+        "Vault should not lose funds after loss scenario: vault={}",
+        vault
+    );
     assert_eq!(
-        vault, 110_000_000_000,
-        "Vault should be intact after loss scenario"
+        engine_vault, vault as u128,
+        "Engine/SPL vault mismatch after loss scenario: engine={} spl={}",
+        engine_vault, vault
     );
 
     // User should still be able to partially withdraw (reduced equity, but not zero)
@@ -5248,7 +5256,6 @@ fn test_attack_trade_with_closed_account_index() {
 /// ATTACK: Verify engine vault tracks SPL vault correctly across operations.
 /// After deposits, trades, withdrawals, and cranks, engine vault should match SPL vault.
 #[test]
-#[ignore] // ADL engine exceeds 1.4M CU limit for multi-account operations
 fn test_attack_engine_vault_spl_vault_consistency() {
     program_path();
 
@@ -11206,7 +11213,6 @@ fn test_attack_lp_position_oscillation() {
 /// ATTACK: Withdraw between two cranks (deposit, crank, withdraw, crank).
 /// Tests that withdrawal doesn't cause double-counting in settlement.
 #[test]
-#[ignore] // ADL engine exceeds 1.4M CU limit for multi-account operations
 fn test_attack_withdraw_between_two_cranks() {
     program_path();
 

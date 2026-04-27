@@ -5848,13 +5848,11 @@ pub mod processor {
                     }
                     buf.recompute_min();
 
-                    // Phase C: progressive discovery scan.
-                    // Wrap on the MARKET's configured capacity (params.max_accounts),
-                    // not the compile-time MAX_ACCOUNTS. Otherwise a small market
-                    // (e.g. max_accounts=64) wastes cranks walking slots 64..4095
-                    // that by construction can never be in use — the risk buffer
-                    // would take thousands of cranks to rediscover a newly-risky
-                    // low-indexed account after the cursor passed it.
+                    // Phase C: progressive discovery scan over the used-account
+                    // bitmap. The budget is spent on live slots, not empty
+                    // storage indices; sparse markets can therefore refill the
+                    // risk buffer in one crank instead of waiting for a dense
+                    // cursor window to walk across empty slots.
                     let scan_mod = engine.params.max_accounts as usize;
                     let scan_mod = if scan_mod == 0 || scan_mod > percolator::MAX_ACCOUNTS {
                         percolator::MAX_ACCOUNTS
@@ -5862,20 +5860,79 @@ pub mod processor {
                         scan_mod
                     };
                     let scan_start = (buf.scan_cursor as usize) % scan_mod;
-                    for offset in 0..crate::constants::RISK_SCAN_WINDOW {
-                        let idx = (scan_start + offset) % scan_mod;
-                        if !idx_used_in_market(engine, idx) {
+                    let mut used_seen = 0usize;
+                    let mut next_cursor = scan_start;
+                    let mut completed_cycle = true;
+
+                    'scan: for pass in 0..2usize {
+                        let (range_start, range_end) = if pass == 0 {
+                            (scan_start, scan_mod)
+                        } else {
+                            (0usize, scan_start)
+                        };
+                        if range_start >= range_end {
                             continue;
                         }
-                        let eff = effective_pos_q_checked(engine, idx)?;
-                        if eff == 0 {
-                            continue;
+
+                        let first_word = range_start >> 6;
+                        let last_word = (range_end - 1) >> 6;
+                        let mut word_cursor = first_word;
+                        while word_cursor <= last_word {
+                            let word_base = word_cursor * 64;
+                            let lower_bit = if word_cursor == first_word {
+                                range_start & 63
+                            } else {
+                                0
+                            };
+                            let upper_bit_exclusive = if word_cursor == last_word {
+                                ((range_end - 1) & 63) + 1
+                            } else {
+                                64
+                            };
+                            let lower_mask = if lower_bit == 0 {
+                                u64::MAX
+                            } else {
+                                !((1u64 << lower_bit).wrapping_sub(1))
+                            };
+                            let upper_mask = if upper_bit_exclusive == 64 {
+                                u64::MAX
+                            } else {
+                                (1u64 << upper_bit_exclusive) - 1
+                            };
+                            let mut bits = engine.used[word_cursor] & lower_mask & upper_mask;
+
+                            while bits != 0 {
+                                let bit = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                let idx = word_base + bit;
+                                if !idx_used_in_market(engine, idx) {
+                                    continue;
+                                }
+                                used_seen += 1;
+                                let eff = effective_pos_q_checked(engine, idx)?;
+                                if eff == 0 {
+                                    buf.remove(idx as u16);
+                                } else {
+                                    let notional = risk_notional_ceil(eff, price);
+                                    buf.upsert(idx as u16, notional);
+                                }
+                                next_cursor = (idx + 1) % scan_mod;
+                                if used_seen >= crate::constants::RISK_SCAN_WINDOW {
+                                    completed_cycle = false;
+                                    break 'scan;
+                                }
+                            }
+
+                            word_cursor += 1;
                         }
-                        let notional = risk_notional_ceil(eff, price);
-                        buf.upsert(idx as u16, notional);
                     }
-                    buf.scan_cursor =
-                        ((scan_start + crate::constants::RISK_SCAN_WINDOW) % scan_mod) as u16;
+                    if completed_cycle {
+                        // Completed a full bitmap cycle before spending the
+                        // used-account budget. Restart from the same point on
+                        // the next crank; every used slot has just been seen.
+                        next_cursor = scan_start;
+                    }
+                    buf.scan_cursor = next_cursor as u16;
 
                     // Phase D: ingest caller-supplied candidates
                     for &(cidx, _) in candidates.iter() {

@@ -240,10 +240,12 @@ fn test_buffer_survives_empty_crank() {
         "Buffer must persist through empty-candidate crank"
     );
 
-    // Scan cursor must advance
+    // Sparse markets can complete a full bitmap cycle in one crank and reset
+    // the cursor to the same point. The important invariant is that live
+    // buffer entries survive and the cursor stays valid.
     assert!(
-        buf_after.scan_cursor > buf_before.scan_cursor,
-        "Scan cursor must advance: before={} after={}",
+        (buf_after.scan_cursor as usize) < MAX_ACCOUNTS,
+        "Scan cursor must stay in range: before={} after={}",
         buf_before.scan_cursor,
         buf_after.scan_cursor
     );
@@ -272,19 +274,23 @@ fn test_scan_cursor_wraps() {
     env.top_up_insurance(&admin, 1_000_000_000);
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
 
-    // Cursor advances by RISK_SCAN_WINDOW (32) per crank, mod MAX_ACCOUNTS.
-    // set_slot + deposit/trade helpers may internally crank, so the exact
-    // final offset isn't predictable — assert the advance is a non-zero
-    // multiple of 32, which is the window invariant.
-    let before = env.read_risk_buffer().scan_cursor as u32;
-    for i in 0..5u64 {
-        env.set_slot(200 + i * 10);
-        env.crank();
-    }
-    let after = env.read_risk_buffer().scan_cursor as u32;
-    let delta = after.wrapping_sub(before) % (MAX_ACCOUNTS as u32);
-    assert!(delta > 0 && delta % 32 == 0,
-        "scan_cursor delta must be a non-zero multiple of 32: before={before} after={after} delta={delta}");
+    // Start near the physical end. The bitmap scan should wrap and still see
+    // the low-index LP/user positions in the same crank.
+    set_risk_buffer_scan_cursor_for_test(&mut env, (MAX_ACCOUNTS - 1) as u16);
+    env.set_slot(200);
+    env.crank();
+
+    let buf = env.read_risk_buffer();
+    assert!(
+        (buf.scan_cursor as usize) < MAX_ACCOUNTS,
+        "scan_cursor must remain in range after wrap: {}",
+        buf.scan_cursor
+    );
+    assert!(buf.find(lp_idx).is_some(), "wrapped scan must see LP");
+    assert!(
+        buf.find(user_idx).is_some(),
+        "wrapped scan must see low-index user"
+    );
 }
 
 // ============================================================================
@@ -428,8 +434,11 @@ fn test_empty_buffer_first_crank() {
     env.crank();
 
     let buf = env.read_risk_buffer();
-    // Scan cursor should advance even with no accounts
-    assert!(buf.scan_cursor > 0, "Scan cursor must advance after crank");
+    assert_eq!(buf.count, 0, "Empty market must keep empty risk buffer");
+    assert!(
+        (buf.scan_cursor as usize) < MAX_ACCOUNTS,
+        "Scan cursor must remain valid after empty crank"
+    );
 }
 
 // ============================================================================
@@ -910,51 +919,63 @@ fn test_crank_scan_refills_after_buffer_entries_are_liquidated() {
     }
 }
 
-/// If the scan window misses lower-ranked live positions, honest keeper
-/// candidates still refill holes in Phase D after Phase A removes liquidated
-/// buffer entries.
+/// If the bitmap scan spends its used-account budget before reaching a live
+/// position, honest keeper candidates still refill holes in Phase D.
 #[test]
-fn test_crank_candidate_refills_when_scan_window_misses() {
-    let (mut env, lp_idx, risky, survivors) = setup_risk_buffer_refill_market();
+fn test_crank_candidate_refills_after_bitmap_scan_budget_exhausted() {
+    use bytemuck::Zeroable;
 
-    // Force the progressive scan to miss the low-index survivor accounts.
-    // The candidate list below is the only same-crank refill source.
-    set_risk_buffer_scan_cursor_for_test(&mut env, 32);
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
 
-    env.set_slot_and_price_raw_no_walk(149, 138_000_000);
-    crank_with_candidates_for_test(&mut env, &survivors);
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
 
-    for &idx in &risky {
-        assert_eq!(
-            env.read_account_position(idx),
-            0,
-            "risky account {idx} should be liquidated by the crank"
-        );
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // Create enough empty-but-used accounts before the candidate to exhaust
+    // Phase C's used-account scan budget. These consume bitmap scan budget but
+    // have no position, so they should not refill the risk buffer.
+    for _ in 0..percolator_prog::constants::RISK_SCAN_WINDOW {
+        let filler = Keypair::new();
+        let _idx = env.init_user(&filler);
     }
+
+    let survivor = Keypair::new();
+    let survivor_idx = env.init_user(&survivor);
+    env.deposit(&survivor, survivor_idx, 10_000_000_000);
+    env.trade(&survivor, &lp, lp_idx, survivor_idx, 5_000_000);
+
+    write_risk_buffer_for_test(
+        &mut env,
+        &percolator_prog::risk_buffer::RiskBuffer::zeroed(),
+    );
+    set_risk_buffer_scan_cursor_for_test(&mut env, 0);
+
+    env.set_slot(200);
+    crank_with_candidates_for_test(&mut env, &[survivor_idx]);
 
     let buf = env.read_risk_buffer();
-    assert_eq!(
-        buf.count, 4,
-        "candidate refill should restore the full buffer"
+    assert!(buf.find(lp_idx).is_some(), "Phase C should refill LP");
+    assert!(
+        buf.find(survivor_idx).is_some(),
+        "candidate Phase D should refill account after scan budget is exhausted"
     );
-    assert!(buf.find(lp_idx).is_some(), "LP should remain in buffer");
-    for &idx in &survivors {
-        assert!(
-            buf.find(idx).is_some(),
-            "candidate Phase D should refill survivor account {idx}"
-        );
-    }
 }
 
-/// If both the scan window and caller candidates miss lower-ranked live
-/// positions, the buffer may remain temporarily underfull; once the scan cursor
-/// reaches those accounts, the next crank refills it.
+/// Sparse bitmap scanning wraps to lower-ranked live positions even when the
+/// cursor starts past them; holes are refilled in the same crank without
+/// requiring candidates.
 #[test]
-fn test_crank_refill_is_progressive_when_scan_and_candidates_miss() {
+fn test_crank_bitmap_scan_wraps_to_sparse_survivors_when_cursor_starts_past_them() {
     let (mut env, lp_idx, risky, survivors) = setup_risk_buffer_refill_market();
 
-    // Model the "scan cursor is elsewhere" corner case without spending 128
-    // cranks to wrap a 4096-account market in the test harness.
+    // Cursor starts after all used accounts. Phase C must scan the bitmap,
+    // wrap, and consume live accounts rather than spending its budget on the
+    // empty dense range 32..63.
     set_risk_buffer_scan_cursor_for_test(&mut env, 32);
 
     env.set_slot_and_price_raw_no_walk(149, 138_000_000);
@@ -967,34 +988,11 @@ fn test_crank_refill_is_progressive_when_scan_and_candidates_miss() {
             "risky account {idx} should be liquidated by the crank"
         );
     }
-
-    let buf_after_miss = env.read_risk_buffer();
-    assert!(
-        buf_after_miss.count < 4,
-        "buffer should remain underfull when both scan and candidates miss: count={}",
-        buf_after_miss.count
-    );
-    assert!(
-        buf_after_miss.find(lp_idx).is_some(),
-        "LP should remain in the partially cleared buffer"
-    );
-    for &idx in &survivors {
-        assert!(
-            buf_after_miss.find(idx).is_none(),
-            "survivor account {idx} should not be refilled until scanned or supplied"
-        );
-    }
-
-    // Model eventual cursor wrap to the low-index accounts and verify the
-    // normal scan path refills the buffer.
-    set_risk_buffer_scan_cursor_for_test(&mut env, 0);
-    env.set_slot_and_price_raw_no_walk(150, 138_000_000);
-    crank_with_candidates_for_test(&mut env, &[]);
 
     let buf_after_refill = env.read_risk_buffer();
     assert_eq!(
         buf_after_refill.count, 4,
-        "later scan should restore the full buffer"
+        "bitmap scan should restore the full buffer in one sparse-market crank"
     );
     assert!(
         buf_after_refill.find(lp_idx).is_some(),
@@ -1003,7 +1001,7 @@ fn test_crank_refill_is_progressive_when_scan_and_candidates_miss() {
     for &idx in &survivors {
         assert!(
             buf_after_refill.find(idx).is_some(),
-            "later scan should refill survivor account {idx}"
+            "bitmap scan should refill survivor account {idx}"
         );
     }
 }
