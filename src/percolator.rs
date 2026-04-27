@@ -243,6 +243,11 @@ pub mod constants {
     /// admin was burned. 10_000_000 slots is ~50 days at 2 slots/s, far beyond
     /// any reasonable grace period but well short of the saturation regime.
     pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
+    /// Maximum profit-maturity horizon (`RiskParams.h_max`) accepted by the
+    /// wrapper. This is a product safety bound, not an arithmetic envelope:
+    /// h_max is independent from `max_accrual_dt_slots` and oracle staleness.
+    /// 2_160_000 slots is ~10 days at 400 ms/slot.
+    pub const MAX_PROFIT_MATURITY_SLOTS: u64 = 2_160_000;
     /// InitMarket wire flag packed into insurance_withdraw_max_bps. When set,
     /// WithdrawInsuranceLimited can withdraw only explicit TopUpInsurance
     /// principal; insurance growth from fees/liquidations remains behind.
@@ -1948,7 +1953,11 @@ pub mod ix {
         // §1.4 requires `cfg_max_price_move_bps_per_slot > 0`. Reject before
         // any engine call so the error surfaces as `InvalidConfigParam`
         // rather than an engine-side panic.
-        if h_max == 0 || h_max < h_min || max_price_move_bps_per_slot == 0 {
+        if h_max == 0
+            || h_max < h_min
+            || h_max > crate::constants::MAX_PROFIT_MATURITY_SLOTS
+            || max_price_move_bps_per_slot == 0
+        {
             return Err(crate::error::PercolatorError::InvalidConfigParam.into());
         }
 
@@ -4484,7 +4493,10 @@ pub mod processor {
                 if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                if risk_params.h_max == 0 || risk_params.h_max < risk_params.h_min {
+                if risk_params.h_max == 0
+                    || risk_params.h_max < risk_params.h_min
+                    || risk_params.h_max > crate::constants::MAX_PROFIT_MATURITY_SLOTS
+                {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 let insurance_withdraw_deposits_only = (insurance_withdraw_max_bps
@@ -4577,14 +4589,6 @@ pub mod processor {
                 // no account can act on stale capital. New accounts are never
                 // back-charged (engine Goal 47: last_fee_slot seeded at
                 // materialization).
-                // §14.1: H_max must not exceed permissionless resolve delay.
-                // Otherwise warmup cohorts could mature after the market is already
-                // permissionlessly resolved, creating inconsistent terminal state.
-                if permissionless_resolve_stale_slots > 0
-                    && risk_params.h_max > permissionless_resolve_stale_slots
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
                 // §12.19.6: permissionless resolution must fire within a
                 // single accrue envelope, else the last accrue on the
                 // market would exceed `max_accrual_dt_slots` and starve
@@ -4763,7 +4767,10 @@ pub mod processor {
                     {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    if p.h_max == 0 || p.h_max < p.h_min {
+                    if p.h_max == 0
+                        || p.h_max < p.h_min
+                        || p.h_max > crate::constants::MAX_PROFIT_MATURITY_SLOTS
+                    {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     // Settlement deviation band: 0 <= bps <= MAX per spec

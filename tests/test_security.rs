@@ -1685,8 +1685,8 @@ fn test_attack_warmup_long_period_withdraw_attempt() {
     program_path();
 
     let mut env = TestEnv::new();
-    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100. Use the
-    // max legal envelope; the test still verifies no early withdraw.
+    // Use a short maturity horizon so the test stays fast; long horizons are
+    // accepted independently from accrual/staleness and covered below.
     env.init_market_with_warmup(0, 50);
 
     let lp = Keypair::new();
@@ -3452,7 +3452,7 @@ fn test_attack_warmup_prevents_immediate_profit_withdrawal() {
     program_path();
 
     let mut env = TestEnv::new();
-    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    // Use a short maturity horizon so this withdrawal test stays fast.
     env.init_market_with_warmup(0, 50);
 
     let lp = Keypair::new();
@@ -11439,7 +11439,7 @@ fn test_attack_warmup_partial_close_vesting() {
     program_path();
 
     let mut env = TestEnv::new();
-    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    // Use a short maturity horizon so this vesting test stays fast.
     env.init_market_with_warmup(0, 50);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -13106,6 +13106,7 @@ const MAX_RISK_LP_CAPITAL: u64 = 100_000_000_000;
 const MAX_RISK_INSURANCE: u64 = 1_000_000_000;
 const MAX_RISK_LEVERAGE_MILLI: u128 = 19_900;
 const MAX_RISK_CLAMP_BPS: u64 = 49;
+const MAX_RISK_H_MAX: u64 = 86_400;
 
 #[derive(Debug, Clone, Copy)]
 enum MaxRiskCrankSchedule {
@@ -13130,7 +13131,11 @@ struct MaxRiskActor {
     direction: i8,
 }
 
-fn encode_init_market_bounty_sol_20x_max(admin: &Pubkey, mint: &Pubkey) -> Vec<u8> {
+fn encode_init_market_bounty_sol_20x_with_h_max(
+    admin: &Pubkey,
+    mint: &Pubkey,
+    h_max: u64,
+) -> Vec<u8> {
     let mut data = vec![0u8];
     data.extend_from_slice(admin.as_ref());
     data.extend_from_slice(mint.as_ref());
@@ -13143,14 +13148,16 @@ fn encode_init_market_bounty_sol_20x_max(admin: &Pubkey, mint: &Pubkey) -> Vec<u
     data.extend_from_slice(&0u128.to_le_bytes());
 
     // RiskParams wire fields. This mirrors ../percolator-stress/max_risk.md's
-    // 20x SOL bounty market with h_min = 0 enabled as a product feature.
+    // 20x SOL bounty market: h_min = 0 is a product feature, while h_max is
+    // the long profit-maturity horizon and is intentionally independent from
+    // max_accrual_dt_slots / permissionless stale resolution.
     data.extend_from_slice(&0u64.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes());
     data.extend_from_slice(&1u64.to_le_bytes());
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
     data.extend_from_slice(&1u128.to_le_bytes());
-    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&h_max.to_le_bytes());
     data.extend_from_slice(&9u64.to_le_bytes());
     data.extend_from_slice(&5u64.to_le_bytes());
     data.extend_from_slice(&50_000_000_000u128.to_le_bytes());
@@ -13170,6 +13177,10 @@ fn encode_init_market_bounty_sol_20x_max(admin: &Pubkey, mint: &Pubkey) -> Vec<u
     data.extend_from_slice(&0u64.to_le_bytes());
     data.extend_from_slice(&10u64.to_le_bytes());
     data
+}
+
+fn encode_init_market_bounty_sol_20x_max(admin: &Pubkey, mint: &Pubkey) -> Vec<u8> {
+    encode_init_market_bounty_sol_20x_with_h_max(admin, mint, MAX_RISK_H_MAX)
 }
 
 fn try_crank_with_candidate_indices(env: &mut TestEnv, candidates: &[u16]) -> Result<(), String> {
@@ -13634,6 +13645,33 @@ fn test_attack_max_risk_edge_sweep_no_insurance_drain() {
     println!(
         "max-risk edge sweep PASS_SAFE: cases={cases_run}, closest_min_minus_start={closest_margin}"
     );
+}
+
+#[test]
+fn test_attack_profit_maturity_cap_independent_from_accrual_window() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
+    let data = encode_init_market_bounty_sol_20x_with_h_max(
+        &env.payer.pubkey(),
+        &env.mint,
+        percolator_prog::constants::MAX_PROFIT_MATURITY_SLOTS,
+    );
+    env.try_init_market_raw(data)
+        .expect("10-day profit maturity cap should be accepted independently from max_dt=10");
+
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
+    let data = encode_init_market_bounty_sol_20x_with_h_max(
+        &env.payer.pubkey(),
+        &env.mint,
+        percolator_prog::constants::MAX_PROFIT_MATURITY_SLOTS + 1,
+    );
+    let err = env
+        .try_init_market_raw(data)
+        .expect_err("profit maturity beyond wrapper cap should be rejected");
+    println!("profit maturity above cap rejected as expected: {err}");
 }
 
 fn run_max_risk_pingpong_probe(label: &str, first_direction: i8) -> (u128, u128, u128) {
