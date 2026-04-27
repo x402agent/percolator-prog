@@ -57,7 +57,9 @@ use percolator_prog::policy::{
     no_oracle_fee_sync_anchor,
     nonce_on_failure,
     nonce_on_success,
+    oversized_crank_catchup_target,
     owner_ok,
+    partial_crank_config_fields_to_write,
     pda_key_matches,
     // New: Oracle unit scale math
     scale_price_e6,
@@ -68,9 +70,11 @@ use percolator_prog::policy::{
     trade_cpi_allowed_after_oracle_read,
     user_value_op_allowed_after_accrual,
     writable_ok,
+    CrankCatchupTarget,
     MatcherAccountsShape,
     // ABI validation from real inputs
     MatcherReturnFields,
+    PartialCrankConfigFields,
     SimpleDecision,
     SlabShape,
     TradeCpiDecision,
@@ -3147,7 +3151,171 @@ fn kani_account_limited_ops_reject_exposed_market_progress() {
 }
 
 // =============================================================================
-// X. TARGET-LAG USER OP POLICY (4 proofs)
+// X. KEEPERCRANK PARTIAL-CATCHUP POLICY (4 proofs)
+// =============================================================================
+
+/// Prove: when KeeperCrank chooses a partial catchup target, that target is a
+/// strict, bounded progress point between the engine's current market slot and
+/// the observed wall-clock slot.
+#[kani::proof]
+fn kani_crank_partial_catchup_target_is_bounded_progress() {
+    let max_dt: u64 = kani::any::<u16>() as u64;
+    let chunks: u64 = kani::any::<u8>() as u64;
+    let last_slot: u64 = kani::any::<u32>() as u64;
+    let now_slot: u64 = kani::any::<u32>() as u64;
+    let last_price: u64 = kani::any::<u32>() as u64;
+    let fresh_price: u64 = kani::any::<u32>() as u64;
+    let funding_rate: i128 = kani::any();
+    let oi_long: u128 = kani::any::<u32>() as u128;
+    let oi_short: u128 = kani::any::<u32>() as u128;
+    let fund_px_last: u64 = kani::any::<u32>() as u64;
+
+    if let CrankCatchupTarget::Target(target) = oversized_crank_catchup_target(
+        max_dt,
+        chunks,
+        last_slot,
+        now_slot,
+        last_price,
+        fresh_price,
+        funding_rate,
+        oi_long,
+        oi_short,
+        fund_px_last,
+    ) {
+        let max_step = max_dt.saturating_mul(chunks);
+        assert!(target > last_slot, "partial catchup must move forward");
+        assert!(
+            target < now_slot,
+            "partial catchup must not consume the wall-clock observation"
+        );
+        assert_eq!(
+            target - last_slot,
+            max_step,
+            "partial catchup target must be exactly one bounded chunk"
+        );
+        assert!(
+            now_slot - target < now_slot - last_slot,
+            "partial catchup must strictly reduce the remaining gap"
+        );
+    }
+}
+
+/// Prove: KeeperCrank does not select partial catchup for no-op conditions.
+/// Flat/no-price-move/no-funding cases can use the normal full path.
+#[kani::proof]
+fn kani_crank_partial_catchup_noops_do_not_partial() {
+    let max_dt: u64 = kani::any();
+    let chunks: u64 = kani::any();
+    let last_slot: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    let last_price: u64 = kani::any();
+    let fund_px_last: u64 = kani::any();
+
+    assert_eq!(
+        oversized_crank_catchup_target(
+            max_dt,
+            chunks,
+            last_slot,
+            now_slot,
+            last_price,
+            last_price,
+            0,
+            0,
+            0,
+            fund_px_last,
+        ),
+        CrankCatchupTarget::None,
+        "flat/no-op catchup should not enter partial mode"
+    );
+}
+
+/// Prove: an oversized exposed price move always selects the exact bounded
+/// partial target.
+#[kani::proof]
+fn kani_crank_partial_catchup_exposed_price_move_selects_target() {
+    let max_dt_raw: u8 = kani::any();
+    let chunks_raw: u8 = kani::any();
+    let last_slot: u64 = kani::any::<u16>() as u64;
+    let gap_extra: u8 = kani::any();
+    let last_price: u64 = kani::any::<u16>() as u64;
+    let fresh_price: u64 = kani::any::<u16>() as u64;
+    let oi_long: u128 = kani::any::<u16>() as u128;
+
+    let max_dt = max_dt_raw as u64 + 1;
+    let chunks = chunks_raw as u64 + 1;
+    let max_step = max_dt.saturating_mul(chunks);
+    let target = last_slot + max_step;
+    let extra = gap_extra as u64 + 1;
+    let now_slot = target + extra;
+
+    kani::assume(last_price > 0);
+    kani::assume(fresh_price != last_price);
+    kani::assume(oi_long != 0);
+
+    match oversized_crank_catchup_target(
+        max_dt,
+        chunks,
+        last_slot,
+        now_slot,
+        last_price,
+        fresh_price,
+        0,
+        oi_long,
+        0,
+        0,
+    ) {
+        CrankCatchupTarget::Target(actual) => assert_eq!(
+            actual, target,
+            "oversized exposed price move must partial-catchup to last + max_step"
+        ),
+        CrankCatchupTarget::None => {
+            assert!(false, "oversized exposed price move must select a target")
+        }
+    }
+}
+
+/// Prove: partial-crank config write rolls back effective/index fields and
+/// preserves only fresh liveness/target plus fee cursor state.
+#[kani::proof]
+fn kani_partial_crank_config_write_field_sources() {
+    let before = PartialCrankConfigFields {
+        last_effective_price_e6: kani::any(),
+        last_hyperp_index_slot: kani::any(),
+        last_good_oracle_slot: kani::any(),
+        last_oracle_publish_time: kani::any(),
+        oracle_target_price_e6: kani::any(),
+        oracle_target_publish_time: kani::any(),
+        fee_sweep_cursor_word: kani::any(),
+        fee_sweep_cursor_bit: kani::any(),
+    };
+    let after = PartialCrankConfigFields {
+        last_effective_price_e6: kani::any(),
+        last_hyperp_index_slot: kani::any(),
+        last_good_oracle_slot: kani::any(),
+        last_oracle_publish_time: kani::any(),
+        oracle_target_price_e6: kani::any(),
+        oracle_target_publish_time: kani::any(),
+        fee_sweep_cursor_word: kani::any(),
+        fee_sweep_cursor_bit: kani::any(),
+    };
+
+    let out = partial_crank_config_fields_to_write(before, after);
+
+    assert_eq!(out.last_effective_price_e6, before.last_effective_price_e6);
+    assert_eq!(out.last_hyperp_index_slot, before.last_hyperp_index_slot);
+    assert_eq!(out.last_good_oracle_slot, after.last_good_oracle_slot);
+    assert_eq!(out.last_oracle_publish_time, after.last_oracle_publish_time);
+    assert_eq!(out.oracle_target_price_e6, after.oracle_target_price_e6);
+    assert_eq!(
+        out.oracle_target_publish_time,
+        after.oracle_target_publish_time
+    );
+    assert_eq!(out.fee_sweep_cursor_word, after.fee_sweep_cursor_word);
+    assert_eq!(out.fee_sweep_cursor_bit, after.fee_sweep_cursor_bit);
+}
+
+// =============================================================================
+// Y. TARGET-LAG USER OP POLICY (4 proofs)
 // =============================================================================
 
 /// Prove: target_lag_pending is exactly "selected raw target is nonzero and
@@ -3241,7 +3409,7 @@ fn kani_trade_cpi_pre_cpi_allowed_iff_no_post_read_lag() {
 }
 
 // =============================================================================
-// Y. CONFIGURED ACCOUNT CAPACITY (1 proof)
+// Z. CONFIGURED ACCOUNT CAPACITY (1 proof)
 // =============================================================================
 
 /// Prove: a wrapper account index is accepted only when it is inside both the
@@ -3264,7 +3432,7 @@ fn kani_market_idx_within_capacity_universal() {
 }
 
 // =============================================================================
-// Z. FEE-SYNC ANCHOR POLICY (3 proofs)
+// AA. FEE-SYNC ANCHOR POLICY (3 proofs)
 // =============================================================================
 
 /// Prove: live fee-sync anchors are admitted exactly when they do not run past

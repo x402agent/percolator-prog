@@ -565,6 +565,89 @@ pub mod policy {
         !price_move_active && !funding_active
     }
 
+    /// KeeperCrank partial-catchup decision. When the market clock is too far
+    /// behind for one full inline catchup, the crank may commit one bounded
+    /// chunk at stored P_last only if price/funding progress is equity-active.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CrankCatchupTarget {
+        None,
+        Target(u64),
+    }
+
+    #[inline]
+    pub fn oversized_crank_catchup_target(
+        max_accrual_dt_slots: u64,
+        chunks_per_instruction: u64,
+        last_market_slot: u64,
+        now_slot: u64,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        fund_px_last: u64,
+    ) -> CrankCatchupTarget {
+        if max_accrual_dt_slots == 0
+            || chunks_per_instruction == 0
+            || now_slot <= last_market_slot
+            || last_oracle_price == 0
+        {
+            return CrankCatchupTarget::None;
+        }
+
+        let gap = now_slot - last_market_slot;
+        let max_step = max_accrual_dt_slots.saturating_mul(chunks_per_instruction);
+        if max_step == 0 || gap <= max_step {
+            return CrankCatchupTarget::None;
+        }
+
+        let oi_any = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        let funding_active =
+            funding_rate_e9 != 0 && oi_eff_long_q != 0 && oi_eff_short_q != 0 && fund_px_last > 0;
+        let price_move_active = fresh_price != last_oracle_price && oi_any;
+        if !funding_active && !price_move_active {
+            return CrankCatchupTarget::None;
+        }
+
+        // Since gap > max_step and gap = now - last, last + max_step is
+        // strictly before now and cannot overflow.
+        CrankCatchupTarget::Target(last_market_slot + max_step)
+    }
+
+    /// The subset of MarketConfig fields that a partial crank catchup is
+    /// allowed to choose between "before read" and "after read/sweep" values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PartialCrankConfigFields {
+        pub last_effective_price_e6: u64,
+        pub last_hyperp_index_slot: u64,
+        pub last_good_oracle_slot: u64,
+        pub last_oracle_publish_time: i64,
+        pub oracle_target_price_e6: u64,
+        pub oracle_target_publish_time: i64,
+        pub fee_sweep_cursor_word: u64,
+        pub fee_sweep_cursor_bit: u64,
+    }
+
+    /// Partial crank catchup must preserve the fresh liveness/target data and
+    /// fee-sweep cursor, while rolling back effective/index fields that the
+    /// engine has not reached yet.
+    #[inline]
+    pub fn partial_crank_config_fields_to_write(
+        before_read: PartialCrankConfigFields,
+        after_read_and_sweep: PartialCrankConfigFields,
+    ) -> PartialCrankConfigFields {
+        PartialCrankConfigFields {
+            last_effective_price_e6: before_read.last_effective_price_e6,
+            last_hyperp_index_slot: before_read.last_hyperp_index_slot,
+            last_good_oracle_slot: after_read_and_sweep.last_good_oracle_slot,
+            last_oracle_publish_time: after_read_and_sweep.last_oracle_publish_time,
+            oracle_target_price_e6: after_read_and_sweep.oracle_target_price_e6,
+            oracle_target_publish_time: after_read_and_sweep.oracle_target_publish_time,
+            fee_sweep_cursor_word: after_read_and_sweep.fee_sweep_cursor_word,
+            fee_sweep_cursor_bit: after_read_and_sweep.fee_sweep_cursor_bit,
+        }
+    }
+
     /// True when the wrapper knows the raw oracle/Hyperp target still differs
     /// from the engine's last effective accrued price.
     #[inline]
@@ -3933,51 +4016,62 @@ pub mod processor {
         price: u64,
         funding_rate_e9: i128,
     ) -> Result<Option<u64>, ProgramError> {
-        let max_dt = engine.params.max_accrual_dt_slots;
-        if max_dt == 0 || now_slot <= engine.last_market_slot || engine.last_oracle_price == 0 {
-            return Ok(None);
+        match crate::policy::oversized_crank_catchup_target(
+            engine.params.max_accrual_dt_slots,
+            CATCHUP_CHUNKS_MAX as u64,
+            engine.last_market_slot,
+            now_slot,
+            engine.last_oracle_price,
+            price,
+            funding_rate_e9,
+            engine.oi_eff_long_q,
+            engine.oi_eff_short_q,
+            engine.fund_px_last,
+        ) {
+            crate::policy::CrankCatchupTarget::None => Ok(None),
+            crate::policy::CrankCatchupTarget::Target(target) => Ok(Some(target)),
         }
+    }
 
-        let gap = now_slot
-            .checked_sub(engine.last_market_slot)
-            .ok_or(PercolatorError::EngineOverflow)?;
-        let max_step = max_dt.saturating_mul(CATCHUP_CHUNKS_MAX as u64);
-        if max_step == 0 || gap <= max_step {
-            return Ok(None);
+    fn partial_crank_config_fields(
+        config: MarketConfig,
+    ) -> crate::policy::PartialCrankConfigFields {
+        crate::policy::PartialCrankConfigFields {
+            last_effective_price_e6: config.last_effective_price_e6,
+            last_hyperp_index_slot: config.last_hyperp_index_slot,
+            last_good_oracle_slot: config.last_good_oracle_slot,
+            last_oracle_publish_time: config.last_oracle_publish_time,
+            oracle_target_price_e6: config.oracle_target_price_e6,
+            oracle_target_publish_time: config.oracle_target_publish_time,
+            fee_sweep_cursor_word: config.fee_sweep_cursor_word,
+            fee_sweep_cursor_bit: config.fee_sweep_cursor_bit,
         }
+    }
 
-        let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
-        let funding_active = funding_rate_e9 != 0
-            && engine.oi_eff_long_q != 0
-            && engine.oi_eff_short_q != 0
-            && engine.fund_px_last > 0;
-        let price_move_active =
-            engine.last_oracle_price > 0 && price != engine.last_oracle_price && oi_any;
-        if !funding_active && !price_move_active {
-            return Ok(None);
-        }
-
-        engine
-            .last_market_slot
-            .checked_add(max_step)
-            .map(Some)
-            .ok_or(PercolatorError::EngineOverflow.into())
+    fn apply_partial_crank_config_fields(
+        config: &mut MarketConfig,
+        fields: crate::policy::PartialCrankConfigFields,
+    ) {
+        config.last_effective_price_e6 = fields.last_effective_price_e6;
+        config.last_hyperp_index_slot = fields.last_hyperp_index_slot;
+        config.last_good_oracle_slot = fields.last_good_oracle_slot;
+        config.last_oracle_publish_time = fields.last_oracle_publish_time;
+        config.oracle_target_price_e6 = fields.oracle_target_price_e6;
+        config.oracle_target_publish_time = fields.oracle_target_publish_time;
+        config.fee_sweep_cursor_word = fields.fee_sweep_cursor_word;
+        config.fee_sweep_cursor_bit = fields.fee_sweep_cursor_bit;
     }
 
     fn partial_crank_config_to_write(
         before_read: MarketConfig,
         after_read_and_sweep: MarketConfig,
     ) -> MarketConfig {
+        let fields = crate::policy::partial_crank_config_fields_to_write(
+            partial_crank_config_fields(before_read),
+            partial_crank_config_fields(after_read_and_sweep),
+        );
         let mut restored = before_read;
-        // Preserve external-oracle target and liveness data learned by this
-        // crank, but do not persist effective/index fields that would apply a
-        // post-observation price to pre-observation engine time.
-        restored.last_good_oracle_slot = after_read_and_sweep.last_good_oracle_slot;
-        restored.last_oracle_publish_time = after_read_and_sweep.last_oracle_publish_time;
-        restored.oracle_target_price_e6 = after_read_and_sweep.oracle_target_price_e6;
-        restored.oracle_target_publish_time = after_read_and_sweep.oracle_target_publish_time;
-        restored.fee_sweep_cursor_word = after_read_and_sweep.fee_sweep_cursor_word;
-        restored.fee_sweep_cursor_bit = after_read_and_sweep.fee_sweep_cursor_bit;
+        apply_partial_crank_config_fields(&mut restored, fields);
         restored
     }
 
