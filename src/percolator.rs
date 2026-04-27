@@ -512,6 +512,144 @@ pub mod policy {
         s.owned_by_program && s.correct_len
     }
 
+    /// Account-free catchup cannot safely perform equity-active accrual on an
+    /// exposed market. Without a candidate list or account touch set, there is
+    /// no liquidation/revalidation turn between cumulative price/funding moves.
+    #[inline]
+    pub fn account_free_catchup_allows_accrual(
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        fund_px_last: u64,
+    ) -> bool {
+        let exposed = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        if !exposed {
+            return true;
+        }
+
+        let price_move_active = last_oracle_price > 0 && fresh_price != last_oracle_price;
+        let funding_active =
+            funding_rate_e9 != 0 && oi_eff_long_q != 0 && oi_eff_short_q != 0 && fund_px_last > 0;
+
+        !price_move_active && !funding_active
+    }
+
+    /// True when the wrapper knows the raw oracle/Hyperp target still differs
+    /// from the engine's last effective accrued price.
+    #[inline]
+    pub fn target_lag_pending(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        engine_last_oracle_price: u64,
+    ) -> bool {
+        let target = if is_hyperp {
+            hyperp_target_price_e6
+        } else {
+            external_oracle_target_price_e6
+        };
+        target != 0 && target != engine_last_oracle_price
+    }
+
+    /// True when the latest oracle read produced an effective engine price that
+    /// still has not caught up to the raw target. TradeCpi uses this before CPI
+    /// so a matcher is not invoked for a trade the wrapper must reject anyway.
+    #[inline]
+    pub fn target_lag_after_read(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        effective_price_e6: u64,
+    ) -> bool {
+        let target = if is_hyperp {
+            hyperp_target_price_e6
+        } else {
+            external_oracle_target_price_e6
+        };
+        target != 0 && target != effective_price_e6
+    }
+
+    /// Public extraction-sensitive/risk-increasing user operations are allowed
+    /// only after the raw target has caught up to the engine's effective price.
+    #[inline]
+    pub fn user_value_op_allowed_after_accrual(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        engine_last_oracle_price: u64,
+    ) -> bool {
+        !target_lag_pending(
+            is_hyperp,
+            external_oracle_target_price_e6,
+            hyperp_target_price_e6,
+            engine_last_oracle_price,
+        )
+    }
+
+    /// Pre-CPI TradeCpi admission under raw-target/effective-price lag policy.
+    #[inline]
+    pub fn trade_cpi_allowed_after_oracle_read(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        effective_price_e6: u64,
+    ) -> bool {
+        !target_lag_after_read(
+            is_hyperp,
+            external_oracle_target_price_e6,
+            hyperp_target_price_e6,
+            effective_price_e6,
+        )
+    }
+
+    /// Account index must be inside both the compiled hard cap and the
+    /// market's configured account capacity.
+    #[inline]
+    pub fn market_idx_within_capacity(idx: usize, market_max_accounts: u64) -> bool {
+        idx < percolator::MAX_ACCOUNTS && (idx as u64) < market_max_accounts
+    }
+
+    /// Fee sync must never advance beyond the market boundary that has already
+    /// been economically accrued. Live markets use last_market_slot; resolved
+    /// markets use the immutable resolved_slot.
+    #[inline]
+    pub fn fee_sync_anchor_within_accrued_boundary(
+        is_resolved: bool,
+        anchor_slot: u64,
+        last_market_slot: u64,
+        resolved_slot: u64,
+    ) -> bool {
+        if is_resolved {
+            anchor_slot <= resolved_slot
+        } else {
+            anchor_slot <= last_market_slot
+        }
+    }
+
+    /// No-oracle instructions cannot accrue market price/funding state, so they
+    /// may only sync fees up to the already-accrued market boundary. Returning
+    /// None means there is no safe forward fee interval for this instruction.
+    #[inline]
+    pub fn no_oracle_fee_sync_anchor(
+        wallclock_slot: u64,
+        last_market_slot: u64,
+        current_slot: u64,
+        account_last_fee_slot: u64,
+    ) -> Option<u64> {
+        let anchor = if wallclock_slot < last_market_slot {
+            wallclock_slot
+        } else {
+            last_market_slot
+        };
+        if anchor < current_slot || anchor < account_last_fee_slot {
+            None
+        } else {
+            Some(anchor)
+        }
+    }
+
     // =========================================================================
     // Per-instruction authorization helpers
     // =========================================================================
@@ -3243,7 +3381,7 @@ pub mod processor {
         state::{self, MarketConfig, SlabHeader},
         zc,
     };
-    use percolator::{RiskEngine, RiskError, MAX_ACCOUNTS};
+    use percolator::{RiskEngine, RiskError};
 
     // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
     // which handles K-pair PnL, checked arithmetic, and all settlement internally.
@@ -3414,6 +3552,20 @@ pub mod processor {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
+        let is_resolved = engine.is_resolved();
+        let resolved_slot = if is_resolved {
+            engine.resolved_context().1
+        } else {
+            0
+        };
+        if !crate::policy::fee_sync_anchor_within_accrued_boundary(
+            is_resolved,
+            now_slot,
+            engine.last_market_slot,
+            resolved_slot,
+        ) {
+            return Err(PercolatorError::CatchupRequired.into());
+        }
         engine
             .sync_account_fee_to_slot_not_atomic(idx, now_slot, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
@@ -3441,15 +3593,14 @@ pub mod processor {
             return Ok(());
         }
         check_idx(engine, idx)?;
-        let anchor = core::cmp::min(wallclock_slot, engine.last_market_slot);
-        // No-oracle paths must not move fee time beyond the market's
-        // accrued slot. If engine.current_slot or this account's fee
-        // cursor is already past that boundary, there is nothing safe
-        // to realize here; the next oracle-backed op will accrue the
-        // market and cover the tail.
-        if anchor < engine.current_slot || anchor < engine.accounts[idx as usize].last_fee_slot {
+        let Some(anchor) = crate::policy::no_oracle_fee_sync_anchor(
+            wallclock_slot,
+            engine.last_market_slot,
+            engine.current_slot,
+            engine.accounts[idx as usize].last_fee_slot,
+        ) else {
             return Ok(());
-        }
+        };
         engine
             .sync_account_fee_to_slot_not_atomic(idx, anchor, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
@@ -3495,12 +3646,6 @@ pub mod processor {
         Ok(if rem == 0 { max_dt } else { rem })
     }
 
-    fn external_oracle_target_pending(config: &MarketConfig, engine: &RiskEngine) -> bool {
-        !oracle::is_hyperp_mode(config)
-            && config.oracle_target_price_e6 != 0
-            && config.oracle_target_price_e6 != engine.last_oracle_price
-    }
-
     fn hyperp_target_price(config: &MarketConfig) -> u64 {
         if config.mark_ewma_e6 > 0 {
             config.mark_ewma_e6
@@ -3510,12 +3655,12 @@ pub mod processor {
     }
 
     fn oracle_target_pending(config: &MarketConfig, engine: &RiskEngine) -> bool {
-        if oracle::is_hyperp_mode(config) {
-            let target = hyperp_target_price(config);
-            target != 0 && target != engine.last_oracle_price
-        } else {
-            external_oracle_target_pending(config, engine)
-        }
+        !crate::policy::user_value_op_allowed_after_accrual(
+            oracle::is_hyperp_mode(config),
+            config.oracle_target_price_e6,
+            hyperp_target_price(config),
+            engine.last_oracle_price,
+        )
     }
 
     fn reject_any_target_lag(
@@ -3529,12 +3674,12 @@ pub mod processor {
     }
 
     fn target_lag_after_read(config: &MarketConfig, effective_price: u64) -> bool {
-        if oracle::is_hyperp_mode(config) {
-            let target = hyperp_target_price(config);
-            target != 0 && target != effective_price
-        } else {
-            config.oracle_target_price_e6 != 0 && config.oracle_target_price_e6 != effective_price
-        }
+        !crate::policy::trade_cpi_allowed_after_oracle_read(
+            oracle::is_hyperp_mode(config),
+            config.oracle_target_price_e6,
+            hyperp_target_price(config),
+            effective_price,
+        )
     }
 
     fn effective_pos_q_checked(engine: &RiskEngine, idx: usize) -> Result<i128, ProgramError> {
@@ -4109,7 +4254,7 @@ pub mod processor {
 
     #[inline]
     fn idx_within_market_capacity(engine: &RiskEngine, idx: usize) -> bool {
-        idx < MAX_ACCOUNTS && (idx as u64) < engine.params.max_accounts
+        crate::policy::market_idx_within_capacity(idx, engine.params.max_accounts)
     }
 
     #[inline]
@@ -5955,7 +6100,7 @@ pub mod processor {
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CRANK_STATS");
-                    sol_log_64(0xC8A4C, liqs, MAX_ACCOUNTS as u64, ins_low, 0);
+                    sol_log_64(0xC8A4C, liqs, percolator::MAX_ACCOUNTS as u64, ins_low, 0);
                 }
             }
             Instruction::TradeNoCpi {
@@ -8856,11 +9001,10 @@ pub mod processor {
                 //
                 //   COMPLETE — the instruction can advance the engine all
                 //   the way to clock.slot in this single call
-                //   (gap ≤ CATCHUP_CHUNKS_MAX × max_dt). Behaves like any
-                //   ordinary inline accrue-bearing op: oracle read mutates
-                //   config, pre-read rate chunks the historical interval
-                //   at stored P_last, final accrue to clock.slot installs
-                //   the fresh observation. Persist mutated config.
+                //   (gap ≤ CATCHUP_CHUNKS_MAX × max_dt), but only when the
+                //   account-free path is not equity-active for exposed OI.
+                //   Price movement or active funding with OI must use an
+                //   account-touching path such as KeeperCrank/liquidation.
                 //
                 //   PARTIAL  — the gap is too large to finish in one
                 //   call. Oracle is STILL read (liveness proof), but the
@@ -8981,6 +9125,17 @@ pub mod processor {
                     && oi_any;
                 let accrual_active = funding_active || price_move_active;
                 let can_finish = !accrual_active || gap <= max_step_per_call;
+
+                if !crate::policy::account_free_catchup_allows_accrual(
+                    engine.oi_eff_long_q,
+                    engine.oi_eff_short_q,
+                    engine.last_oracle_price,
+                    fresh_price,
+                    funding_rate_e9_pre,
+                    engine.fund_px_last,
+                ) {
+                    return Err(PercolatorError::CatchupRequired.into());
+                }
 
                 if can_finish {
                     // COMPLETE: chunk to clock.slot using stored P_last

@@ -4806,13 +4806,15 @@ fn test_liquidation_fee_goes_to_insurance() {
     );
 }
 
-/// Verify insurance fund absorbs losses when an account goes bankrupt.
-/// After liquidation with deficit, insurance decreases, not vault.
+/// Verify account-touching price catchup liquidates before bankruptcy.
+/// The old account-free catchup path could defer touches until the LP was
+/// bankrupt; the compliant path cranks/touches during the price walk and
+/// credits liquidation fees to insurance instead of draining it.
 #[test]
-fn test_insurance_absorbs_bankruptcy_loss() {
+fn test_account_touching_crank_prevents_bankruptcy_insurance_loss() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 2_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4823,7 +4825,7 @@ fn test_insurance_absorbs_bankruptcy_loss() {
     env.deposit(&user, user_idx, 15_000_000_000);
 
     // User goes long, so the LP takes the short side. A large cap-respecting
-    // price rally bankrupts the LP and leaves a deficit for insurance.
+    // price rally would bankrupt the LP if no account-touching path ran.
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000_000);
 
     // Large insurance to absorb the deficit
@@ -4833,22 +4835,12 @@ fn test_insurance_absorbs_bankruptcy_loss() {
     let ins_before = env.read_insurance_balance();
     let vault_before = env.vault_balance();
 
-    // Price rally: LP's short loss exceeds capital and leaves a deficit. Use
-    // real intermediate oracle observations rather than the helper's crank walk,
-    // because this test must leave liquidation to the explicit call below.
-    for step in 1..=30u64 {
-        let slot = 100 + step * 50;
-        let price = 138_000_000i64 + (207_000_000i64 - 138_000_000i64) * step as i64 / 30;
-        env.set_slot_and_price_raw_no_walk(slot, price);
-        env.try_catchup_accrue()
-            .expect("price path must stay inside the engine envelope");
-    }
-    let result = env.try_liquidate(lp_idx);
-    assert!(
-        result.is_ok(),
-        "Bankrupt liquidation should succeed: {:?}",
-        result
-    );
+    // Price rally: LP's short loss exceeds capital and leaves a deficit. Walk
+    // through the account-touching crank path; account-free CatchupAccrue is
+    // intentionally not allowed to move exposed markets through equity-active
+    // price changes.
+    env.set_slot_and_price(1_500, 207_000_000);
+    env.crank();
 
     let ins_after = env.read_insurance_balance();
     let vault_after = env.vault_balance();
@@ -4856,8 +4848,8 @@ fn test_insurance_absorbs_bankruptcy_loss() {
 
     assert_eq!(lp_pos, 0, "Bankrupt account position must be liquidated");
     assert!(
-        ins_after < ins_before,
-        "Bankrupt liquidation must consume insurance net of fees: before={} after={}",
+        ins_after >= ins_before,
+        "account-touching crank should avoid insurance depletion: before={} after={}",
         ins_before,
         ins_after
     );

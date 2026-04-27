@@ -28,6 +28,7 @@ use percolator_prog::matcher_abi::{
 use percolator_prog::oracle::{clamp_oracle_price, clamp_toward_with_dt, restart_detected};
 use percolator_prog::policy::{
     abi_ok,
+    account_free_catchup_allows_accrual,
     admin_ok,
     cpi_trade_size,
     decide_admin_op,
@@ -41,23 +42,30 @@ use percolator_prog::policy::{
     decision_nonce,
     // Fee-weighted EWMA
     ewma_update,
+    // Account validation helpers
+    fee_sync_anchor_within_accrued_boundary,
     // New: InitMarket scale validation
     init_market_scale_ok,
     // New: Oracle inversion math
     invert_price_e6,
     len_at_least,
     len_ok,
+    market_idx_within_capacity,
     matcher_identity_ok,
     matcher_shape_ok,
+    no_oracle_fee_sync_anchor,
     nonce_on_failure,
     nonce_on_success,
     owner_ok,
     pda_key_matches,
     // New: Oracle unit scale math
     scale_price_e6,
-    // Account validation helpers
     signer_ok,
     slab_shape_ok,
+    target_lag_after_read,
+    target_lag_pending,
+    trade_cpi_allowed_after_oracle_read,
+    user_value_op_allowed_after_accrual,
     writable_ok,
     MatcherAccountsShape,
     // ABI validation from real inputs
@@ -3017,4 +3025,283 @@ fn kani_restart_detected_universal() {
         current > init,
         "restart_detected must return (current > init_restart_slot)"
     );
+}
+
+// =============================================================================
+// W. ACCOUNT-FREE CATCHUP POLICY (3 proofs)
+// =============================================================================
+
+/// Prove: account-free catchup rejects any exposed price move. Price movement
+/// is equity-active whenever any side has OI, so a public catchup instruction
+/// with no account touches must not install it.
+#[kani::proof]
+fn kani_account_free_catchup_rejects_exposed_price_move() {
+    let oi_long: u128 = kani::any();
+    let oi_short: u128 = kani::any();
+    let p_last: u64 = kani::any();
+    let fresh_price: u64 = kani::any();
+    let funding_rate: i128 = kani::any();
+    let fund_px_last: u64 = kani::any();
+
+    kani::assume(oi_long != 0 || oi_short != 0);
+    kani::assume(p_last > 0);
+    kani::assume(fresh_price != p_last);
+
+    assert!(
+        !account_free_catchup_allows_accrual(
+            oi_long,
+            oi_short,
+            p_last,
+            fresh_price,
+            funding_rate,
+            fund_px_last,
+        ),
+        "exposed account-free catchup must reject price movement"
+    );
+}
+
+/// Prove: account-free catchup rejects exposed funding transfer. Funding is
+/// equity-active only when both OI sides and fund_px_last are present.
+#[kani::proof]
+fn kani_account_free_catchup_rejects_exposed_funding() {
+    let oi_long: u128 = kani::any();
+    let oi_short: u128 = kani::any();
+    let p_last: u64 = kani::any();
+    let funding_rate: i128 = kani::any();
+    let fund_px_last: u64 = kani::any();
+
+    kani::assume(oi_long != 0);
+    kani::assume(oi_short != 0);
+    kani::assume(funding_rate != 0);
+    kani::assume(fund_px_last > 0);
+
+    assert!(
+        !account_free_catchup_allows_accrual(
+            oi_long,
+            oi_short,
+            p_last,
+            p_last,
+            funding_rate,
+            fund_px_last,
+        ),
+        "exposed account-free catchup must reject active funding"
+    );
+}
+
+/// Prove: account-free catchup still allows no-op exposed accrual and all flat
+/// market accrual, including flat price replacement.
+#[kani::proof]
+fn kani_account_free_catchup_allows_flat_or_exposed_noop() {
+    let oi_long: u128 = kani::any();
+    let oi_short: u128 = kani::any();
+    let p_last: u64 = kani::any();
+    let fresh_price: u64 = kani::any();
+    let funding_rate: i128 = kani::any();
+    let fund_px_last: u64 = kani::any();
+
+    assert!(
+        account_free_catchup_allows_accrual(0, 0, p_last, fresh_price, funding_rate, fund_px_last),
+        "flat market account-free catchup is allowed"
+    );
+
+    assert!(
+        account_free_catchup_allows_accrual(oi_long, oi_short, p_last, p_last, 0, fund_px_last),
+        "exposed account-free catchup is allowed when price and funding are no-op"
+    );
+}
+
+// =============================================================================
+// X. TARGET-LAG USER OP POLICY (4 proofs)
+// =============================================================================
+
+/// Prove: target_lag_pending is exactly "selected raw target is nonzero and
+/// differs from engine P_last" for both external-oracle and Hyperp modes.
+#[kani::proof]
+fn kani_target_lag_pending_universal() {
+    let is_hyperp: bool = kani::any();
+    let external_target: u64 = kani::any();
+    let hyperp_target: u64 = kani::any();
+    let engine_last_price: u64 = kani::any();
+
+    let selected_target = if is_hyperp {
+        hyperp_target
+    } else {
+        external_target
+    };
+
+    assert_eq!(
+        target_lag_pending(is_hyperp, external_target, hyperp_target, engine_last_price,),
+        selected_target != 0 && selected_target != engine_last_price,
+        "target lag must be exactly selected_target != 0 && selected_target != engine P_last"
+    );
+}
+
+/// Prove: after an oracle read, target lag is exactly "selected raw target is
+/// nonzero and differs from the effective price the wrapper is about to feed."
+#[kani::proof]
+fn kani_target_lag_after_read_universal() {
+    let is_hyperp: bool = kani::any();
+    let external_target: u64 = kani::any();
+    let hyperp_target: u64 = kani::any();
+    let effective_price: u64 = kani::any();
+
+    let selected_target = if is_hyperp {
+        hyperp_target
+    } else {
+        external_target
+    };
+
+    assert_eq!(
+        target_lag_after_read(is_hyperp, external_target, hyperp_target, effective_price),
+        selected_target != 0 && selected_target != effective_price,
+        "post-read target lag must compare selected target to effective price"
+    );
+}
+
+/// Prove: public user value-moving/risk-increasing operations are admitted iff
+/// no raw-target/effective-price lag remains after accrual.
+#[kani::proof]
+fn kani_user_value_op_allowed_iff_no_target_lag() {
+    let is_hyperp: bool = kani::any();
+    let external_target: u64 = kani::any();
+    let hyperp_target: u64 = kani::any();
+    let engine_last_price: u64 = kani::any();
+
+    let lag = target_lag_pending(is_hyperp, external_target, hyperp_target, engine_last_price);
+    let allowed = user_value_op_allowed_after_accrual(
+        is_hyperp,
+        external_target,
+        hyperp_target,
+        engine_last_price,
+    );
+
+    assert_eq!(
+        allowed, !lag,
+        "user value/risk operation must be allowed iff target lag is absent"
+    );
+}
+
+/// Prove: TradeCpi's pre-CPI policy admits matcher invocation iff the raw
+/// target has already caught up to the effective price returned by the read.
+#[kani::proof]
+fn kani_trade_cpi_pre_cpi_allowed_iff_no_post_read_lag() {
+    let is_hyperp: bool = kani::any();
+    let external_target: u64 = kani::any();
+    let hyperp_target: u64 = kani::any();
+    let effective_price: u64 = kani::any();
+
+    let lag = target_lag_after_read(is_hyperp, external_target, hyperp_target, effective_price);
+    let allowed = trade_cpi_allowed_after_oracle_read(
+        is_hyperp,
+        external_target,
+        hyperp_target,
+        effective_price,
+    );
+
+    assert_eq!(
+        allowed, !lag,
+        "TradeCpi must invoke matcher only when post-read target lag is absent"
+    );
+}
+
+// =============================================================================
+// Y. CONFIGURED ACCOUNT CAPACITY (1 proof)
+// =============================================================================
+
+/// Prove: a wrapper account index is accepted only when it is inside both the
+/// compiled slab capacity and the market's configured max_accounts.
+#[kani::proof]
+fn kani_market_idx_within_capacity_universal() {
+    let idx: usize = kani::any();
+    let market_max_accounts: u64 = kani::any();
+
+    assert_eq!(
+        market_idx_within_capacity(idx, market_max_accounts),
+        idx < percolator::MAX_ACCOUNTS && (idx as u64) < market_max_accounts,
+        "market index capacity must enforce both hard cap and configured max_accounts"
+    );
+
+    if market_idx_within_capacity(idx, market_max_accounts) {
+        assert!(idx < percolator::MAX_ACCOUNTS);
+        assert!((idx as u64) < market_max_accounts);
+    }
+}
+
+// =============================================================================
+// Z. FEE-SYNC ANCHOR POLICY (3 proofs)
+// =============================================================================
+
+/// Prove: live fee-sync anchors are admitted exactly when they do not run past
+/// the already-accrued live market slot.
+#[kani::proof]
+fn kani_live_fee_sync_anchor_boundary_universal() {
+    let anchor_slot: u64 = kani::any();
+    let last_market_slot: u64 = kani::any();
+    let resolved_slot: u64 = kani::any();
+
+    assert_eq!(
+        fee_sync_anchor_within_accrued_boundary(
+            false,
+            anchor_slot,
+            last_market_slot,
+            resolved_slot,
+        ),
+        anchor_slot <= last_market_slot,
+        "live fee sync anchor must be bounded by last_market_slot"
+    );
+}
+
+/// Prove: resolved fee-sync anchors are admitted exactly when they do not run
+/// past the immutable resolved slot.
+#[kani::proof]
+fn kani_resolved_fee_sync_anchor_boundary_universal() {
+    let anchor_slot: u64 = kani::any();
+    let last_market_slot: u64 = kani::any();
+    let resolved_slot: u64 = kani::any();
+
+    assert_eq!(
+        fee_sync_anchor_within_accrued_boundary(true, anchor_slot, last_market_slot, resolved_slot,),
+        anchor_slot <= resolved_slot,
+        "resolved fee sync anchor must be bounded by resolved_slot"
+    );
+}
+
+/// Prove: no-oracle fee sync either returns no anchor or returns an anchor that
+/// is capped by wallclock, capped by last_market_slot, and not behind either
+/// engine current_slot or the account's fee cursor.
+#[kani::proof]
+fn kani_no_oracle_fee_sync_anchor_universal() {
+    let wallclock_slot: u64 = kani::any();
+    let last_market_slot: u64 = kani::any();
+    let current_slot: u64 = kani::any();
+    let account_last_fee_slot: u64 = kani::any();
+
+    let result = no_oracle_fee_sync_anchor(
+        wallclock_slot,
+        last_market_slot,
+        current_slot,
+        account_last_fee_slot,
+    );
+    let expected_anchor = if wallclock_slot < last_market_slot {
+        wallclock_slot
+    } else {
+        last_market_slot
+    };
+    let expected = if expected_anchor < current_slot || expected_anchor < account_last_fee_slot {
+        None
+    } else {
+        Some(expected_anchor)
+    };
+
+    assert_eq!(
+        result, expected,
+        "no-oracle fee sync anchor must be min(wallclock, last_market) unless stale"
+    );
+
+    if let Some(anchor) = result {
+        assert!(anchor <= wallclock_slot);
+        assert!(anchor <= last_market_slot);
+        assert!(anchor >= current_slot);
+        assert!(anchor >= account_last_fee_slot);
+    }
 }

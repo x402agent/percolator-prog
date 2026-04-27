@@ -13370,6 +13370,39 @@ fn setup_max_risk_probe(
     (env, lp, lp_idx, actors)
 }
 
+#[test]
+fn test_attack_issue33_account_free_catchup_cannot_move_exposed_market() {
+    program_path();
+
+    let (mut env, _lp, _lp_idx, _actors) = setup_max_risk_probe(1, 1);
+    let slot_before = env.read_last_market_slot();
+    let insurance_before = env.read_insurance_balance();
+    let price = max_risk_next_clamped_price(MAX_RISK_P0_E6, -1, MAX_RISK_ATTACK_SLOTS as u64);
+
+    env.set_slot_and_price_raw_no_walk(
+        MAX_RISK_ATTACK_START_SLOT + MAX_RISK_ATTACK_SLOTS as u64,
+        price as i64,
+    );
+
+    let err = env
+        .try_catchup_accrue()
+        .expect_err("account-free catchup must reject exposed price movement");
+    assert!(
+        err.contains("0x1d"),
+        "expected CatchupRequired for exposed account-free catchup, got: {err}",
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before,
+        "rejected account-free catchup must not advance the market slot",
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "rejected account-free catchup must not mutate insurance",
+    );
+}
+
 fn max_risk_candidate_indices(lp_idx: u16, actors: &[MaxRiskActor]) -> Vec<u16> {
     let mut candidates = Vec::with_capacity(actors.len() + 1);
     candidates.push(lp_idx);
