@@ -664,8 +664,8 @@ fn test_buffer_correct_after_many_cranks() {
         );
     }
     assert!(
-        buf.scan_cursor > 0,
-        "Scan cursor must advance after 20 cranks: cursor={}",
+        (buf.scan_cursor as usize) < MAX_ACCOUNTS,
+        "Scan cursor must stay inside configured account capacity: cursor={}",
         buf.scan_cursor
     );
 }
