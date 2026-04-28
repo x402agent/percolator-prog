@@ -537,10 +537,10 @@ pub mod policy {
         !price_move_active && !funding_active
     }
 
-    /// Non-executing account-limited instructions must not be a hidden market
-    /// progress path when exposed OI exists. Actual nonzero trades are allowed
-    /// to accrue first because the engine immediately syncs and mutates both
-    /// counterparties under the fresh market state.
+    /// Account-limited instructions must not be a hidden market progress path
+    /// when exposed OI exists. They only touch a bounded caller-supplied set;
+    /// unrelated liquidatable accounts need KeeperCrank's cascade before the
+    /// market clock/price/funding can advance.
     #[inline]
     pub fn account_limited_op_allows_accrual(
         oi_eff_long_q: u128,
@@ -6433,10 +6433,11 @@ pub mod processor {
 
                 // Side-mode gating is handled inside engine.execute_trade_not_atomic()
 
-                // Fully accrue market to clock.slot BEFORE execute_trade_with
-                // _matcher, which internally syncs both counterparties' fees
-                // before the trade. Explicit accrue→sync→trade ordering.
-                ensure_market_accrued_to_now_with_policy(
+                // Exposed market progress belongs to KeeperCrank. If this
+                // account-limited trade is allowed to proceed, accrue to
+                // clock.slot before execute_trade_with_matcher, which
+                // internally syncs both counterparties' fees before the trade.
+                ensure_market_accrued_to_now_for_account_limited_op(
                     engine,
                     &config,
                     clock.slot,
@@ -6835,6 +6836,17 @@ pub mod processor {
                 if target_lag_after_read(&config, price) {
                     return Err(PercolatorError::CatchupRequired.into());
                 }
+                // Reject before matcher CPI if this trade would be the hidden
+                // progress path for unrelated exposed accounts.
+                {
+                    let data = a_slab.try_borrow_data()?;
+                    reject_account_limited_market_progress(
+                        zc::engine_ref(&*data)?,
+                        clock.slot,
+                        price,
+                        funding_rate_e9_pre,
+                    )?;
+                }
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
                 // Security is maintained by ABI validation which checks req_id (nonce),
@@ -7067,10 +7079,11 @@ pub mod processor {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Fully accrue market to clock.slot BEFORE execute_trade
-                    // _with_matcher, which internally syncs both sides' fees
-                    // before the trade. Explicit accrue→sync→trade ordering.
-                    ensure_market_accrued_to_now_with_policy(
+                    // Exposed market progress belongs to KeeperCrank. If this
+                    // account-limited trade is allowed to proceed, accrue to
+                    // clock.slot before execute_trade_with_matcher, which
+                    // internally syncs both sides' fees before the trade.
+                    ensure_market_accrued_to_now_for_account_limited_op(
                         engine,
                         &config,
                         clock.slot,

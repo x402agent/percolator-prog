@@ -169,7 +169,7 @@ fn test_external_oracle_stuck_target_does_not_advance_slot_last() {
 }
 
 #[test]
-fn test_trade_nocpi_can_advance_exposed_price_progress_without_crank() {
+fn test_trade_nocpi_requires_crank_for_exposed_price_progress() {
     program_path();
 
     let mut env = TestEnv::new();
@@ -190,18 +190,49 @@ fn test_trade_nocpi_can_advance_exposed_price_progress_without_crank() {
         "test setup must create exposed OI",
     );
 
+    let walker_lp = Keypair::new();
+    let walker_lp_idx = env.init_lp(&walker_lp);
+    env.deposit(&walker_lp, walker_lp_idx, 10_000_000_000);
+
+    let walker_user = Keypair::new();
+    let walker_user_idx = env.init_user(&walker_user);
+    env.deposit(&walker_user, walker_user_idx, 1_000_000_000);
+
     let slot_before = env.read_last_market_slot();
     let next_slot = slot_before + percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS + 1;
     let target = (env.read_last_effective_price() + 1) as i64;
     env.set_slot_and_price_raw_no_walk(next_slot, target);
 
-    env.try_trade(&user, &lp, lp_idx, user_idx, -1_000)
-        .expect("nonzero TradeNoCpi must not require a prior keeper crank");
+    let err = env
+        .try_trade(
+            &walker_user,
+            &walker_lp,
+            walker_lp_idx,
+            walker_user_idx,
+            1_000,
+        )
+        .expect_err("nonzero TradeNoCpi must not be a hidden crank path");
+    assert_custom_error(
+        &err,
+        "0x1d",
+        "TradeNoCpi must reject exposed market progress before the crank cascade",
+    );
     assert_eq!(
         env.read_last_market_slot(),
-        next_slot,
-        "nonzero trade should accrue the exposed market before touching counterparties",
+        slot_before,
+        "rejected TradeNoCpi must not advance exposed market time",
     );
+
+    env.try_crank()
+        .expect("KeeperCrank must own exposed market progress");
+    env.try_trade(
+        &walker_user,
+        &walker_lp,
+        walker_lp_idx,
+        walker_user_idx,
+        2_000,
+    )
+    .expect("TradeNoCpi should succeed once KeeperCrank has caught up");
 }
 
 #[test]
@@ -4391,6 +4422,8 @@ fn test_funding_bootstrap_rate_stamped_after_trade() {
     env.top_up_insurance(&admin, 1_000_000_000);
     for i in 1..=20u64 {
         env.set_slot_and_price(100 + i * 10, 140_000_000); // cap-respecting move from $138
+        env.try_crank()
+            .expect("KeeperCrank must own exposed market progress before funding bootstrap trade");
         let trade_size = if i % 2 == 0 {
             1_000 + i as i128
         } else {

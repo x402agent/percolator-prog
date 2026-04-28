@@ -5981,7 +5981,7 @@ fn test_tradecpi_zero_fill_rejects_exposed_price_progress() {
 }
 
 #[test]
-fn test_tradecpi_nonzero_fill_can_advance_exposed_price_progress() {
+fn test_tradecpi_nonzero_fill_requires_crank_for_exposed_price_progress() {
     let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
         let data = env.svm.get_account(&env.slab).unwrap().data;
         let off = ENGINE_OFFSET + 664;
@@ -6018,6 +6018,14 @@ fn test_tradecpi_nonzero_fill_can_advance_exposed_price_progress() {
         "test setup must create exposed OI",
     );
 
+    let walker_lp = Keypair::new();
+    let (walker_lp_idx, walker_matcher_ctx) = env.init_lp_with_matcher(&walker_lp, &mp);
+    env.deposit(&walker_lp, walker_lp_idx, 10_000_000_000);
+
+    let walker_user = Keypair::new();
+    let walker_user_idx = env.init_user(&walker_user);
+    env.deposit(&walker_user, walker_user_idx, 1_000_000_000);
+
     let slot_before = read_last_market_slot(&env);
     let target = {
         let d = env.svm.get_account(&env.slab).unwrap().data;
@@ -6046,21 +6054,38 @@ fn test_tradecpi_nonzero_fill_can_advance_exposed_price_progress() {
             .unwrap();
     }
 
-    env.try_trade_cpi(
-        &user,
-        &lp.pubkey(),
-        lp_idx,
-        user_idx,
-        -1_000,
-        &mp,
-        &matcher_ctx,
-    )
-    .expect("nonzero TradeCpi must not require a prior keeper crank");
+    let err = env
+        .try_trade_cpi(
+            &walker_user,
+            &walker_lp.pubkey(),
+            walker_lp_idx,
+            walker_user_idx,
+            1_000,
+            &mp,
+            &walker_matcher_ctx,
+        )
+        .expect_err("nonzero TradeCpi must not be a hidden crank path");
+    assert!(
+        err.contains("0x1d"),
+        "TradeCpi exposed progress must surface CatchupRequired, got: {err}",
+    );
     assert_eq!(
         read_last_market_slot(&env),
-        next_slot,
-        "nonzero trade should accrue the exposed market before touching counterparties",
+        slot_before,
+        "rejected TradeCpi must not advance exposed market time",
     );
+
+    env.crank();
+    env.try_trade_cpi(
+        &walker_user,
+        &walker_lp.pubkey(),
+        walker_lp_idx,
+        walker_user_idx,
+        2_000,
+        &mp,
+        &walker_matcher_ctx,
+    )
+    .expect("TradeCpi should succeed once KeeperCrank has caught up");
 }
 
 // ============================================================================
