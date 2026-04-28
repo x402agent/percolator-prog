@@ -6010,12 +6010,11 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     );
 }
 
-/// Regression: reward must pay on the SECOND crank of a market with live
-/// positions, not just the first. Under v12.19.6 the slot window is tight
-/// (perm_resolve <= 100); this test keeps advances inside that window and
-/// asserts directional properties rather than exact magnitudes.
+/// Regression: a second crank with a populated risk buffer must still process
+/// candidate fee syncs and bitmap sweep fees without counting the candidate
+/// sync phase in the reward base.
 #[test]
-fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
+fn test_keeper_crank_second_crank_candidate_sync_excluded_from_reward_base() {
     program_path();
     let mut env = TestEnv::new();
     let data = encode_init_market_with_maint_fee_bounded(
@@ -6054,10 +6053,9 @@ fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
     env.crank_as(&user, user_idx);
     env.svm.expire_blockhash();
 
-    // Crank #2: buffer is populated. Without the fix, candidate-sync
-    // realizes fees before ins_before → sweep_delta == 0 → reward gate
-    // fails. With the fix, ins_before is captured pre-candidate-sync so
-    // the reward credits correctly.
+    // Crank #2: buffer is populated. Candidate sync realizes high-risk
+    // account fees first; those fees must stay entirely in insurance.
+    // Any reward must come only from the subsequent bitmap sweep.
     env.set_slot_and_price_raw_no_walk(170, 138_000_000);
     let cap_before = env.read_account_capital(user_idx);
     let ins_before = env.read_insurance_balance();
@@ -6068,23 +6066,92 @@ fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
     let cap_delta: i128 = (cap_after as i128) - (cap_before as i128);
     let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
 
-    // Core property under test: on the second crank, insurance still
-    // receives the 50% share of the sweep (not 100%), proving the
-    // `ins_before` snapshot lands BEFORE candidate-sync. The exact
-    // magnitudes depend on inter-crank slot count, which changes with
-    // the new envelope — we assert the DIRECTIONAL property.
+    // Core property under test: the second crank still realizes fee debt
+    // even when the risk buffer feeds candidate sync first.
     assert!(
         ins_delta > 0,
         "insurance must receive swept fees on second crank, got {ins_delta}"
     );
-    // With a reward paid, cranker isn't a full net loss of their own fee.
-    // A reward was paid iff (cap_delta + own_fee) > 0; own_fee is the
-    // maintenance charged to the user for the inter-crank interval.
-    // Asserting reward > 0 => cap_delta > -own_fee (strict), i.e.
-    // cap_delta is not simply the negative of an own-fee payment.
     assert!(
-        cap_delta >= -1_000 * 60,
-        "cranker cap delta must include reward credit, got {cap_delta}"
+        cap_delta <= 0,
+        "candidate-synced fees must not create a positive cranker reward, got {cap_delta}"
+    );
+}
+
+/// Regression (#63): candidate-directed fee sync is required so the engine's
+/// liquidation/settlement pass sees post-fee equity, but those candidate fees
+/// are third-party payments and must not be counted in the keeper reward base.
+#[test]
+fn test_attack_fresh_keeper_cranker_cannot_capture_third_party_candidate_fees() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        1_000,
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let victim = Keypair::new();
+    let victim_idx = env.init_user(&victim);
+    env.deposit(&victim, victim_idx, 10_000_000_000);
+
+    env.set_slot_and_price_raw_no_walk(150, 138_000_000);
+
+    let cranker = Keypair::new();
+    let cranker_idx = env.init_user(&cranker);
+    let cranker_cap_before = env.read_account_capital(cranker_idx);
+    let victim_cap_before = env.read_account_capital(victim_idx);
+    let ins_before = env.read_insurance_balance();
+
+    let mut crank_data = vec![5u8];
+    crank_data.extend_from_slice(&cranker_idx.to_le_bytes());
+    crank_data.push(1u8);
+    crank_data.extend_from_slice(&victim_idx.to_le_bytes());
+    crank_data.push(0xFFu8);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(cranker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: crank_data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&cranker.pubkey()),
+        &[&cranker],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("candidate self-crank should succeed");
+
+    let cranker_cap_after = env.read_account_capital(cranker_idx);
+    let victim_cap_after = env.read_account_capital(victim_idx);
+    let ins_after = env.read_insurance_balance();
+
+    let victim_fee_paid = victim_cap_before.saturating_sub(victim_cap_after);
+    assert!(
+        victim_fee_paid > 0,
+        "candidate sync must realize the stale third-party fee debt"
+    );
+    assert_eq!(
+        cranker_cap_after, cranker_cap_before,
+        "fresh cranker must not capture candidate-synced third-party fees"
+    );
+    assert_eq!(
+        ins_after.saturating_sub(ins_before),
+        victim_fee_paid,
+        "candidate-synced third-party fees should stay entirely in insurance"
     );
 }
 

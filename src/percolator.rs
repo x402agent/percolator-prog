@@ -6017,9 +6017,11 @@ pub mod processor {
                 // with a full sweep.
                 //
                 // Ordering: candidates first, then sweep with
-                // remaining budget, then crank. Sweep-delta (keeper
-                // reward) is computed from balance BEFORE the sweep
-                // only, so candidate syncs don't inflate the reward.
+                // remaining budget, then crank. Candidate syncs are
+                // health-preparation work for caller-supplied accounts;
+                // their third-party maintenance fees are not rewardable.
+                // The keeper reward is computed only from the subsequent
+                // bitmap sweep's insurance delta.
                 //
                 // Budget accounting MUST MIRROR keeper_crank_not_atomic's:
                 // invalid / out-of-range / unused entries are SKIPPED
@@ -6038,20 +6040,6 @@ pub mod processor {
                 // on consecutive entries, which is idempotent at the same
                 // anchor). The wrapper skips duplicate SYNC calls purely
                 // to save CU — dedup is within the loop, not the budget.
-                // Capture the pre-fee-collection insurance balance so the
-                // reward base reflects EVERY fee this crank swept in —
-                // candidate-directed syncs AND the bitmap sweep. Earlier
-                // revisions captured `ins_before` between the two phases,
-                // which silently dropped the reward to zero whenever the
-                // risk buffer auto-populated `combined` (i.e. on every
-                // crank after the first live crank). Including both
-                // phases is safe: `sync_account_fee_to_slot_not_atomic`
-                // is idempotent at same-slot and the shared FEE_SWEEP
-                // _BUDGET still caps total syncs, so a caller cannot
-                // inflate the reward by stuffing candidates — duplicates
-                // are dedup'd, already-synced accounts are no-ops, and
-                // unused slots are skipped before consuming budget.
-                let ins_before = engine.insurance_fund.balance.get();
                 let mut candidate_syncs = 0usize;
                 if config.maintenance_fee_per_slot > 0 {
                     // Candidate syncs share the FEE_SWEEP_BUDGET with
@@ -6111,6 +6099,7 @@ pub mod processor {
                     }
                 }
 
+                let ins_before_reward_sweep = engine.insurance_fund.balance.get();
                 let remaining_budget =
                     crate::constants::FEE_SWEEP_BUDGET.saturating_sub(candidate_syncs);
                 sweep_maintenance_fees(engine, &mut config, crank_slot, remaining_budget)?;
@@ -6118,7 +6107,7 @@ pub mod processor {
                     .insurance_fund
                     .balance
                     .get()
-                    .saturating_sub(ins_before);
+                    .saturating_sub(ins_before_reward_sweep);
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
