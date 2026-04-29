@@ -57,9 +57,17 @@ pub mod constants {
     /// it pays for its full elapsed interval in one charge.
     pub const FEE_SWEEP_BUDGET: usize = 128;
 
-    /// Phase 1 revalidation/liquidation budget per KeeperCrank (wrapper-owned
-    /// since v12.19, which dropped the engine-level `LIQ_BUDGET_PER_CRANK`).
-    pub const LIQ_BUDGET_PER_CRANK: u16 = 64;
+    /// Maximum caller-supplied liquidation candidates decoded for one crank.
+    /// This is intentionally larger than the per-crank execution budget so
+    /// honest keepers can over-specify the next cascade segment; the wrapper
+    /// uses the tail for issue-65 coverage checks while the engine executes a
+    /// CU-bounded prefix.
+    pub const MAX_KEEPER_CANDIDATES: usize = 128;
+    /// Phase 1 revalidation/liquidation execution budget per KeeperCrank
+    /// (wrapper-owned since v12.19, which dropped the engine-level
+    /// `LIQ_BUDGET_PER_CRANK`). Kept at 32 so dense liquidation cascades plus
+    /// wrapper coverage checks fit the SVM compute envelope.
+    pub const LIQ_BUDGET_PER_CRANK: u16 = 32;
     /// Phase 2 mandatory engine round-robin sweep window. The engine requires
     /// `max_revalidations + rr_window_size <= MAX_TOUCHED_PER_INSTRUCTION`.
     /// Use the remaining touched-account capacity after Phase 1 so KeeperCrank
@@ -1923,12 +1931,11 @@ pub mod ix {
                     // VALID existing entries against its per-crank
                     // budget. A keeper could otherwise submit thousands
                     // of invalid indices to burn CU before any useful
-                    // work. We accept up to 2 × LIQ_BUDGET_PER_CRANK
-                    // candidates — enough room for over-specification
-                    // of deduplication / expired entries while keeping
-                    // the total scan bounded.
-                    const MAX_CANDIDATES: usize =
-                        (crate::constants::LIQ_BUDGET_PER_CRANK as usize) * 2;
+                    // work. We accept a fixed candidate cap that is larger
+                    // than the execution budget so keepers can include the
+                    // next cascade tail for wrapper coverage checks without
+                    // asking the engine to process it in the same call.
+                    const MAX_CANDIDATES: usize = crate::constants::MAX_KEEPER_CANDIDATES;
                     if format_version == 1 {
                         // Extended: u16 idx + u8 policy tag per candidate
                         while rest.len() >= 3 {
@@ -1947,6 +1954,9 @@ pub mod ix {
                                 _ => return Err(ProgramError::InvalidInstructionData),
                             };
                             candidates.push((idx, policy));
+                        }
+                        if !rest.is_empty() {
+                            return Err(ProgramError::InvalidInstructionData);
                         }
                     } else {
                         return Err(ProgramError::InvalidInstructionData);
@@ -4444,63 +4454,76 @@ pub mod processor {
         Ok(eq_after > I256::from_u128(mm_req))
     }
 
-    fn phase1_reachable_liquidation(
+    fn set_idx_bit(words: &mut [u64; (percolator::MAX_ACCOUNTS + 63) / 64], idx: usize) {
+        words[idx >> 6] |= 1u64 << (idx & 63);
+    }
+
+    fn idx_bit(words: &[u64; (percolator::MAX_ACCOUNTS + 63) / 64], idx: usize) -> bool {
+        (words[idx >> 6] & (1u64 << (idx & 63))) != 0
+    }
+
+    fn build_keeper_liquidation_coverage_maps(
         engine: &RiskEngine,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
-        idx: u16,
         price: u64,
-    ) -> Result<bool, ProgramError> {
+    ) -> Result<
+        (
+            [u64; (percolator::MAX_ACCOUNTS + 63) / 64],
+            [u64; (percolator::MAX_ACCOUNTS + 63) / 64],
+        ),
+        ProgramError,
+    > {
+        let mut phase1_reachable = [0u64; (percolator::MAX_ACCOUNTS + 63) / 64];
+        let mut listed_liquidatable = [0u64; (percolator::MAX_ACCOUNTS + 63) / 64];
         let mut attempts: u16 = 0;
         let max_candidate_inspections = core::cmp::min(
-            percolator::MAX_TOUCHED_PER_INSTRUCTION as u16,
-            crate::constants::LIQ_BUDGET_PER_CRANK.saturating_mul(4),
-        );
+            percolator::MAX_TOUCHED_PER_INSTRUCTION as usize,
+            crate::constants::MAX_KEEPER_CANDIDATES,
+        ) as u16;
         let mut inspected: u16 = 0;
         for &(candidate_idx, policy) in combined.iter() {
-            if attempts >= crate::constants::LIQ_BUDGET_PER_CRANK
-                || inspected >= max_candidate_inspections
-            {
+            if inspected >= max_candidate_inspections {
                 break;
             }
             inspected = match inspected.checked_add(1) {
                 Some(v) => v,
-                None => return Ok(false),
+                None => break,
             };
             let candidate_usize = candidate_idx as usize;
             if !idx_used_in_market(engine, candidate_usize) {
                 continue;
             }
-            attempts = match attempts.checked_add(1) {
-                Some(v) => v,
-                None => return Ok(false),
-            };
-            if candidate_idx == idx {
-                let eff = effective_pos_q_checked(engine, candidate_usize)?;
-                return Ok(keeper_policy_can_liquidate(
-                    engine,
-                    candidate_usize,
-                    eff,
-                    price,
-                    policy,
-                ));
+            let phase1_attempt = attempts < crate::constants::LIQ_BUDGET_PER_CRANK;
+            attempts = attempts.saturating_add(1);
+            let eff = effective_pos_q_checked(engine, candidate_usize)?;
+            let can_liquidate =
+                keeper_policy_can_liquidate(engine, candidate_usize, eff, price, policy);
+            if can_liquidate {
+                set_idx_bit(&mut listed_liquidatable, candidate_usize);
+                if phase1_attempt {
+                    set_idx_bit(&mut phase1_reachable, candidate_usize);
+                }
             }
         }
-        Ok(false)
+        Ok((phase1_reachable, listed_liquidatable))
     }
 
-    fn reject_keeper_crank_uncovered_market_progress(
+    fn check_keeper_crank_market_progress_coverage(
         engine: &RiskEngine,
         now_slot: u64,
         price: u64,
         funding_rate_e9: i128,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
-    ) -> Result<(), ProgramError> {
+    ) -> Result<bool, ProgramError> {
         let dt_slots = now_slot.saturating_sub(engine.last_market_slot);
         let _ = funding_rate_e9;
         if dt_slots == 0 && price == engine.last_oracle_price {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut defer_phase2 = false;
+        let (phase1_reachable, listed_liquidatable) =
+            build_keeper_liquidation_coverage_maps(engine, combined, price)?;
         let max_accounts = core::cmp::min(
             engine.params.max_accounts as usize,
             percolator::MAX_ACCOUNTS,
@@ -4513,6 +4536,19 @@ pub mod processor {
             if eff == 0 {
                 continue;
             }
+            if idx_bit(&phase1_reachable, idx) {
+                continue;
+            }
+            if idx_bit(&listed_liquidatable, idx) {
+                // The account is honestly supplied but lies beyond the
+                // current phase-1 liquidation budget. Allow this crank to
+                // process the reachable prefix, but suppress phase 2 below
+                // so deferred unhealthy accounts are not touched without
+                // their liquidation policy. The next crank skips closed
+                // prefix accounts and reaches this candidate.
+                defer_phase2 = true;
+                continue;
+            }
             if account_provably_above_maintenance_after_accrual(
                 engine,
                 idx,
@@ -4523,11 +4559,9 @@ pub mod processor {
             )? {
                 continue;
             }
-            if !phase1_reachable_liquidation(engine, combined, idx as u16, price)? {
-                return Err(PercolatorError::CatchupRequired.into());
-            }
+            return Err(PercolatorError::CatchupRequired.into());
         }
-        Ok(())
+        Ok(defer_phase2)
     }
 
     fn ensure_market_accrued_to_now_for_keeper_crank(
@@ -4537,16 +4571,17 @@ pub mod processor {
         price: u64,
         funding_rate_e9: i128,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
-    ) -> Result<(), ProgramError> {
+    ) -> Result<bool, ProgramError> {
         reject_stuck_target_accrual(config, engine, now_slot, price)?;
-        reject_keeper_crank_uncovered_market_progress(
+        let defer_phase2 = check_keeper_crank_market_progress_coverage(
             engine,
             now_slot,
             price,
             funding_rate_e9,
             combined,
         )?;
-        ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
+        ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)?;
+        Ok(defer_phase2)
     }
 
     /// Incrementally sweep maintenance fees from the current cursor position.
@@ -6288,20 +6323,53 @@ pub mod processor {
                 let mut combined =
                     alloc::vec::Vec::with_capacity(buf.count as usize + candidates.len());
                 for i in 0..buf.count as usize {
-                    combined.push((
-                        buf.entries[i].idx,
-                        Some(percolator::LiquidationPolicy::FullClose),
-                    ));
+                    let risk_idx = buf.entries[i].idx;
+                    let risk_eff_abs = if idx_used_in_market(engine, risk_idx as usize) {
+                        effective_pos_q_checked(engine, risk_idx as usize)?.unsigned_abs()
+                    } else {
+                        0
+                    };
+                    for &(cidx, policy) in candidates.iter() {
+                        let q_close_q = match policy {
+                            Some(percolator::LiquidationPolicy::ExactPartial(q)) => q,
+                            _ => continue,
+                        };
+                        if cidx != risk_idx || q_close_q == 0 || q_close_q >= risk_eff_abs {
+                            continue;
+                        }
+                        // Preserve one keeper-supplied partial-liquidation
+                        // opportunity for cached high-risk accounts, but keep
+                        // the risk-buffer FullClose immediately behind it as
+                        // a fallback. Invalid local bounds are skipped here so
+                        // repeated malformed hints cannot consume the engine's
+                        // phase-1 attempt budget before the fallback.
+                        combined.push((cidx, policy));
+                        break;
+                    }
+                    combined.push((risk_idx, Some(percolator::LiquidationPolicy::FullClose)));
                 }
-                combined.extend_from_slice(&candidates);
+                for &(cidx, policy) in candidates.iter() {
+                    let mut already_promoted = false;
+                    if matches!(policy, Some(percolator::LiquidationPolicy::ExactPartial(_))) {
+                        for i in 0..buf.count as usize {
+                            if buf.entries[i].idx == cidx {
+                                already_promoted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !already_promoted {
+                        combined.push((cidx, policy));
+                    }
+                }
                 // Defense-in-depth cap: the decode-time check already
                 // bounds candidates, but truncating `combined` here as
                 // well ensures the engine's scan is bounded even if the
                 // decode cap is loosened in the future or an insider
                 // path ever constructs `combined` differently. Cap:
-                // 4 (risk buffer max) + 2 × LIQ_BUDGET_PER_CRANK.
+                // risk buffer max + the decoded candidate cap.
                 const COMBINED_CAP: usize =
-                    4 + (crate::constants::LIQ_BUDGET_PER_CRANK as usize) * 2;
+                    crate::constants::RISK_BUF_CAP + crate::constants::MAX_KEEPER_CANDIDATES;
                 if combined.len() > COMBINED_CAP {
                     combined.truncate(COMBINED_CAP);
                 }
@@ -6350,7 +6418,7 @@ pub mod processor {
                 // reducing the gap instead of returning CatchupRequired.
                 let partial_target =
                     oversized_catchup_target(engine, clock.slot, price, funding_rate_e9_pre)?;
-                let (crank_slot, crank_price, partial_catchup) =
+                let (crank_slot, crank_price, partial_catchup, defer_phase2) =
                     if let Some(target_slot) = partial_target {
                         let stored_p_last = engine.last_oracle_price;
                         catchup_accrue(engine, target_slot, stored_p_last, funding_rate_e9_pre)?;
@@ -6359,9 +6427,9 @@ pub mod processor {
                                 .accrue_market_to(target_slot, stored_p_last, funding_rate_e9_pre)
                                 .map_err(map_risk_error)?;
                         }
-                        (target_slot, stored_p_last, true)
+                        (target_slot, stored_p_last, true, false)
                     } else {
-                        ensure_market_accrued_to_now_for_keeper_crank(
+                        let defer_phase2 = ensure_market_accrued_to_now_for_keeper_crank(
                             engine,
                             &config,
                             clock.slot,
@@ -6369,7 +6437,7 @@ pub mod processor {
                             funding_rate_e9_pre,
                             &combined,
                         )?;
-                        (clock.slot, price, false)
+                        (clock.slot, price, false, defer_phase2)
                     };
 
                 // Shared per-instruction fee-sync budget (audit #2).
@@ -6479,6 +6547,11 @@ pub mod processor {
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
+                let rr_window_size = if defer_phase2 {
+                    0
+                } else {
+                    crate::constants::RR_WINDOW_PER_CRANK
+                };
                 let _outcome = engine
                     .keeper_crank_not_atomic(
                         crank_slot,
@@ -6489,7 +6562,7 @@ pub mod processor {
                         admit_h_min,
                         admit_h_max,
                         admit_threshold,
-                        crate::constants::RR_WINDOW_PER_CRANK,
+                        rr_window_size,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]

@@ -58,6 +58,191 @@ fn withdraw_chunked(
     withdrawn
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PnlInterfaceSnapshot {
+    user_cap: u128,
+    user_pnl: i128,
+    user_reserved_pnl: u128,
+    user_fee_credits: i128,
+    user_pos: i128,
+    lp_cap: u128,
+    lp_pnl: i128,
+    lp_reserved_pnl: u128,
+    lp_fee_credits: i128,
+    lp_pos: i128,
+    c_tot: u128,
+    insurance: u128,
+    engine_vault: u128,
+    spl_vault: u64,
+}
+
+fn pnl_interface_snapshot(env: &TestEnv, user_idx: u16, lp_idx: u16) -> PnlInterfaceSnapshot {
+    PnlInterfaceSnapshot {
+        user_cap: env.read_account_capital(user_idx),
+        user_pnl: env.read_account_pnl(user_idx),
+        user_reserved_pnl: env.read_account_reserved_pnl(user_idx),
+        user_fee_credits: env.read_account_fee_credits(user_idx),
+        user_pos: env.read_account_position(user_idx),
+        lp_cap: env.read_account_capital(lp_idx),
+        lp_pnl: env.read_account_pnl(lp_idx),
+        lp_reserved_pnl: env.read_account_reserved_pnl(lp_idx),
+        lp_fee_credits: env.read_account_fee_credits(lp_idx),
+        lp_pos: env.read_account_position(lp_idx),
+        c_tot: env.read_c_tot(),
+        insurance: env.read_insurance_balance(),
+        engine_vault: env.read_engine_vault(),
+        spl_vault: env.vault_balance(),
+    }
+}
+
+struct UnmaturedPnlFixture {
+    env: TestEnv,
+    lp: Keypair,
+    lp_idx: u16,
+    user: Keypair,
+    user_idx: u16,
+    before: PnlInterfaceSnapshot,
+}
+
+fn setup_unmatured_pnl_fixture() -> UnmaturedPnlFixture {
+    let mut env = TestEnv::new();
+    env.init_market_with_warmup(0, 50);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let size = 1_000_000;
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+
+    // Walk to a favorable price and flatten immediately. This creates a
+    // positive PnL claim for the user, but with h_max=50 it is not yet
+    // extractable as capital in the same slot.
+    env.set_slot_and_price(230, 150_000_000);
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+    assert_eq!(
+        env.read_account_position(user_idx),
+        0,
+        "fixture user should be flat with a PnL claim"
+    );
+
+    let before = pnl_interface_snapshot(&env, user_idx, lp_idx);
+    assert!(
+        before.user_pnl > 0 || before.user_reserved_pnl > 0,
+        "fixture must create positive-but-unmatured user PnL: {:?}",
+        before
+    );
+
+    UnmaturedPnlFixture {
+        env,
+        lp,
+        lp_idx,
+        user,
+        user_idx,
+        before,
+    }
+}
+
+fn assert_protocol_unchanged(label: &str, fixture: &UnmaturedPnlFixture) {
+    let after = pnl_interface_snapshot(&fixture.env, fixture.user_idx, fixture.lp_idx);
+    assert_eq!(
+        after, fixture.before,
+        "{}: failed public interface must not move protocol accounting",
+        label
+    );
+}
+
+fn assert_no_unmatured_capital_unlock(
+    label: &str,
+    before: PnlInterfaceSnapshot,
+    after: PnlInterfaceSnapshot,
+) {
+    assert_eq!(
+        after.spl_vault, before.spl_vault,
+        "{label}: no-token-move interface must not transfer vault funds"
+    );
+    assert_eq!(
+        after.engine_vault, before.engine_vault,
+        "{label}: no-token-move interface must not move engine vault accounting"
+    );
+    assert!(
+        after.user_cap <= before.user_cap,
+        "{label}: interface converted unmatured PnL into user capital: before={:?} after={:?}",
+        before,
+        after
+    );
+}
+
+fn try_crank_exact_partial(env: &mut TestEnv, idx: u16, q_close_q: u128) -> Result<(), String> {
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let mut data = vec![5u8];
+    data.extend_from_slice(&percolator_prog::constants::CRANK_NO_CALLER.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&idx.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&q_close_q.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+fn try_crank_bad_policy_tag(env: &mut TestEnv, idx: u16, tag: u8) -> Result<(), String> {
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let mut data = vec![5u8];
+    data.extend_from_slice(&percolator_prog::constants::CRANK_NO_CALLER.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&idx.to_le_bytes());
+    data.push(tag);
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
 /// dYdX/YFI-style profit recycling.
 ///
 /// Attack model: the attacker controls both sides of a matched trade. They
@@ -786,4 +971,261 @@ fn test_attack_sequential_winner_exits_after_whipsaw_no_double_spend() {
         env.read_insurance_balance()
     );
     assert_eq!(env.read_engine_vault() as u64, env.vault_balance());
+}
+
+/// Matrix regression for the public interfaces that can otherwise become
+/// accidental PnL-extraction paths. The fixture leaves the user flat with
+/// positive PnL that is still inside the profit-maturity window. Reverting
+/// interfaces must be atomic; successful non-withdrawal interfaces may do
+/// their own action, but must not convert that unmatured PnL into withdrawable
+/// capital or external vault tokens.
+#[test]
+fn test_attack_unmatured_pnl_public_interface_matrix_no_extraction() {
+    program_path();
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let amount = f.before.user_cap.saturating_add(1) as u64;
+        let result = f.env.try_withdraw(&f.user, f.user_idx, amount);
+        assert!(
+            result.is_err(),
+            "WithdrawCollateral must not withdraw beyond accounted capital while PnL is unmatured"
+        );
+        assert_protocol_unchanged("WithdrawCollateral", &f);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let result = f.env.try_convert_released_pnl(&f.user, f.user_idx, 1);
+        assert!(
+            result.is_err(),
+            "ConvertReleasedPnl must reject before PnL is released by maturity"
+        );
+        assert_protocol_unchanged("ConvertReleasedPnl", &f);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let result = f.env.try_close_account(&f.user, f.user_idx);
+        assert!(
+            result.is_err(),
+            "CloseAccount must not close and pay out unmatured positive PnL"
+        );
+        assert_protocol_unchanged("CloseAccount", &f);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let result = f.env.try_deposit_fee_credits(&f.user, f.user_idx, 1);
+        assert!(
+            result.is_err(),
+            "DepositFeeCredits must reject when no fee debt exists"
+        );
+        assert_protocol_unchanged("DepositFeeCredits", &f);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let deposit_amount = 1_234u64;
+        f.env
+            .try_deposit(&f.user, f.user_idx, deposit_amount)
+            .expect("DepositCollateral should still allow fresh capital");
+        let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+        assert_eq!(
+            after.user_cap,
+            f.before.user_cap + deposit_amount as u128,
+            "DepositCollateral must credit only the deposited amount, not unmatured PnL"
+        );
+        assert_eq!(
+            after.spl_vault,
+            f.before.spl_vault + deposit_amount,
+            "DepositCollateral must move exactly the deposited tokens"
+        );
+        assert_eq!(
+            after.engine_vault,
+            f.before.engine_vault + deposit_amount as u128,
+            "DepositCollateral must move exactly the deposited units internally"
+        );
+        assert_eq!(
+            after.user_pnl, f.before.user_pnl,
+            "DepositCollateral must not consume unmatured PnL"
+        );
+        assert_eq!(
+            after.user_reserved_pnl, f.before.user_reserved_pnl,
+            "DepositCollateral must not consume reserved PnL"
+        );
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let result = f.env.try_trade(&f.user, &f.lp, f.lp_idx, f.user_idx, 1_000);
+        if result.is_ok() {
+            let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+            assert_no_unmatured_capital_unlock("TradeNoCpi", f.before, after);
+        } else {
+            assert_protocol_unchanged("TradeNoCpi", &f);
+        }
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let result = f.env.try_settle_account(f.user_idx);
+        assert!(
+            result.is_ok(),
+            "KeeperCrank touch-only settlement should remain callable: {:?}",
+            result
+        );
+        let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+        assert_no_unmatured_capital_unlock("KeeperCrank touch-only", f.before, after);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let admin = Keypair::from_bytes(&f.env.payer.to_bytes()).unwrap();
+        f.env
+            .try_top_up_insurance(&admin, 1_000)
+            .expect("TopUpInsurance should remain callable");
+        let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+        assert_eq!(
+            after.user_cap, f.before.user_cap,
+            "TopUpInsurance must not unlock user PnL"
+        );
+        assert_eq!(
+            after.user_pnl, f.before.user_pnl,
+            "TopUpInsurance must not consume user PnL"
+        );
+        assert_eq!(
+            after.insurance,
+            f.before.insurance + 1_000,
+            "TopUpInsurance must only increase insurance by the top-up"
+        );
+    }
+}
+
+/// KeeperCrank is the one public interface that intentionally does account
+/// touching and market catchup. Cover its major branch shapes against the same
+/// "latent PnL must not become external value" invariant:
+/// - permissionless touch-only candidate
+/// - permissioned self-crank
+/// - rejected self-crank auth
+/// - oversized-gap partial catchup
+/// - resolved-market early return
+///
+/// Maintenance-fee reward branches are covered by the focused keeper tests in
+/// `test_basic`; this matrix keeps the PnL fixture isolated from fee rewards.
+#[test]
+fn test_attack_unmatured_pnl_keeper_branch_matrix_no_extraction() {
+    program_path();
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        f.env
+            .try_settle_account(f.user_idx)
+            .expect("permissionless touch-only KeeperCrank should remain callable");
+        let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+        assert_no_unmatured_capital_unlock(
+            "KeeperCrank permissionless touch-only",
+            f.before,
+            after,
+        );
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        try_crank_exact_partial(&mut f.env, f.user_idx, 0)
+            .expect("ExactPartial candidate branch should decode and no-op on invalid q");
+        let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+        assert_no_unmatured_capital_unlock("KeeperCrank ExactPartial no-op", f.before, after);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let result = try_crank_bad_policy_tag(&mut f.env, f.user_idx, 2);
+        assert!(
+            result.is_err(),
+            "invalid KeeperCrank policy tag must reject"
+        );
+        assert_protocol_unchanged("KeeperCrank invalid policy tag", &f);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        f.env
+            .try_crank_self(&f.user, f.user_idx)
+            .expect("owner self-crank branch should remain callable");
+        let after = pnl_interface_snapshot(&f.env, f.user_idx, f.lp_idx);
+        assert_no_unmatured_capital_unlock("KeeperCrank self-crank", f.before, after);
+    }
+
+    {
+        let mut f = setup_unmatured_pnl_fixture();
+        let attacker = Keypair::new();
+        f.env
+            .svm
+            .airdrop(&attacker.pubkey(), 1_000_000_000)
+            .unwrap();
+        let result = f.env.try_crank_self(&attacker, f.user_idx);
+        assert!(
+            result.is_err(),
+            "self-crank with the wrong owner must reject"
+        );
+        assert_protocol_unchanged("KeeperCrank rejected self-crank", &f);
+    }
+
+    {
+        let mut env = TestEnv::new();
+        env.init_market_with_cap(0, 1_000);
+
+        let lp = Keypair::new();
+        let lp_idx = env.init_lp(&lp);
+        env.deposit(&lp, lp_idx, 10_000_000_000);
+
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_000_000_000);
+        env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+        let before = pnl_interface_snapshot(&env, user_idx, lp_idx);
+        let slot_before = env.read_last_market_slot();
+        let target = env.read_last_effective_price().saturating_add(1);
+        let inline_budget = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS * 20;
+        let far_slot = slot_before + inline_budget + 50;
+        env.set_slot_and_price_raw_no_walk(far_slot, target as i64);
+
+        env.try_crank_once()
+            .expect("KeeperCrank should commit partial catchup instead of rejecting");
+        assert_eq!(
+            env.read_last_market_slot(),
+            slot_before + inline_budget,
+            "partial catchup branch should commit one bounded chunk"
+        );
+        let after = pnl_interface_snapshot(&env, user_idx, lp_idx);
+        assert_no_unmatured_capital_unlock("KeeperCrank partial catchup", before, after);
+    }
+
+    {
+        let mut env = TestEnv::new();
+        env.init_market_with_invert(0);
+
+        let lp = Keypair::new();
+        let lp_idx = env.init_lp(&lp);
+        env.deposit(&lp, lp_idx, 10_000_000_000);
+
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_000_000_000);
+
+        let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+        env.try_resolve_market(&admin, 0)
+            .expect("ordinary resolve with no open position should succeed");
+        let before = pnl_interface_snapshot(&env, user_idx, lp_idx);
+
+        env.try_crank()
+            .expect("resolved KeeperCrank early-return branch should succeed");
+        let after = pnl_interface_snapshot(&env, user_idx, lp_idx);
+        assert_eq!(
+            after, before,
+            "resolved KeeperCrank must not settle or pay accounts"
+        );
+    }
 }

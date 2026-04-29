@@ -2400,6 +2400,119 @@ fn test_keeper_crank_format_v1_full_close() {
     );
 }
 
+/// KeeperCrank format_version=1 ExactPartial candidates must be decoded and
+/// forwarded to the engine as partial-liquidation hints, not treated as
+/// FullClose or touch-only.
+#[test]
+fn test_keeper_crank_format_v1_exact_partial() {
+    program_path();
+    let mut env = TestEnv::new();
+    let mut init = vec![0u8];
+    init.extend_from_slice(env.payer.pubkey().as_ref());
+    init.extend_from_slice(env.mint.as_ref());
+    init.extend_from_slice(&TEST_FEED_ID);
+    init.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes());
+    init.extend_from_slice(&500u16.to_le_bytes());
+    init.push(0u8);
+    init.extend_from_slice(&0u32.to_le_bytes());
+    init.extend_from_slice(&0u64.to_le_bytes());
+    init.extend_from_slice(&0u128.to_le_bytes());
+    init.extend_from_slice(&1u64.to_le_bytes()); // h_min
+    init.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    init.extend_from_slice(&600u64.to_le_bytes()); // initial_margin_bps
+    init.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    init.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    init.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee
+    init.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    init.extend_from_slice(&999u64.to_le_bytes()); // legacy max_crank_staleness_slots
+    init.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+    init.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
+    init.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
+    init.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    init.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    init.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    init.extend_from_slice(&40u64.to_le_bytes()); // max_price_move_bps_per_slot
+    init.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    init.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    init.extend_from_slice(&1_000u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    init.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    init.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    init.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    init.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    init.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    init.extend_from_slice(&1u64.to_le_bytes()); // force_close_delay_slots
+    env.try_init_market_raw(init).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 900_000_000);
+
+    env.set_slot(50);
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
+    let pos_before = env.read_account_position(user_idx);
+    assert_eq!(pos_before, 100_000_000);
+
+    // Move below maintenance, but keep the target within one residual
+    // price-move envelope. TradeNoCpi inserted this account into the risk
+    // buffer, so this specifically verifies that a keeper-supplied
+    // ExactPartial hint is promoted ahead of the buffer's FullClose fallback.
+    let last_slot = env.read_last_market_slot();
+    env.set_slot_and_price_raw_no_walk(last_slot + 10, 135_240_000);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes());
+    data.push(1u8);
+    // Invalid exact-partial hint first. The wrapper must not let the
+    // risk-buffer FullClose fallback run before a later valid ExactPartial for
+    // the same account.
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&0u128.to_le_bytes());
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&99_000_000u128.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_ok(),
+        "format_version=1 ExactPartial crank should succeed: {:?}",
+        result
+    );
+
+    let pos_after = env.read_account_position(user_idx);
+    assert!(
+        pos_after > 0 && pos_after < pos_before,
+        "ExactPartial should reduce but not close the position: before={pos_before} after={pos_after}"
+    );
+}
+
 /// Spec: KeeperCrank format_version=1 with touch-only policy (tag 0xFF) must
 /// settle an account's lazy state (funding, mark-to-market, fees, warmup)
 /// without triggering liquidation, even if the account is healthy.
@@ -3783,6 +3896,72 @@ fn test_keeper_crank_format_v2_rejected() {
     assert!(
         result.is_err(),
         "format_version=2 crank must be rejected (only 0 and 1 are valid)"
+    );
+}
+
+/// KeeperCrank format_version=1 is a fixed record stream:
+/// FullClose/touch records are 3 bytes and ExactPartial records are 19 bytes.
+/// Any trailing byte that cannot form a full candidate must reject instead of
+/// being silently ignored.
+#[test]
+fn test_keeper_crank_format_v1_rejects_trailing_bytes() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let send = |env: &mut TestEnv, caller: &Keypair, data: Vec<u8>| {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data,
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[caller],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx)
+    };
+
+    let mut fullclose_trailing = vec![5u8];
+    fullclose_trailing.extend_from_slice(&u16::MAX.to_le_bytes());
+    fullclose_trailing.push(1u8);
+    fullclose_trailing.extend_from_slice(&0u16.to_le_bytes());
+    fullclose_trailing.push(0u8);
+    fullclose_trailing.push(0xAA);
+    assert!(
+        percolator_prog::ix::Instruction::decode(&fullclose_trailing).is_err(),
+        "decoder must reject trailing bytes after a FullClose candidate"
+    );
+    assert!(
+        send(&mut env, &caller, fullclose_trailing).is_err(),
+        "KeeperCrank must reject trailing bytes after a FullClose candidate"
+    );
+
+    let mut exact_partial_trailing = vec![5u8];
+    exact_partial_trailing.extend_from_slice(&u16::MAX.to_le_bytes());
+    exact_partial_trailing.push(1u8);
+    exact_partial_trailing.extend_from_slice(&0u16.to_le_bytes());
+    exact_partial_trailing.push(1u8);
+    exact_partial_trailing.extend_from_slice(&1u128.to_le_bytes());
+    exact_partial_trailing.extend_from_slice(&[0xBB, 0xCC]);
+    assert!(
+        percolator_prog::ix::Instruction::decode(&exact_partial_trailing).is_err(),
+        "decoder must reject trailing bytes after an ExactPartial candidate"
+    );
+    assert!(
+        send(&mut env, &caller, exact_partial_trailing).is_err(),
+        "KeeperCrank must reject trailing bytes after an ExactPartial candidate"
     );
 }
 
