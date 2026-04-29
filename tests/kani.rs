@@ -12,7 +12,12 @@
 //! - Nonce monotonicity (unchanged on failure, +1 on success)
 //! - CPI uses exec_size (not requested size)
 //!
-//! Only wrapper-level authorization and binding logic is proven.
+//! Only wrapper-level authorization and binding logic is proven. The
+//! issue-65 scan proof treats `provably_healthy` and `phase1_reachable`
+//! as abstract predicates. It proves the keeper coverage loop is
+//! inductive assuming those predicates are sound; it does not prove
+//! `account_provably_above_maintenance_after_accrual` against the
+//! engine's private accrue/touch math.
 
 #![cfg(kani)]
 

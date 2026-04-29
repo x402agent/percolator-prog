@@ -13373,9 +13373,10 @@ fn test_attack_withdraw_decoy_cannot_walk_exposed_market() {
 /// become a hidden market-progress walker for accounts outside the risk buffer.
 /// The setup fills the 4-entry risk buffer with larger over-collateralized
 /// stuffer positions, then opens a smaller target pair that is evicted from the
-/// buffer. Two empty cranks walk the market price against the target; the final
-/// crank includes the target as a liquidation candidate. The invariant is that
-/// this sequence must not drain insurance below its pre-walk level.
+/// buffer. Empty cranks must reject and roll back instead of walking the market
+/// price against the uncovered target. The final crank includes the target as a
+/// liquidation candidate. The invariant is that this sequence must not drain
+/// insurance below its pre-walk level.
 #[test]
 fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target() {
     program_path();
@@ -13437,14 +13438,33 @@ fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target
     );
 
     let insurance_before = env.read_insurance_balance();
+    let slot_before_walk = env.read_last_market_slot();
     let start_slot = env.svm.get_sysvar::<Clock>().slot;
     let p1 = (138_000_000f64 * 0.955) as i64;
     env.set_slot_and_price_raw_no_walk(start_slot + 10, p1);
     let first_empty = try_empty_crank(&mut env);
+    assert!(
+        first_empty.is_err(),
+        "empty candidate crank must reject when an uncovered exposed target is outside the risk buffer"
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before_walk,
+        "rejected empty crank must roll back market-clock progress"
+    );
 
     let p2 = (138_000_000f64 * 0.910) as i64;
     env.set_slot_and_price_raw_no_walk(start_slot + 20, p2);
     let second_empty = try_empty_crank(&mut env);
+    assert!(
+        second_empty.is_err(),
+        "repeated empty candidate crank must keep rejecting while the exposed target remains uncovered"
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before_walk,
+        "second rejected empty crank must also roll back market-clock progress"
+    );
 
     let after_walk = env.read_insurance_balance();
     let cap_after_walk = env.read_account_capital(target_a_idx);
