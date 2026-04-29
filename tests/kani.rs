@@ -12,7 +12,6 @@
 //! - Nonce monotonicity (unchanged on failure, +1 on success)
 //! - CPI uses exec_size (not requested size)
 //!
-//! Note: CPI execution and risk engine internals are NOT modeled.
 //! Only wrapper-level authorization and binding logic is proven.
 
 #![cfg(kani)]
@@ -3853,4 +3852,62 @@ fn kani_no_oracle_fee_sync_anchor_universal() {
         assert!(anchor >= current_slot);
         assert!(anchor >= account_last_fee_slot);
     }
+}
+
+// =============================================================================
+// AB. ISSUE 65 KEEPER COVERAGE SCAN POLICY (1 proof)
+// =============================================================================
+
+fn issue65_prefix_covered(
+    used: [bool; 4],
+    exposed: [bool; 4],
+    provably_healthy: [bool; 4],
+    phase1_reachable: [bool; 4],
+    len: usize,
+) -> bool {
+    let mut i = 0usize;
+    while i < len {
+        if used[i] && exposed[i] && !provably_healthy[i] && !phase1_reachable[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Prove the issue-65 scan invariant in prefix form. Adding one more account
+/// to a covered prefix preserves coverage iff that account is either unused,
+/// flat, provably healthy, or phase-1 reachable. This is the inductive shape
+/// behind the dense-market fix: solvent exposed accounts do not consume the
+/// bounded phase-1 candidate budget.
+#[kani::proof]
+#[kani::unwind(5)]
+fn kani_issue65_prefix_scan_step_inductive() {
+    let used: [bool; 4] = kani::any();
+    let exposed: [bool; 4] = kani::any();
+    let provably_healthy: [bool; 4] = kani::any();
+    let phase1_reachable: [bool; 4] = kani::any();
+    let len_raw: u8 = kani::any();
+    let len = (len_raw as usize) % 4;
+
+    kani::assume(issue65_prefix_covered(
+        used,
+        exposed,
+        provably_healthy,
+        phase1_reachable,
+        len,
+    ));
+
+    let account_ok = !used[len] || !exposed[len] || provably_healthy[len] || phase1_reachable[len];
+    assert_eq!(
+        issue65_prefix_covered(
+            used,
+            exposed,
+            provably_healthy,
+            phase1_reachable,
+            len + 1,
+        ),
+        account_ok,
+        "covered prefix extends exactly when the next account does not need an unavailable phase-1 slot"
+    );
 }

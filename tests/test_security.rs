@@ -13504,6 +13504,37 @@ fn test_issue65_keeper_crank_does_not_require_all_solvent_accounts_in_phase1_bud
     );
 }
 
+#[test]
+fn test_issue65_keeper_crank_near_mm_accounts_do_not_grief_phase1_budget() {
+    program_path();
+
+    let (mut env, _lp, _lp_idx, actors) = setup_max_risk_probe(65, 0);
+    assert_eq!(actors.len(), 65);
+
+    let start_slot = env.read_last_market_slot();
+    let target_price = max_risk_next_price_signed_bps(MAX_RISK_P0_E6, -1) as i64;
+    env.set_slot_and_price_raw_no_walk(start_slot + 1, target_price);
+
+    let crank = try_empty_crank(&mut env);
+    assert!(
+        crank.is_ok(),
+        "near-MM but solvent exposed accounts must not become a phase-1-budget griefing primitive: {crank:?}"
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        start_slot + 1,
+        "empty crank should advance after certifying near-MM accounts are still solvent"
+    );
+
+    for actor in actors.iter() {
+        assert_ne!(
+            env.read_account_position(actor.idx),
+            0,
+            "near-MM regression should leave solvent accounts open, not require liquidation"
+        );
+    }
+}
+
 fn max_risk_candidate_indices(lp_idx: u16, actors: &[MaxRiskActor]) -> Vec<u16> {
     let mut candidates = Vec::with_capacity(actors.len() + 1);
     candidates.push(lp_idx);
