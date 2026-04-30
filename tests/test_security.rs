@@ -13581,6 +13581,33 @@ fn test_issue65_keeper_crank_near_mm_accounts_do_not_grief_phase1_budget() {
     }
 }
 
+#[test]
+fn test_issue65_tail_candidate_defers_phase2_after_phase1_closures() {
+    program_path();
+
+    let (mut env, _lp, _lp_idx, actors) = setup_max_risk_probe(80, 0);
+    assert!(
+        actors.len() > percolator_prog::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK as usize
+    );
+
+    let start_slot = env.read_last_market_slot();
+    let target_price = max_risk_next_price_signed_bps(MAX_RISK_P0_E6, -49) as i64;
+    env.set_slot_and_price_raw_no_walk(start_slot + 1, target_price);
+
+    let rr_cursor_before = env.read_rr_cursor_position();
+    let candidates: Vec<u16> = actors.iter().map(|a| a.idx).collect();
+    let crank = try_crank_with_candidate_indices(&mut env, &candidates);
+    assert!(
+        crank.is_ok(),
+        "candidate-covered max-risk crank should execute phase 1 and defer phase 2 when a tail candidate would otherwise be reached without policy: {crank:?}"
+    );
+    assert_eq!(
+        env.read_rr_cursor_position(),
+        rr_cursor_before,
+        "phase 2 must be suppressed when phase-1 closures can make an unhealthy tail candidate reachable beyond the phase-1 budget"
+    );
+}
+
 fn max_risk_candidate_indices(lp_idx: u16, actors: &[MaxRiskActor]) -> Vec<u16> {
     let mut candidates = Vec::with_capacity(actors.len() + 1);
     candidates.push(lp_idx);

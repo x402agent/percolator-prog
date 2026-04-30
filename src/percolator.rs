@@ -79,6 +79,10 @@ pub mod constants {
     /// liquidation work. Keep their Phase 2 window at the previously audited
     /// 64-account envelope; empty cranks remain greedy via RR_WINDOW_PER_CRANK.
     pub const RR_WINDOW_WITH_CANDIDATES_PER_CRANK: u64 = 64;
+    /// Engine Phase 2 inspected-slot cap. This is intentionally explicit even
+    /// when the deployment wants full-slab greedy progress: avoid delegating
+    /// unbounded `u64::MAX` scan policy to the engine API.
+    pub const RR_SCAN_LIMIT_PER_CRANK: u64 = percolator::MAX_ACCOUNTS as u64;
 
     // Compile-time invariant: the crank's total fee-sync budget
     // (FEE_SWEEP_BUDGET) must accommodate the wrapper's per-crank
@@ -4425,33 +4429,43 @@ pub mod processor {
         (words[idx >> 6] & (1u64 << (idx & 63))) != 0
     }
 
-    fn phase2_would_touch_idx(engine: &RiskEngine, target_idx: usize, rr_touch_limit: u64) -> bool {
-        if rr_touch_limit == 0 {
-            return false;
+    fn build_phase2_touch_map(
+        engine: &RiskEngine,
+        rr_touch_limit: u64,
+        rr_scan_limit: u64,
+        phase1_reachable: &[u64; (percolator::MAX_ACCOUNTS + 63) / 64],
+    ) -> [u64; (percolator::MAX_ACCOUNTS + 63) / 64] {
+        let mut phase2_touched = [0u64; (percolator::MAX_ACCOUNTS + 63) / 64];
+        if rr_touch_limit == 0 || rr_scan_limit == 0 {
+            return phase2_touched;
         }
         let wrap_bound = core::cmp::min(
             engine.params.max_accounts as usize,
             percolator::MAX_ACCOUNTS,
         );
         if wrap_bound == 0 || engine.rr_cursor_position >= wrap_bound as u64 {
-            return false;
+            return phase2_touched;
         }
         let mut i = engine.rr_cursor_position;
         let mut touched = 0u64;
-        while i < wrap_bound as u64 && touched < rr_touch_limit {
+        let scan_cap = core::cmp::min(rr_scan_limit, wrap_bound as u64);
+        let mut inspected = 0u64;
+        while i < wrap_bound as u64 && inspected < scan_cap && touched < rr_touch_limit {
             let idx = i as usize;
-            if idx_used_in_market(engine, idx) {
-                if idx == target_idx {
-                    return true;
-                }
+            if idx_used_in_market(engine, idx) && !idx_bit(phase1_reachable, idx) {
+                set_idx_bit(&mut phase2_touched, idx);
                 touched = match touched.checked_add(1) {
                     Some(v) => v,
-                    None => return true,
+                    None => return phase2_touched,
                 };
             }
             i += 1;
+            inspected = match inspected.checked_add(1) {
+                Some(v) => v,
+                None => return phase2_touched,
+            };
         }
-        false
+        phase2_touched
     }
 
     fn build_keeper_liquidation_coverage_maps(
@@ -4507,6 +4521,7 @@ pub mod processor {
         funding_rate_e9: i128,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
         rr_window_size: u64,
+        rr_scan_limit: u64,
     ) -> Result<bool, ProgramError> {
         let dt_slots = now_slot.saturating_sub(engine.last_market_slot);
         if dt_slots == 0 && price == engine.last_oracle_price {
@@ -4516,6 +4531,17 @@ pub mod processor {
         let mut defer_phase2 = false;
         let (phase1_reachable, listed_liquidatable) =
             build_keeper_liquidation_coverage_maps(engine, combined, price)?;
+        // Phase 1 runs before Phase 2. Conservatively simulate
+        // phase-1-reachable FullClose candidates as no longer consuming RR
+        // touch budget, because they may be closed before Phase 2 scans. This
+        // can over-defer Phase 2, but it must not under-defer and let Phase 2
+        // touch a deferred unhealthy tail account without its policy.
+        //
+        // Build the map once. Re-scanning the RR window for every listed tail
+        // candidate is O(candidates * scan_window) and can exceed the SVM CU
+        // envelope on dense candidate cascades.
+        let phase2_touched =
+            build_phase2_touch_map(engine, rr_window_size, rr_scan_limit, &phase1_reachable);
         let max_accounts = core::cmp::min(
             engine.params.max_accounts as usize,
             percolator::MAX_ACCOUNTS,
@@ -4553,7 +4579,7 @@ pub mod processor {
                     // candidate is not a reason to suppress phase 2. Suppress
                     // only when the deferred account cannot be proven healthy and
                     // the RR cursor would otherwise touch it without its policy.
-                    if phase2_would_touch_idx(engine, idx, rr_window_size) {
+                    if idx_bit(&phase2_touched, idx) {
                         let provably_healthy = account_provably_above_maintenance_after_accrual(
                             engine,
                             idx,
@@ -4591,13 +4617,17 @@ pub mod processor {
         price: u64,
         funding_rate_e9: i128,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
-    ) -> Result<(bool, u64), ProgramError> {
+    ) -> Result<(bool, u64, u64), ProgramError> {
         reject_stuck_target_accrual(config, engine, now_slot, price)?;
         let rr_window_size = if combined.is_empty() {
             crate::constants::RR_WINDOW_PER_CRANK
         } else {
             crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK
         };
+        let rr_scan_limit = core::cmp::min(
+            crate::constants::RR_SCAN_LIMIT_PER_CRANK,
+            engine.params.max_accounts,
+        );
         let defer_phase2 = check_keeper_crank_market_progress_coverage(
             engine,
             now_slot,
@@ -4605,9 +4635,10 @@ pub mod processor {
             funding_rate_e9,
             combined,
             rr_window_size,
+            rr_scan_limit,
         )?;
         ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)?;
-        Ok((defer_phase2, rr_window_size))
+        Ok((defer_phase2, rr_window_size, rr_scan_limit))
     }
 
     /// Incrementally sweep maintenance fees from the current cursor position.
@@ -6444,33 +6475,57 @@ pub mod processor {
                 // reducing the gap instead of returning CatchupRequired.
                 let partial_target =
                     oversized_catchup_target(engine, clock.slot, price, funding_rate_e9_pre)?;
-                let (crank_slot, crank_price, partial_catchup, defer_phase2, rr_window_size) =
-                    if let Some(target_slot) = partial_target {
-                        let stored_p_last = engine.last_oracle_price;
-                        catchup_accrue(engine, target_slot, stored_p_last, funding_rate_e9_pre)?;
-                        if target_slot > engine.last_market_slot {
-                            engine
-                                .accrue_market_to(target_slot, stored_p_last, funding_rate_e9_pre)
-                                .map_err(map_risk_error)?;
-                        }
-                        let rr_window_size = if combined.is_empty() {
-                            crate::constants::RR_WINDOW_PER_CRANK
-                        } else {
-                            crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK
-                        };
-                        (target_slot, stored_p_last, true, false, rr_window_size)
+                let (
+                    crank_slot,
+                    crank_price,
+                    partial_catchup,
+                    defer_phase2,
+                    rr_window_size,
+                    rr_scan_limit,
+                ) = if let Some(target_slot) = partial_target {
+                    let stored_p_last = engine.last_oracle_price;
+                    catchup_accrue(engine, target_slot, stored_p_last, funding_rate_e9_pre)?;
+                    if target_slot > engine.last_market_slot {
+                        engine
+                            .accrue_market_to(target_slot, stored_p_last, funding_rate_e9_pre)
+                            .map_err(map_risk_error)?;
+                    }
+                    let rr_window_size = if combined.is_empty() {
+                        crate::constants::RR_WINDOW_PER_CRANK
                     } else {
-                        let (defer_phase2, rr_window_size) =
-                            ensure_market_accrued_to_now_for_keeper_crank(
-                                engine,
-                                &config,
-                                clock.slot,
-                                price,
-                                funding_rate_e9_pre,
-                                &combined,
-                            )?;
-                        (clock.slot, price, false, defer_phase2, rr_window_size)
+                        crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK
                     };
+                    let rr_scan_limit = core::cmp::min(
+                        crate::constants::RR_SCAN_LIMIT_PER_CRANK,
+                        engine.params.max_accounts,
+                    );
+                    (
+                        target_slot,
+                        stored_p_last,
+                        true,
+                        false,
+                        rr_window_size,
+                        rr_scan_limit,
+                    )
+                } else {
+                    let (defer_phase2, rr_window_size, rr_scan_limit) =
+                        ensure_market_accrued_to_now_for_keeper_crank(
+                            engine,
+                            &config,
+                            clock.slot,
+                            price,
+                            funding_rate_e9_pre,
+                            &combined,
+                        )?;
+                    (
+                        clock.slot,
+                        price,
+                        false,
+                        defer_phase2,
+                        rr_window_size,
+                        rr_scan_limit,
+                    )
+                };
 
                 // Shared per-instruction fee-sync budget (audit #2).
                 // Candidate syncs run FIRST so the engine's crank sees
@@ -6584,17 +6639,18 @@ pub mod processor {
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
                 let rr_window_size = if defer_phase2 { 0 } else { rr_window_size };
                 let _outcome = engine
-                    .keeper_crank_not_atomic(
-                        crank_slot,
-                        crank_price,
-                        &combined,
-                        crate::constants::LIQ_BUDGET_PER_CRANK,
-                        funding_rate_e9_pre,
+                    .keeper_crank_with_request_not_atomic(percolator::KeeperCrankRequest {
+                        now_slot: crank_slot,
+                        oracle_price: crank_price,
+                        ordered_candidates: &combined,
+                        max_revalidations: crate::constants::LIQ_BUDGET_PER_CRANK,
+                        funding_rate_e9: funding_rate_e9_pre,
                         admit_h_min,
                         admit_h_max,
-                        admit_threshold,
-                        rr_window_size,
-                    )
+                        admit_h_max_consumption_threshold_bps_opt: admit_threshold,
+                        rr_touch_limit: rr_window_size,
+                        rr_scan_limit,
+                    })
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
                 {
