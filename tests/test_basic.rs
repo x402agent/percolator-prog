@@ -147,7 +147,7 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
         let gap = if remaining <= max_delta {
             max_dt
         } else {
-            max_dt + 1
+            max_dt.saturating_mul(2)
         };
         let step_slot = env.read_last_market_slot() + gap;
         env.set_slot_and_price_raw_no_walk(step_slot, target as i64);
