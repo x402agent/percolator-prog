@@ -4078,18 +4078,44 @@ pub mod processor {
         if trading_fee_bps == 0 || size == 0 {
             return Ok(0);
         }
-        let notional = percolator::wide_math::mul_div_floor_u128(
+        let notional = safe_mul_div_floor_u128(
             size.unsigned_abs(),
             exec_price as u128,
             percolator::POS_SCALE,
-        );
+        )?;
         if notional == 0 {
             return Ok(0);
         }
-        let one_side_fee =
-            percolator::wide_math::mul_div_ceil_u128(notional, trading_fee_bps as u128, 10_000);
+        let one_side_fee = safe_mul_div_ceil_u128(notional, trading_fee_bps as u128, 10_000)?;
         one_side_fee
             .checked_mul(2)
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
+
+    fn safe_mul_div_floor_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+        if d == 0 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+        let q = percolator::wide_math::mul_div_floor_u256(
+            percolator::wide_math::U256::from_u128(a),
+            percolator::wide_math::U256::from_u128(b),
+            percolator::wide_math::U256::from_u128(d),
+        );
+        q.try_into_u128()
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
+
+    fn safe_mul_div_ceil_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+        if d == 0 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+        let q = percolator::wide_math::checked_mul_div_ceil_u256(
+            percolator::wide_math::U256::from_u128(a),
+            percolator::wide_math::U256::from_u128(b),
+            percolator::wide_math::U256::from_u128(d),
+        )
+        .ok_or(PercolatorError::EngineOverflow)?;
+        q.try_into_u128()
             .ok_or_else(|| PercolatorError::EngineOverflow.into())
     }
 
@@ -7302,6 +7328,9 @@ pub mod processor {
                 if size == 0 || size == i128::MIN {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                if size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -7570,6 +7599,9 @@ pub mod processor {
                 // Also reject i128::MIN before oracle/CPI work; it has no positive
                 // counterpart and the engine would reject it later.
                 if size == 0 || size == i128::MIN {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                if size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 if lp_idx == user_idx {
@@ -8018,6 +8050,9 @@ pub mod processor {
                     )?;
 
                     let trade_size = crate::policy::cpi_trade_size(ret.exec_size, size);
+                    if trade_size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
                     let current_fee_paid_cap = current_trade_fee_paid_cap(
                         trade_size,
                         exec_price,

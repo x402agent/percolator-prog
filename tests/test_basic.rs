@@ -37,6 +37,16 @@ fn assert_custom_error(err: &str, code_hex: &str, context: &str) {
     );
 }
 
+fn assert_no_sbf_panic(err: &str, context: &str) {
+    assert!(
+        !err.contains("panicked")
+            && !err.contains("SBF program panicked")
+            && !err.contains("mul_div_floor_u128")
+            && !err.contains("mul_div_ceil_u128"),
+        "{context}: expected a clean program error, got panic-shaped failure: {err}",
+    );
+}
+
 fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     let d = env.svm.get_account(&env.slab).unwrap().data;
     const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 696;
@@ -1845,6 +1855,49 @@ fn test_comprehensive_margin_limit_enforcement() {
         "Huge trade exceeding margin should be rejected: {:?}",
         result2
     );
+}
+
+#[test]
+fn test_trade_nocpi_oversized_size_rejects_without_fee_math_panic() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_trading_fee(10);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let user_capital_before = env.read_account_capital(user_idx);
+    let lp_capital_before = env.read_account_capital(lp_idx);
+    let user_position_before = env.read_account_position(user_idx);
+    let lp_position_before = env.read_account_position(lp_idx);
+    let vault_before = env.read_engine_vault();
+    let c_tot_before = env.read_c_tot();
+    let insurance_before = env.read_insurance_balance();
+    let used_before = env.read_num_used_accounts();
+
+    let err = env
+        .try_trade(&user, &lp, lp_idx, user_idx, i128::MAX)
+        .expect_err("oversized TradeNoCpi request must be rejected");
+
+    assert_no_sbf_panic(&err, "oversized TradeNoCpi request");
+    assert!(
+        err.contains("InvalidInstructionData") || err.contains("invalid instruction data"),
+        "oversized TradeNoCpi request should fail at wrapper input validation, got: {err}",
+    );
+    assert_eq!(env.read_account_capital(user_idx), user_capital_before);
+    assert_eq!(env.read_account_capital(lp_idx), lp_capital_before);
+    assert_eq!(env.read_account_position(user_idx), user_position_before);
+    assert_eq!(env.read_account_position(lp_idx), lp_position_before);
+    assert_eq!(env.read_engine_vault(), vault_before);
+    assert_eq!(env.read_c_tot(), c_tot_before);
+    assert_eq!(env.read_insurance_balance(), insurance_before);
+    assert_eq!(env.read_num_used_accounts(), used_before);
 }
 
 /// Test 10: Funding accrual - multiple cranks succeed over time

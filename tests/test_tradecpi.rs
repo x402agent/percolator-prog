@@ -14,6 +14,16 @@ use solana_sdk::{
 };
 use spl_token::state::{Account as TokenAccount, AccountState};
 
+fn assert_no_sbf_panic(err: &str, context: &str) {
+    assert!(
+        !err.contains("panicked")
+            && !err.contains("SBF program panicked")
+            && !err.contains("mul_div_floor_u128")
+            && !err.contains("mul_div_ceil_u128"),
+        "{context}: expected a clean program error, got panic-shaped failure: {err}",
+    );
+}
+
 fn advance_hyperp_target(env: &mut TradeCpiTestEnv, logical_slot: &mut u64) {
     *logical_slot += 1;
     env.set_slot(*logical_slot);
@@ -3003,6 +3013,140 @@ fn test_attack_extreme_position_size() {
         used_after, used_before,
         "Rejected extreme-size trade must not change num_used_accounts"
     );
+}
+
+fn init_lp_with_matcher_fill_cap(
+    env: &mut TradeCpiTestEnv,
+    owner: &Keypair,
+    matcher_program: &Pubkey,
+    max_fill_abs: u128,
+) -> (u16, Pubkey) {
+    let idx = env.account_count;
+    env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    let ata = env.create_ata(&owner.pubkey(), DEFAULT_INIT_PAYMENT);
+
+    let lp_bytes = idx.to_le_bytes();
+    let (lp_pda, _) =
+        Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
+
+    let matcher_context = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            matcher_context,
+            Account {
+                lamports: 10_000_000,
+                data: vec![0; MATCHER_CONTEXT_LEN],
+                owner: *matcher_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let matcher_init = Instruction {
+        program_id: *matcher_program,
+        accounts: vec![
+            AccountMeta::new_readonly(lp_pda, false),
+            AccountMeta::new(matcher_context, false),
+        ],
+        data: encode_init_vamm(MatcherMode::Passive, 5, 10, 200, 0, 0, max_fill_abs, 0),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), matcher_init],
+        Some(&owner.pubkey()),
+        &[owner],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("matcher init with custom fill cap failed");
+
+    let init_lp = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_init_lp(matcher_program, &matcher_context, DEFAULT_INIT_PAYMENT),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), init_lp],
+        Some(&owner.pubkey()),
+        &[owner],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("InitLP with custom-fill matcher failed");
+    env.account_count += 1;
+
+    (idx, matcher_context)
+}
+
+#[test]
+fn test_tradecpi_oversized_matcher_fill_rejects_without_fee_math_panic() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_fee_weighting(&mut env, 1_000_000, 10, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let matcher_program = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_context) =
+        init_lp_with_matcher_fill_cap(&mut env, &lp, &matcher_program, i128::MAX as u128);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let user_capital_before = env.read_account_capital(user_idx);
+    let lp_capital_before = env.read_account_capital(lp_idx);
+    let user_position_before = env.read_account_position(user_idx);
+    let lp_position_before = env.read_account_position(lp_idx);
+    let vault_before = env.read_vault();
+    let c_tot_before = env.read_c_tot();
+    let insurance_before = env.read_insurance_balance();
+    let used_before = env.read_num_used_accounts();
+
+    let err = env
+        .try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            i128::MAX,
+            &matcher_program,
+            &matcher_context,
+        )
+        .expect_err("oversized TradeCpi matcher fill must be rejected");
+
+    assert_no_sbf_panic(&err, "oversized TradeCpi matcher fill");
+    assert!(
+        err.contains("InvalidInstructionData")
+            || err.contains("invalid instruction data")
+            || err.contains("EngineOverflow")
+            || err.contains("0x2"),
+        "oversized TradeCpi matcher fill should reject cleanly, got: {err}",
+    );
+    assert_eq!(env.read_account_capital(user_idx), user_capital_before);
+    assert_eq!(env.read_account_capital(lp_idx), lp_capital_before);
+    assert_eq!(env.read_account_position(user_idx), user_position_before);
+    assert_eq!(env.read_account_position(lp_idx), lp_position_before);
+    assert_eq!(env.read_vault(), vault_before);
+    assert_eq!(env.read_c_tot(), c_tot_before);
+    assert_eq!(env.read_insurance_balance(), insurance_before);
+    assert_eq!(env.read_num_used_accounts(), used_before);
 }
 
 /// ATTACK: Try to trade with i128::MIN position size (negative extreme).
