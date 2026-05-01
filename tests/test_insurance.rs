@@ -1599,6 +1599,12 @@ fn read_withdraw_deposit_remaining_raw(env: &TestEnv) -> u64 {
     )
 }
 
+fn write_engine_vault_raw(env: &mut TestEnv, value: u128) {
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    slab.data[ENGINE_OFFSET..ENGINE_OFFSET + 16].copy_from_slice(&value.to_le_bytes());
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
 /// 1. Positive: default insurance_operator (=admin) signs, amount within bps
 ///    cap, insurance balance decrements by exactly the withdrawal amount.
 #[test]
@@ -1617,6 +1623,49 @@ fn test_withdraw_limited_operator_succeeds() {
 
     assert_eq!(env.read_insurance_balance(), 10_000 - 500);
     assert_eq!(env.vault_balance(), vault_before - 500);
+}
+
+/// 1b. Health gate: bounded live insurance withdrawal is operator extraction
+///      and must reject while the senior residual is negative
+///      (`engine.vault < c_tot + insurance`).
+#[test]
+fn test_withdraw_limited_rejects_negative_senior_residual() {
+    program_path();
+    let mut env = TestEnv::new();
+    setup_bounded_withdrawal(&mut env, 10_000, 500, 100);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let c_tot = env.read_c_tot();
+    let insurance_before = env.read_insurance_balance();
+    let senior = c_tot
+        .checked_add(insurance_before)
+        .expect("test setup senior sum");
+    assert_eq!(senior, 10_000);
+
+    write_engine_vault_raw(&mut env, senior - 1);
+    let spl_vault_before = env.vault_balance();
+    let engine_vault_before = env.read_engine_vault();
+
+    let result = send_withdraw_limited(&mut env, &admin, 1);
+    assert!(
+        result.is_err(),
+        "operator must not withdraw insurance from a live market with negative senior residual"
+    );
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "failed health-gated withdrawal must preserve insurance accounting"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        spl_vault_before,
+        "failed health-gated withdrawal must not transfer vault tokens"
+    );
+    assert_eq!(
+        env.read_engine_vault(),
+        engine_vault_before,
+        "failed health-gated withdrawal must not mutate engine vault accounting"
+    );
 }
 
 /// 2. Cooldown: second call within cooldown slots is rejected.

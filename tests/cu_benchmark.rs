@@ -43,6 +43,12 @@ const MAX_ACCOUNTS: usize = 256;
 const MAX_ACCOUNTS: usize = 1024;
 #[cfg(not(any(feature = "small", feature = "medium")))]
 const MAX_ACCOUNTS: usize = 4096;
+#[cfg(all(feature = "small", not(feature = "medium")))]
+const ENGINE_ACCOUNTS_OFFSET: usize = 1808;
+#[cfg(all(feature = "medium", not(feature = "small")))]
+const ENGINE_ACCOUNTS_OFFSET: usize = 4976;
+#[cfg(not(any(feature = "small", feature = "medium")))]
+const ENGINE_ACCOUNTS_OFFSET: usize = 17648;
 const TEST_MAX_STALENESS_SECS: u64 = percolator_prog::constants::MAX_ORACLE_STALENESS_SECS;
 const BENCHMARK_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 10_000;
 
@@ -210,6 +216,17 @@ fn encode_crank_permissionless(_panic: u8) -> Vec<u8> {
     data
 }
 
+fn encode_crank_with_candidates(candidates: &[u16]) -> Vec<u8> {
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes());
+    data.push(1u8); // format_version = 1
+    for &idx in candidates {
+        data.extend_from_slice(&idx.to_le_bytes());
+        data.push(0u8); // tag 0 = FullClose
+    }
+    data
+}
+
 fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
     let mut data = vec![6u8];
     data.extend_from_slice(&lp.to_le_bytes());
@@ -227,6 +244,7 @@ struct TestEnv {
     vault: Pubkey,
     pyth_index: Pubkey,
     pyth_col: Pubkey,
+    account_count: u16,
 }
 
 impl TestEnv {
@@ -326,6 +344,7 @@ impl TestEnv {
             vault,
             pyth_index,
             pyth_col,
+            account_count: 0,
         }
     }
 
@@ -383,6 +402,32 @@ impl TestEnv {
         self.svm.send_transaction(tx).expect("init_market failed");
     }
 
+    fn init_market_raw(&mut self, data: Vec<u8>) {
+        let admin = &self.payer;
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&admin.pubkey()),
+            &[admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("init_market_raw failed");
+    }
+
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
         let ata = Pubkey::new_unique();
         self.svm
@@ -401,8 +446,13 @@ impl TestEnv {
     }
 
     fn init_lp(&mut self, owner: &Keypair) -> u16 {
+        self.init_lp_with_fee(owner, 100)
+    }
+
+    fn init_lp_with_fee(&mut self, owner: &Keypair, fee: u64) -> u16 {
+        let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 100);
+        let ata = self.create_ata(&owner.pubkey(), fee);
         let matcher = spl_token::ID;
         let ctx = Pubkey::new_unique();
         self.svm
@@ -428,7 +478,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
-            data: encode_init_lp(&matcher, &ctx, 100),
+            data: encode_init_lp(&matcher, &ctx, fee),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -438,12 +488,18 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_lp failed");
-        0
+        self.account_count += 1;
+        idx
     }
 
     fn init_user(&mut self, owner: &Keypair) -> u16 {
+        self.init_user_with_fee(owner, 100)
+    }
+
+    fn init_user_with_fee(&mut self, owner: &Keypair, fee: u64) -> u16 {
+        let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let ata = self.create_ata(&owner.pubkey(), 100);
+        let ata = self.create_ata(&owner.pubkey(), fee);
 
         let ix = Instruction {
             program_id: self.program_id,
@@ -455,7 +511,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
-            data: encode_init_user(100),
+            data: encode_init_user(fee),
         };
 
         let tx = Transaction::new_signed_with_payer(
@@ -465,7 +521,8 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
-        1 // LP is 0
+        self.account_count += 1;
+        idx
     }
 
     fn deposit(&mut self, owner: &Keypair, user_idx: u16, amount: u64) {
@@ -626,6 +683,38 @@ impl TestEnv {
         }
     }
 
+    fn try_crank_with_candidates(
+        &mut self,
+        candidates: &[u16],
+    ) -> Result<(u64, Vec<String>), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+
+        let crank_ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_crank_with_candidates(candidates),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[budget_ix, crank_ix],
+            Some(&caller.pubkey()),
+            &[&caller],
+            self.svm.latest_blockhash(),
+        );
+        match self.svm.send_transaction(tx) {
+            Ok(result) => Ok((result.compute_units_consumed, result.logs)),
+            Err(e) => Err(format!("{:?}", e)),
+        }
+    }
+
     fn top_up_insurance(&mut self, funder: &Keypair, amount: u64) {
         let ata = self.create_ata(&funder.pubkey(), amount);
 
@@ -654,6 +743,84 @@ impl TestEnv {
         self.svm
             .send_transaction(tx)
             .expect("top_up_insurance failed");
+    }
+
+    fn read_last_market_slot(&self) -> u64 {
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        const LAST_MARKET_SLOT_OFFSET: usize = 520 + 672;
+        u64::from_le_bytes(
+            d[LAST_MARKET_SLOT_OFFSET..LAST_MARKET_SLOT_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn read_rr_cursor_position(&self) -> u64 {
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        const RR_CURSOR_OFFSET: usize = 520 + 592;
+        u64::from_le_bytes(
+            d[RR_CURSOR_OFFSET..RR_CURSOR_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    fn read_account_position(&self, idx: u16) -> i128 {
+        let d = self.svm.get_account(&self.slab).unwrap().data;
+        const ENGINE: usize = 520;
+        const ACCOUNTS_OFFSET: usize = ENGINE + ENGINE_ACCOUNTS_OFFSET;
+        const ACCOUNT_SIZE: usize = 360;
+        const PBQ: usize = 56;
+        const A_BASIS: usize = 72;
+        const EPOCH_SNAP: usize = 120;
+        const ADL_MULT_LONG: usize = ENGINE + 360;
+        const ADL_MULT_SHORT: usize = ENGINE + 376;
+        const ADL_EPOCH_LONG: usize = ENGINE + 424;
+        const ADL_EPOCH_SHORT: usize = ENGINE + 432;
+
+        let acc_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE;
+        if d.len() < acc_off + ACCOUNT_SIZE {
+            return 0;
+        }
+        let basis = i128::from_le_bytes(d[acc_off + PBQ..acc_off + PBQ + 16].try_into().unwrap());
+        if basis == 0 {
+            return 0;
+        }
+        let a_basis = u128::from_le_bytes(
+            d[acc_off + A_BASIS..acc_off + A_BASIS + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let epoch_snap = u64::from_le_bytes(
+            d[acc_off + EPOCH_SNAP..acc_off + EPOCH_SNAP + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if a_basis == 0 {
+            return 0;
+        }
+        let (a_side, epoch_side) = if basis > 0 {
+            let a = u128::from_le_bytes(d[ADL_MULT_LONG..ADL_MULT_LONG + 16].try_into().unwrap());
+            let e = u64::from_le_bytes(d[ADL_EPOCH_LONG..ADL_EPOCH_LONG + 8].try_into().unwrap());
+            (a, e)
+        } else {
+            let a = u128::from_le_bytes(d[ADL_MULT_SHORT..ADL_MULT_SHORT + 16].try_into().unwrap());
+            let e = u64::from_le_bytes(d[ADL_EPOCH_SHORT..ADL_EPOCH_SHORT + 8].try_into().unwrap());
+            (a, e)
+        };
+        if epoch_snap != epoch_side {
+            return 0;
+        }
+        let effective = if a_side == a_basis {
+            basis.unsigned_abs()
+        } else {
+            basis.unsigned_abs().saturating_mul(a_side) / a_basis
+        };
+        if basis < 0 {
+            -(effective as i128)
+        } else {
+            effective as i128
+        }
     }
 }
 
@@ -780,6 +947,214 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
         }
     }
     users
+}
+
+const DENSE_CRANK_P0_E6: u64 = 200_000_000;
+const DENSE_CRANK_START_SLOT: u64 = 100;
+const DENSE_CRANK_CAP_BPS: u64 = 49;
+const DENSE_CRANK_CAPITAL_PER_USER: u64 = 1_000_000_000;
+const DENSE_CRANK_LP_CAPITAL: u64 = 10_000_000_000_000;
+const DENSE_CRANK_INSURANCE: u64 = 1_000_000_000;
+const DENSE_CRANK_LEVERAGE_MILLI: u128 = 20_000;
+const DENSE_CRANK_SETUP_BUFFER: u64 = 300_000_000;
+
+fn encode_dense_crank_market(admin: &Pubkey, mint: &Pubkey) -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.as_ref());
+    data.extend_from_slice(mint.as_ref());
+    data.extend_from_slice(&BENCHMARK_FEED_ID);
+    data.extend_from_slice(&600u64.to_le_bytes()); // max_staleness_secs
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    data.push(0); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+
+    // Same high-risk shape used by the security probe: h_min=0 product mode,
+    // 20x notional, and a 49 bps/slot cap. The benchmark advances by a capped
+    // 40-slot move, then submits a saturated candidate tail to exercise the
+    // dense keeper-crank CU envelope.
+    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    data.extend_from_slice(&500u64.to_le_bytes()); // initial_margin_bps
+    data.extend_from_slice(&1u64.to_le_bytes()); // trading_fee_bps
+    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&86_400u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&9u64.to_le_bytes()); // legacy max_crank_staleness_slots
+    data.extend_from_slice(&5u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&50_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&1_000u64.to_le_bytes()); // resolve_price_deviation_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data.extend_from_slice(&500u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&600u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&DENSE_CRANK_CAP_BPS.to_le_bytes());
+
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&BENCHMARK_PERMISSIONLESS_RESOLVE_STALE_SLOTS.to_le_bytes());
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    data.extend_from_slice(&10u64.to_le_bytes()); // force_close_delay_slots
+    data
+}
+
+fn dense_crank_position_size(capital: u64, price_e6: u64) -> i128 {
+    let notional = (capital as u128) * DENSE_CRANK_LEVERAGE_MILLI / 1_000;
+    let q = notional
+        .saturating_mul(percolator::POS_SCALE)
+        .checked_div(price_e6 as u128)
+        .expect("nonzero price");
+    q as i128
+}
+
+fn dense_crank_next_price_for_dt(price_e6: u64, signed_bps_per_slot: i16, dt_slots: u64) -> u64 {
+    let abs_bps = signed_bps_per_slot.unsigned_abs() as u64;
+    assert!(abs_bps <= DENSE_CRANK_CAP_BPS);
+    let delta = (price_e6 as u128)
+        .saturating_mul(abs_bps as u128)
+        .saturating_mul(dt_slots as u128)
+        / 10_000;
+    if signed_bps_per_slot < 0 {
+        price_e6.saturating_sub(delta as u64)
+    } else {
+        price_e6.saturating_add(delta as u64)
+    }
+}
+
+fn count_open_positions(env: &TestEnv, indices: &[u16]) -> usize {
+    indices
+        .iter()
+        .filter(|&&idx| env.read_account_position(idx) != 0)
+        .count()
+}
+
+#[cfg(not(feature = "test"))]
+#[test]
+fn benchmark_keeper_crank_dense_candidate_cap_fixed_size_and_progress() {
+    println!("\n=== KEEPER DENSE CANDIDATE-CAP CU REGRESSION ===");
+    println!(
+        "candidate cap={}, phase1 budget={}, max accounts={}",
+        percolator_prog::constants::MAX_KEEPER_CANDIDATES,
+        percolator_prog::constants::LIQ_BUDGET_PER_CRANK,
+        MAX_ACCOUNTS
+    );
+
+    let test_sizes: &[usize] = if MAX_ACCOUNTS >= 512 {
+        &[128, 256, 512, 1024, MAX_ACCOUNTS - 1]
+    } else {
+        &[64, 128, 192]
+    };
+    let mut saturated_reference: Option<u64> = None;
+    let mut results = Vec::new();
+
+    for &num_actors in test_sizes {
+        assert!(num_actors + 1 <= MAX_ACCOUNTS);
+        let mut env = TestEnv::new();
+        env.write_price_and_clock(DENSE_CRANK_P0_E6 as i64, DENSE_CRANK_START_SLOT);
+        let admin = env.payer.pubkey();
+        let mint = env.mint;
+        env.init_market_raw(encode_dense_crank_market(&admin, &mint));
+
+        let lp = Keypair::new();
+        let lp_idx = env.init_lp_with_fee(&lp, DENSE_CRANK_LP_CAPITAL + DENSE_CRANK_SETUP_BUFFER);
+        let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+        env.top_up_insurance(&payer, DENSE_CRANK_INSURANCE);
+
+        let size = dense_crank_position_size(DENSE_CRANK_CAPITAL_PER_USER, DENSE_CRANK_P0_E6);
+        let mut actors = Vec::with_capacity(num_actors);
+        for _ in 0..num_actors {
+            let user = Keypair::new();
+            let user_idx = env.init_user_with_fee(
+                &user,
+                DENSE_CRANK_CAPITAL_PER_USER + DENSE_CRANK_SETUP_BUFFER,
+            );
+            let direction = if actors.len() < percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+                1i128
+            } else {
+                -1i128
+            };
+            env.trade(&user, &lp, lp_idx, user_idx, size * direction);
+            actors.push(user_idx);
+        }
+
+        let start_slot = env.read_last_market_slot();
+        let target_dt_slots = 40;
+        let target = dense_crank_next_price_for_dt(
+            DENSE_CRANK_P0_E6,
+            -(DENSE_CRANK_CAP_BPS as i16),
+            target_dt_slots,
+        );
+        env.set_price(target as i64, start_slot + target_dt_slots);
+
+        let mut worst_cu = 0u64;
+        let mut total_closed = 0usize;
+        let rounds = 4usize.min(
+            (num_actors + percolator_prog::constants::LIQ_BUDGET_PER_CRANK as usize - 1)
+                / percolator_prog::constants::LIQ_BUDGET_PER_CRANK as usize,
+        );
+        for round in 0..rounds {
+            let before_open = count_open_positions(&env, &actors);
+            let before_slot = env.read_last_market_slot();
+            let before_rr = env.read_rr_cursor_position();
+            let candidates: Vec<u16> = actors
+                .iter()
+                .copied()
+                .filter(|&idx| env.read_account_position(idx) != 0)
+                .take(percolator_prog::constants::MAX_KEEPER_CANDIDATES)
+                .collect();
+            assert!(
+                !candidates.is_empty(),
+                "dense setup should still have open candidates on round {round}"
+            );
+
+            let (cu, _logs) = env
+                .try_crank_with_candidates(&candidates)
+                .expect("dense candidate-cap crank must not brick");
+            assert!(
+                cu <= 1_400_000,
+                "keeper crank exceeded SVM tx limit: actors={num_actors}, round={round}, cu={cu}"
+            );
+            worst_cu = worst_cu.max(cu);
+
+            let after_open = count_open_positions(&env, &actors);
+            let after_slot = env.read_last_market_slot();
+            let after_rr = env.read_rr_cursor_position();
+            let closed = before_open.saturating_sub(after_open);
+            total_closed += closed;
+            assert!(
+                after_slot > before_slot || after_rr != before_rr || closed > 0,
+                "dense candidate-cap crank made no observable progress: actors={num_actors}, round={round}, cu={cu}, before_open={before_open}, after_open={after_open}, before_slot={before_slot}, after_slot={after_slot}, before_rr={before_rr}, after_rr={after_rr}"
+            );
+            println!(
+                "  actors={num_actors:>3}, round={round:>2}: cu={cu:>8}, closed={closed:>2}, open_after={after_open:>3}, rr={before_rr}->{after_rr}, slot={before_slot}->{after_slot}"
+            );
+        }
+
+        assert!(
+            total_closed > 0 || env.read_last_market_slot() > start_slot,
+            "dense candidate-cap sequence should make durable progress"
+        );
+        println!("  actors={num_actors:>3}: worst_cu={worst_cu:>8}, total_closed={total_closed}");
+        if num_actors == percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+            saturated_reference = Some(worst_cu);
+        }
+        results.push((num_actors, worst_cu));
+    }
+
+    let reference = saturated_reference.expect("test sizes must include candidate cap");
+    for (num_actors, worst_cu) in results {
+        if num_actors <= percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+            continue;
+        }
+        assert!(
+            worst_cu <= reference + 250_000,
+            "keeper CU should remain budget-shaped once candidate cap is saturated: cap_cu={reference}, actors={num_actors}, worst_cu={worst_cu}"
+        );
+    }
 }
 
 #[cfg(not(feature = "test"))]

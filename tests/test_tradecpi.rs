@@ -20,6 +20,52 @@ fn advance_hyperp_target(env: &mut TradeCpiTestEnv, logical_slot: &mut u64) {
     env.crank();
 }
 
+fn init_tradecpi_market_with_perm_resolve(env: &mut TradeCpiTestEnv, perm_resolve_slots: u64) {
+    let admin = &env.payer;
+    let dummy_ata = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_init_market_with_cap(
+            &admin.pubkey(),
+            &env.mint,
+            &TEST_FEED_ID,
+            0,
+            perm_resolve_slots,
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("init_tradecpi_market_with_perm_resolve failed");
+}
+
 /// CRITICAL: TradeCpi allows trading without LP signature
 ///
 /// The LP delegates trade authorization to a matcher program. The percolator
@@ -6086,6 +6132,120 @@ fn test_tradecpi_nonzero_fill_requires_crank_for_exposed_price_progress() {
         &walker_matcher_ctx,
     )
     .expect("TradeCpi should succeed once KeeperCrank has caught up");
+}
+
+#[test]
+fn test_tradecpi_far_behind_recovers_after_repeated_keeper_cranks() {
+    let read_last_market_slot = |env: &TradeCpiTestEnv| -> u64 {
+        let data = env.svm.get_account(&env.slab).unwrap().data;
+        let off = ENGINE_OFFSET + 672;
+        u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+    };
+
+    let mut env = TradeCpiTestEnv::new();
+    init_tradecpi_market_with_perm_resolve(&mut env, 1_000);
+    let mp = env.matcher_program_id;
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(50);
+    env.crank();
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000,
+        &mp,
+        &matcher_ctx,
+    )
+    .expect("opening TradeCpi should succeed");
+
+    let walker_lp = Keypair::new();
+    let (walker_lp_idx, walker_matcher_ctx) = env.init_lp_with_matcher(&walker_lp, &mp);
+    env.deposit(&walker_lp, walker_lp_idx, 10_000_000_000);
+
+    let walker_user = Keypair::new();
+    let walker_user_idx = env.init_user(&walker_user);
+    env.deposit(&walker_user, walker_user_idx, 1_000_000_000);
+
+    let slot_before = read_last_market_slot(&env);
+    let target = {
+        let d = env.svm.get_account(&env.slab).unwrap().data;
+        (percolator_prog::state::read_config(&d).last_effective_price_e6 + 1) as i64
+    };
+    let far_slot = slot_before + percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS * 50 + 7;
+    let publish_time = far_slot as i64;
+    env.svm.set_sysvar(&Clock {
+        slot: far_slot,
+        unix_timestamp: publish_time,
+        ..Clock::default()
+    });
+    let pyth_data = make_pyth_data(&TEST_FEED_ID, target, -6, 1, publish_time);
+    for oracle in [env.pyth_index, env.pyth_col] {
+        env.svm
+            .set_account(
+                oracle,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data.clone(),
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    let err = env
+        .try_trade_cpi(
+            &walker_user,
+            &walker_lp.pubkey(),
+            walker_lp_idx,
+            walker_user_idx,
+            1_000,
+            &mp,
+            &walker_matcher_ctx,
+        )
+        .expect_err("far-behind TradeCpi must not be a hidden crank path");
+    assert!(
+        err.contains("0x1d"),
+        "far-behind TradeCpi must surface CatchupRequired, got: {err}",
+    );
+    assert_eq!(
+        read_last_market_slot(&env),
+        slot_before,
+        "rejected far-behind TradeCpi must not advance exposed market time",
+    );
+
+    for _ in 0..8 {
+        if read_last_market_slot(&env) >= far_slot {
+            break;
+        }
+        env.crank();
+    }
+    assert_eq!(
+        read_last_market_slot(&env),
+        far_slot,
+        "repeated KeeperCranks must fully catch up the TradeCpi market",
+    );
+
+    env.try_trade_cpi(
+        &walker_user,
+        &walker_lp.pubkey(),
+        walker_lp_idx,
+        walker_user_idx,
+        2_000,
+        &mp,
+        &walker_matcher_ctx,
+    )
+    .expect("TradeCpi should succeed after repeated KeeperCrank catchup");
 }
 
 // ============================================================================

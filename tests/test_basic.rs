@@ -256,6 +256,78 @@ fn test_trade_nocpi_requires_crank_for_exposed_price_progress() {
 }
 
 #[test]
+fn test_trade_nocpi_far_behind_recovers_after_repeated_keeper_cranks() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 1_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    let walker_lp = Keypair::new();
+    let walker_lp_idx = env.init_lp(&walker_lp);
+    env.deposit(&walker_lp, walker_lp_idx, 10_000_000_000);
+
+    let walker_user = Keypair::new();
+    let walker_user_idx = env.init_user(&walker_user);
+    env.deposit(&walker_user, walker_user_idx, 1_000_000_000);
+
+    let slot_before = env.read_last_market_slot();
+    let far_slot = slot_before + percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS * 50 + 7;
+    let target = (env.read_last_effective_price() + 1) as i64;
+    env.set_slot_and_price_raw_no_walk(far_slot, target);
+
+    let err = env
+        .try_trade(
+            &walker_user,
+            &walker_lp,
+            walker_lp_idx,
+            walker_user_idx,
+            1_000,
+        )
+        .expect_err("TradeNoCpi must not be the far-behind catchup path");
+    assert_custom_error(
+        &err,
+        "0x1d",
+        "far-behind TradeNoCpi must surface CatchupRequired",
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before,
+        "rejected far-behind TradeNoCpi must not advance market time",
+    );
+
+    for _ in 0..8 {
+        if env.read_last_market_slot() >= far_slot {
+            break;
+        }
+        env.try_crank()
+            .expect("KeeperCrank must keep committing far-behind progress");
+    }
+    assert_eq!(
+        env.read_last_market_slot(),
+        far_slot,
+        "repeated KeeperCranks must fully catch up the exposed market",
+    );
+
+    env.try_trade(
+        &walker_user,
+        &walker_lp,
+        walker_lp_idx,
+        walker_user_idx,
+        2_000,
+    )
+    .expect("TradeNoCpi should succeed after repeated KeeperCrank catchup");
+}
+
+#[test]
 fn test_keeper_crank_auto_commits_partial_catchup_when_gap_exceeds_inline_budget() {
     program_path();
 
@@ -277,9 +349,15 @@ fn test_keeper_crank_auto_commits_partial_catchup_when_gap_exceeds_inline_budget
     let inline_budget = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS * 20;
     let far_slot = slot_before + inline_budget + 50;
     env.set_slot_and_price_raw_no_walk(far_slot, target as i64);
+    let insurance_before = env.read_insurance_balance();
 
     env.try_crank_once()
         .expect("first crank should commit a partial catchup chunk");
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "partial catchup at stored P_last must not realize an insurance loss"
+    );
     assert_eq!(
         env.read_last_market_slot(),
         slot_before + inline_budget,
@@ -303,6 +381,10 @@ fn test_keeper_crank_auto_commits_partial_catchup_when_gap_exceeds_inline_budget
 
     env.try_crank_once()
         .expect("second crank should finish the remaining gap");
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "finishing a bounded catchup must not drain insurance below the pre-catchup balance"
+    );
     assert_eq!(
         env.read_last_market_slot(),
         far_slot,
@@ -3979,6 +4061,53 @@ fn test_keeper_crank_format_v1_rejects_trailing_bytes() {
     );
 }
 
+/// KeeperCrank candidate lists are capped by the wrapper ABI. This is a CU
+/// boundary, not a semantic liquidation limit: callers can submit later
+/// candidates on later cranks, but one transaction cannot carry an unbounded
+/// invalid tail that burns scan time.
+#[test]
+fn test_keeper_crank_format_v1_rejects_candidate_cap_overflow() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
+
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes());
+    data.push(1u8);
+    for i in 0..=percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+        data.extend_from_slice(&(i as u16).to_le_bytes());
+        data.push(0xFFu8);
+    }
+    assert!(
+        percolator_prog::ix::Instruction::decode(&data).is_err(),
+        "decoder must reject candidate lists above MAX_KEEPER_CANDIDATES"
+    );
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "runtime KeeperCrank must reject candidate lists above MAX_KEEPER_CANDIDATES"
+    );
+}
+
 /// Self-crank with wrong signer must be rejected.
 ///
 /// When caller_idx is set to a specific account index (not u16::MAX),
@@ -6430,6 +6559,17 @@ fn test_keeper_crank_healthy_tail_candidate_does_not_defer_phase2() {
         let idx = env.init_user(&owner);
         env.deposit(&owner, idx, 10_000_000_000);
         env.trade(&owner, &lp, lp_idx, idx, 10_000_000);
+    }
+
+    // Ensure a successful candidate-bearing Phase 2 cannot scan every used
+    // account and wrap back to cursor 0 in one crank. Newer engine semantics
+    // intentionally avoid advancing sweep_generation twice in the same slot,
+    // so a sparse full-wrap can look unchanged if this test only observes
+    // cursor/generation.
+    for _ in 0..percolator_prog::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK {
+        let owner = Keypair::new();
+        let idx = env.init_user(&owner);
+        env.deposit(&owner, idx, 10_000_000_000);
     }
 
     env.trade(&target, &lp, lp_idx, target_idx, 1_000_000);

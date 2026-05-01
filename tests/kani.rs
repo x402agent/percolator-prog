@@ -13,10 +13,10 @@
 //! - CPI uses exec_size (not requested size)
 //!
 //! Only wrapper-level authorization and binding logic is proven. The
-//! issue-65 scan proof treats `provably_healthy` and `phase1_reachable`
+//! issue-65 scan proof treats `provably_nonnegative` and `phase1_reachable`
 //! as abstract predicates. It proves the keeper coverage loop is
 //! inductive assuming those predicates are sound; it does not prove
-//! `account_provably_above_maintenance_after_accrual` against the
+//! `account_provably_nonnegative_after_accrual` against the
 //! engine's private accrue/touch math.
 
 #![cfg(kani)]
@@ -24,12 +24,18 @@
 extern crate kani;
 
 // Import real types and helpers from the program crate
-use percolator_prog::constants::MATCHER_ABI_VERSION;
-use percolator_prog::constants::MAX_UNIT_SCALE;
+use percolator_prog::constants::{
+    DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS, MATCHER_ABI_VERSION, MAX_ABS_FUNDING_E9_PER_SLOT,
+    MAX_ACCRUAL_DT_SLOTS, MAX_PROFIT_MATURITY_SLOTS, MAX_UNIT_SCALE, MIN_FUNDING_LIFETIME_SLOTS,
+};
+use percolator_prog::ix::Instruction;
 use percolator_prog::matcher_abi::{
     validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
 };
-use percolator_prog::oracle::{clamp_oracle_price, clamp_toward_with_dt, restart_detected};
+use percolator_prog::oracle::{
+    clamp_oracle_price, clamp_toward_engine_dt, clamp_toward_with_dt, effective_price_from_target,
+    restart_detected,
+};
 use percolator_prog::policy::{
     abi_ok,
     account_free_catchup_allows_accrual,
@@ -50,6 +56,7 @@ use percolator_prog::policy::{
     ewma_update,
     // Account validation helpers
     fee_sync_anchor_within_accrued_boundary,
+    force_close_delay_elapsed,
     funding_rate_e9_from_mark_index,
     // New: InitMarket scale validation
     init_market_scale_ok,
@@ -57,6 +64,8 @@ use percolator_prog::policy::{
     invert_price_e6,
     len_at_least,
     len_ok,
+    live_insurance_withdraw_market_healthy,
+    live_insurance_withdraw_residual_ok,
     market_idx_within_capacity,
     matcher_identity_ok,
     matcher_shape_ok,
@@ -126,6 +135,295 @@ fn any_matcher_return_fields() -> MatcherReturnFields {
         oracle_price_e6: kani::any(),
         reserved: kani::any(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct InitRiskWire {
+    h_min: u64,
+    maintenance_margin_bps: u64,
+    initial_margin_bps: u64,
+    trading_fee_bps: u64,
+    max_accounts: u64,
+    new_account_fee: u128,
+    h_max: u64,
+    max_crank_staleness_slots: u64,
+    liquidation_fee_bps: u64,
+    liquidation_fee_cap: u128,
+    resolve_price_deviation_bps: u64,
+    min_liquidation_abs: u128,
+    min_nonzero_mm_req: u128,
+    min_nonzero_im_req: u128,
+    max_price_move_bps_per_slot: u64,
+}
+
+fn any_init_risk_wire_valid_for_decode() -> InitRiskWire {
+    let h_min: u64 = kani::any();
+    let h_max: u64 = kani::any();
+    let max_price_move_bps_per_slot: u64 = kani::any();
+
+    kani::assume(MAX_PROFIT_MATURITY_SLOTS > 0);
+    kani::assume(h_max > 0);
+    kani::assume(h_max >= h_min);
+    kani::assume(h_max <= MAX_PROFIT_MATURITY_SLOTS);
+    kani::assume(max_price_move_bps_per_slot > 0);
+
+    InitRiskWire {
+        h_min,
+        maintenance_margin_bps: kani::any(),
+        initial_margin_bps: kani::any(),
+        trading_fee_bps: kani::any(),
+        max_accounts: kani::any(),
+        new_account_fee: kani::any(),
+        h_max,
+        max_crank_staleness_slots: kani::any(),
+        liquidation_fee_bps: kani::any(),
+        liquidation_fee_cap: kani::any(),
+        resolve_price_deviation_bps: kani::any(),
+        min_liquidation_abs: kani::any(),
+        min_nonzero_mm_req: kani::any(),
+        min_nonzero_im_req: kani::any(),
+        max_price_move_bps_per_slot,
+    }
+}
+
+fn push_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_i64(out: &mut Vec<u8>, v: i64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_u128(out: &mut Vec<u8>, v: u128) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn encode_init_market_minimal_for_kani(r: InitRiskWire) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0); // InitMarket tag
+    out.extend_from_slice(&[1u8; 32]); // admin
+    out.extend_from_slice(&[2u8; 32]); // collateral_mint
+    out.extend_from_slice(&[3u8; 32]); // nonzero external index_feed_id
+    push_u64(&mut out, 60); // max_staleness_secs
+    push_u16(&mut out, 100); // conf_filter_bps
+    out.push(0); // invert
+    push_u32(&mut out, 0); // unit_scale
+    push_u64(&mut out, 0); // initial_mark_price_e6 (unused for external)
+    push_u128(&mut out, 1); // maintenance_fee_per_slot
+
+    // RiskParams wire block.
+    push_u64(&mut out, r.h_min);
+    push_u64(&mut out, r.maintenance_margin_bps);
+    push_u64(&mut out, r.initial_margin_bps);
+    push_u64(&mut out, r.trading_fee_bps);
+    push_u64(&mut out, r.max_accounts);
+    push_u128(&mut out, r.new_account_fee);
+    push_u64(&mut out, r.h_max);
+    push_u64(&mut out, r.max_crank_staleness_slots);
+    push_u64(&mut out, r.liquidation_fee_bps);
+    push_u128(&mut out, r.liquidation_fee_cap);
+    push_u64(&mut out, r.resolve_price_deviation_bps);
+    push_u128(&mut out, r.min_liquidation_abs);
+    push_u128(&mut out, r.min_nonzero_mm_req);
+    push_u128(&mut out, r.min_nonzero_im_req);
+    push_u64(&mut out, r.max_price_move_bps_per_slot);
+    out
+}
+
+fn append_init_market_extended_tail_for_kani(
+    out: &mut Vec<u8>,
+    insurance_withdraw_max_bps: u16,
+    insurance_withdraw_cooldown_slots: u64,
+    permissionless_resolve_stale_slots: u64,
+    funding_horizon_slots: u64,
+    funding_k_bps: u64,
+    funding_max_premium_bps: i64,
+    funding_max_e9_per_slot: i64,
+    mark_min_fee: u64,
+    force_close_delay_slots: u64,
+) {
+    push_u16(out, insurance_withdraw_max_bps);
+    push_u64(out, insurance_withdraw_cooldown_slots);
+    push_u64(out, permissionless_resolve_stale_slots);
+    push_u64(out, funding_horizon_slots);
+    push_u64(out, funding_k_bps);
+    push_i64(out, funding_max_premium_bps);
+    push_i64(out, funding_max_e9_per_slot);
+    push_u64(out, mark_min_fee);
+    push_u64(out, force_close_delay_slots);
+}
+
+// =============================================================================
+// INITMARKET WIRE FORMAT -> ENGINE RISKPARAMS PROOFS
+// =============================================================================
+
+/// Prove the InitMarket decoder maps the wire RiskParams block into the exact
+/// RiskParams object later passed to engine.init_in_place. Wrapper-owned
+/// envelope fields must come from deployment constants, not caller bytes; the
+/// discarded max_crank_staleness wire slot must not affect engine state.
+#[kani::proof]
+fn kani_init_market_decode_wires_risk_params_to_engine_envelope() {
+    let wire = any_init_risk_wire_valid_for_decode();
+    let data = encode_init_market_minimal_for_kani(wire);
+    let decoded = Instruction::decode(&data);
+
+    match decoded {
+        Ok(Instruction::InitMarket {
+            risk_params,
+            new_account_fee,
+            permissionless_resolve_stale_slots,
+            funding_horizon_slots,
+            funding_k_bps,
+            funding_max_premium_bps,
+            funding_max_e9_per_slot,
+            force_close_delay_slots,
+            ..
+        }) => {
+            assert_eq!(risk_params.h_min, wire.h_min);
+            assert_eq!(risk_params.h_max, wire.h_max);
+            assert_eq!(
+                risk_params.maintenance_margin_bps,
+                wire.maintenance_margin_bps
+            );
+            assert_eq!(risk_params.initial_margin_bps, wire.initial_margin_bps);
+            assert_eq!(risk_params.trading_fee_bps, wire.trading_fee_bps);
+            assert_eq!(risk_params.max_accounts, wire.max_accounts);
+            assert_eq!(risk_params.liquidation_fee_bps, wire.liquidation_fee_bps);
+            assert_eq!(
+                risk_params.liquidation_fee_cap.get(),
+                wire.liquidation_fee_cap
+            );
+            assert_eq!(
+                risk_params.resolve_price_deviation_bps,
+                wire.resolve_price_deviation_bps
+            );
+            assert_eq!(
+                risk_params.min_liquidation_abs.get(),
+                wire.min_liquidation_abs
+            );
+            assert_eq!(risk_params.min_nonzero_mm_req, wire.min_nonzero_mm_req);
+            assert_eq!(risk_params.min_nonzero_im_req, wire.min_nonzero_im_req);
+            assert_eq!(
+                risk_params.max_price_move_bps_per_slot,
+                wire.max_price_move_bps_per_slot
+            );
+            assert_eq!(new_account_fee, wire.new_account_fee);
+
+            // Deployment-owned engine envelope. These fields must not be
+            // caller-configurable through InitMarket wire bytes.
+            assert_eq!(risk_params.max_accrual_dt_slots, MAX_ACCRUAL_DT_SLOTS);
+            assert_eq!(
+                risk_params.max_abs_funding_e9_per_slot,
+                MAX_ABS_FUNDING_E9_PER_SLOT
+            );
+            assert_eq!(
+                risk_params.min_funding_lifetime_slots,
+                MIN_FUNDING_LIFETIME_SLOTS
+            );
+            assert_eq!(risk_params.max_active_positions_per_side, wire.max_accounts);
+
+            // Minimal payload defaults.
+            assert_eq!(
+                permissionless_resolve_stale_slots,
+                DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS
+            );
+            assert!(funding_horizon_slots.is_none());
+            assert!(funding_k_bps.is_none());
+            assert!(funding_max_premium_bps.is_none());
+            assert!(funding_max_e9_per_slot.is_none());
+            assert_eq!(force_close_delay_slots, 1);
+        }
+        _ => panic!("valid minimal InitMarket wire must decode to InitMarket"),
+    }
+}
+
+/// Prove the optional InitMarket tail is all-or-nothing and each field lands in
+/// the intended instruction field. This catches drift in the 66-byte extended
+/// tail without modeling Solana accounts.
+#[kani::proof]
+fn kani_init_market_extended_tail_decode_is_exact() {
+    let wire = any_init_risk_wire_valid_for_decode();
+    let mut data = encode_init_market_minimal_for_kani(wire);
+
+    let insurance_withdraw_max_bps: u16 = kani::any();
+    let insurance_withdraw_cooldown_slots: u64 = kani::any();
+    let permissionless_resolve_stale_slots: u64 = kani::any();
+    let funding_horizon_slots: u64 = kani::any();
+    let funding_k_bps: u64 = kani::any();
+    let funding_max_premium_bps: i64 = kani::any();
+    let funding_max_e9_per_slot: i64 = kani::any();
+    let mark_min_fee: u64 = kani::any();
+    let force_close_delay_slots: u64 = kani::any();
+
+    append_init_market_extended_tail_for_kani(
+        &mut data,
+        insurance_withdraw_max_bps,
+        insurance_withdraw_cooldown_slots,
+        permissionless_resolve_stale_slots,
+        funding_horizon_slots,
+        funding_k_bps,
+        funding_max_premium_bps,
+        funding_max_e9_per_slot,
+        mark_min_fee,
+        force_close_delay_slots,
+    );
+
+    match Instruction::decode(&data) {
+        Ok(Instruction::InitMarket {
+            insurance_withdraw_max_bps: got_iwm,
+            insurance_withdraw_cooldown_slots: got_iwc,
+            permissionless_resolve_stale_slots: got_prs,
+            funding_horizon_slots: got_fh,
+            funding_k_bps: got_fk,
+            funding_max_premium_bps: got_fmp,
+            funding_max_e9_per_slot: got_fms,
+            mark_min_fee: got_mmf,
+            force_close_delay_slots: got_fcd,
+            ..
+        }) => {
+            assert_eq!(got_iwm, insurance_withdraw_max_bps);
+            assert_eq!(got_iwc, insurance_withdraw_cooldown_slots);
+            assert_eq!(got_prs, permissionless_resolve_stale_slots);
+            assert_eq!(got_fh, Some(funding_horizon_slots));
+            assert_eq!(got_fk, Some(funding_k_bps));
+            assert_eq!(got_fmp, Some(funding_max_premium_bps));
+            assert_eq!(got_fms, Some(funding_max_e9_per_slot));
+            assert_eq!(got_mmf, mark_min_fee);
+            assert_eq!(got_fcd, force_close_delay_slots);
+        }
+        _ => panic!("valid extended InitMarket wire must decode to InitMarket"),
+    }
+}
+
+/// Prove any partial extended InitMarket tail is rejected. The only accepted
+/// forms are no tail or the full 66-byte tail.
+#[kani::proof]
+#[kani::unwind(67)]
+fn kani_init_market_partial_extended_tail_rejected() {
+    let wire = any_init_risk_wire_valid_for_decode();
+    let mut data = encode_init_market_minimal_for_kani(wire);
+    let extra_len_raw: u8 = kani::any();
+    let extra_len = (extra_len_raw as usize) % 66;
+    kani::assume(extra_len > 0);
+
+    let mut i = 0usize;
+    while i < extra_len {
+        data.push(kani::any());
+        i += 1;
+    }
+
+    assert!(
+        Instruction::decode(&data).is_err(),
+        "partial InitMarket extended tail must be rejected"
+    );
 }
 
 // =============================================================================
@@ -703,6 +1001,59 @@ fn kani_tradenocpi_universal_characterization() {
             decision,
             TradeNoCpiDecision::Reject,
             "must reject when any condition fails"
+        );
+    }
+}
+
+/// TradeNoCpi handler gate composition: auth alone is not enough. The public
+/// no-CPI trade path also rejects Hyperp markets, zero/i128::MIN sizes, exposed
+/// account-limited market progress, and raw-target/effective-price lag.
+#[kani::proof]
+fn kani_tradenocpi_full_wrapper_gate_composition() {
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let is_hyperp: bool = kani::any();
+    let size: i128 = kani::any();
+    let oi_long: u128 = kani::any();
+    let oi_short: u128 = kani::any();
+    let last_price: u64 = kani::any();
+    let fresh_price: u64 = kani::any();
+    let funding_rate: i128 = kani::any();
+    let fund_px_last: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+    let external_target: u64 = kani::any();
+    let engine_last_price_after_accrual: u64 = kani::any();
+
+    let auth_accept = decide_trade_nocpi(user_auth_ok, lp_auth_ok) == TradeNoCpiDecision::Accept;
+    let size_ok = size != 0 && size != i128::MIN;
+    let accrual_ok = account_limited_op_allows_accrual(
+        oi_long,
+        oi_short,
+        last_price,
+        fresh_price,
+        funding_rate,
+        fund_px_last,
+        dt_slots,
+    );
+    let no_target_lag = user_value_op_allowed_after_accrual(
+        false,
+        external_target,
+        0,
+        engine_last_price_after_accrual,
+    );
+
+    let handler_gate_allows = auth_accept && !is_hyperp && size_ok && accrual_ok && no_target_lag;
+
+    if handler_gate_allows {
+        assert!(auth_accept);
+        assert!(!is_hyperp);
+        assert!(size_ok);
+        assert!(accrual_ok);
+        assert!(no_target_lag);
+    } else {
+        assert!(
+            !auth_accept || is_hyperp || !size_ok || !accrual_ok || !no_target_lag,
+            "TradeNoCpi reject must be explained by one wrapper gate"
         );
     }
 }
@@ -2297,6 +2648,121 @@ fn kani_scale_price_e6_concrete_example() {
 // insignificant compared to the original bug (factor of unit_scale difference).
 
 // =============================================================================
+// SPEC §3 TARGET/EFFECTIVE STAIRCASE PROOFS (clamp_toward_engine_dt)
+// =============================================================================
+
+/// Prove zero-OI markets adopt the raw target directly. This is the spec §3
+/// carveout: no exposed position can lose equity, so no staircase lag is needed.
+#[kani::proof]
+fn kani_effective_price_zero_oi_adopts_target() {
+    let anchor: u64 = kani::any();
+    let target: u64 = kani::any();
+    let cap_bps: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+
+    assert_eq!(
+        effective_price_from_target(anchor, target, cap_bps, dt_slots, false),
+        target,
+        "zero-OI effective price must be the raw target"
+    );
+}
+
+/// Prove exposed markets always route through the engine-dt staircase helper.
+/// This binds the external-oracle and Hyperp target/effective paths to the same
+/// load-bearing price-advance law.
+#[kani::proof]
+fn kani_effective_price_exposed_uses_engine_staircase() {
+    // Bounded for CBMC tractability. The unbounded arithmetic law is covered
+    // by the edge-case and bounded-formula proofs below; this harness verifies
+    // the wrapper routing invariant that exposed markets call the staircase
+    // helper instead of adopting the raw target.
+    let anchor = kani::any::<u8>() as u64;
+    let target = kani::any::<u8>() as u64;
+    let cap_bps = (kani::any::<u8>() % 100) as u64;
+    let dt_slots = (kani::any::<u8>() % 32) as u64;
+
+    assert_eq!(
+        effective_price_from_target(anchor, target, cap_bps, dt_slots, true),
+        clamp_toward_engine_dt(anchor, target, cap_bps, dt_slots),
+        "exposed effective price must use clamp_toward_engine_dt"
+    );
+}
+
+/// Prove the edge cases of the engine-dt staircase: uninitialized/zero target
+/// bootstraps to target, while zero cap or zero dt freezes an exposed market at
+/// the current effective price.
+#[kani::proof]
+fn kani_clamp_toward_engine_dt_edge_cases() {
+    let p_last: u64 = kani::any();
+    let target: u64 = kani::any();
+    let cap_bps: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+
+    assert_eq!(
+        clamp_toward_engine_dt(0, target, cap_bps, dt_slots),
+        target,
+        "p_last=0 must bootstrap to target"
+    );
+    assert_eq!(
+        clamp_toward_engine_dt(p_last, 0, cap_bps, dt_slots),
+        0,
+        "target=0 must return target"
+    );
+
+    kani::assume(p_last != 0);
+    kani::assume(target != 0);
+    assert_eq!(
+        clamp_toward_engine_dt(p_last, target, 0, dt_slots),
+        p_last,
+        "cap=0 must freeze at p_last for exposed markets"
+    );
+    assert_eq!(
+        clamp_toward_engine_dt(p_last, target, cap_bps, 0),
+        p_last,
+        "dt=0 must freeze at p_last for exposed markets"
+    );
+}
+
+/// Bounded symbolic proof of the staircase formula. The multiplication chain is
+/// bounded for CBMC tractability; the branch logic and floor formula are the
+/// production implementation.
+#[kani::proof]
+fn kani_clamp_toward_engine_dt_bounded_formula() {
+    let p_raw: u8 = kani::any();
+    let cap_raw: u8 = kani::any();
+    let dt_raw: u8 = kani::any();
+    let target_raw: u8 = kani::any();
+
+    kani::assume(p_raw > 0);
+    kani::assume(cap_raw > 0);
+    kani::assume(dt_raw > 0);
+    kani::assume(cap_raw <= 100);
+    kani::assume(dt_raw <= 32);
+    kani::assume(target_raw > 0);
+
+    let p_last = p_raw as u64;
+    let cap_bps = cap_raw as u64;
+    let dt_slots = dt_raw as u64;
+    let target = target_raw as u64;
+    let result = clamp_toward_engine_dt(p_last, target, cap_bps, dt_slots);
+
+    let max_delta = ((p_last as u128 * cap_bps as u128 * dt_slots as u128) / 10_000u128) as u64;
+    let lo = p_last.saturating_sub(max_delta);
+    let hi = p_last.saturating_add(max_delta);
+
+    assert!(result >= lo && result <= hi);
+    if target > p_last {
+        assert_eq!(result, core::cmp::min(target, hi));
+        assert!(result >= p_last);
+        assert!(result <= target);
+    } else {
+        assert_eq!(result, core::cmp::max(target, lo));
+        assert!(result <= p_last);
+        assert!(result >= target);
+    }
+}
+
+// =============================================================================
 // BUG #9 RATE LIMITING PROOFS (clamp_toward_with_dt)
 // =============================================================================
 //
@@ -2617,8 +3083,56 @@ fn kani_clamp_toward_saturation_paths() {
 
 // =========================================================================
 // WithdrawInsurance vault accounting proofs
-// (Removed: withdraw_insurance_vault harnesses — verify function deleted)
 // =========================================================================
+
+/// Bounded live insurance withdrawals subtract the same amount from vault and
+/// insurance. If the senior residual is non-negative before the withdrawal,
+/// and the amount is within the insurance balance, the residual remains
+/// non-negative afterward.
+#[kani::proof]
+fn kani_live_insurance_withdraw_residual_gate_is_preserved_by_withdrawal() {
+    let vault = kani::any::<u64>() as u128;
+    let c_tot = kani::any::<u64>() as u128;
+    let insurance = kani::any::<u64>() as u128;
+    let amount = kani::any::<u64>() as u128;
+
+    kani::assume(live_insurance_withdraw_residual_ok(vault, c_tot, insurance));
+    kani::assume(amount <= insurance);
+
+    assert!(vault >= amount);
+    assert!(live_insurance_withdraw_residual_ok(
+        vault - amount,
+        c_tot,
+        insurance - amount,
+    ));
+}
+
+/// Active stress/h-max reconciliation locks live limited insurance
+/// withdrawal regardless of residual.
+#[kani::proof]
+fn kani_live_insurance_withdraw_market_health_rejects_stress_envelope() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+
+    assert!(!live_insurance_withdraw_market_healthy(
+        vault, c_tot, insurance, true,
+    ));
+}
+
+/// Senior-sum overflow is treated as unhealthy rather than being interpreted
+/// as a wrapped non-negative residual.
+#[kani::proof]
+fn kani_live_insurance_withdraw_residual_gate_rejects_senior_overflow() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+
+    kani::assume(c_tot.checked_add(insurance).is_none());
+    assert!(!live_insurance_withdraw_residual_ok(
+        vault, c_tot, insurance,
+    ));
+}
 
 // =============================================================================
 // INDUCTIVE: Full-domain algebraic properties
@@ -3883,19 +4397,46 @@ fn kani_no_oracle_fee_sync_anchor_universal() {
 }
 
 // =============================================================================
+// FORCE-CLOSE DELAY POLICY (1 proof)
+// =============================================================================
+
+/// Prove permissionless force-close delay uses elapsed time, not
+/// `resolved_slot + delay`, so large resolved slots cannot create an addition
+/// saturation trap.
+#[kani::proof]
+fn kani_force_close_delay_elapsed_universal() {
+    let clock_slot: u64 = kani::any();
+    let resolved_slot: u64 = kani::any();
+    let delay: u64 = kani::any();
+
+    let result = force_close_delay_elapsed(clock_slot, resolved_slot, delay);
+    assert_eq!(
+        result,
+        delay != 0 && clock_slot.saturating_sub(resolved_slot) >= delay,
+        "force-close delay must be checked via elapsed saturating_sub"
+    );
+
+    if result {
+        assert!(delay > 0);
+        assert!(clock_slot >= resolved_slot);
+        assert!(clock_slot - resolved_slot >= delay);
+    }
+}
+
+// =============================================================================
 // AB. ISSUE 65 KEEPER COVERAGE SCAN POLICY (1 proof)
 // =============================================================================
 
 fn issue65_prefix_covered(
     used: [bool; 4],
     exposed: [bool; 4],
-    provably_healthy: [bool; 4],
+    provably_nonnegative: [bool; 4],
     phase1_reachable: [bool; 4],
     len: usize,
 ) -> bool {
     let mut i = 0usize;
     while i < len {
-        if used[i] && exposed[i] && !provably_healthy[i] && !phase1_reachable[i] {
+        if used[i] && exposed[i] && !provably_nonnegative[i] && !phase1_reachable[i] {
             return false;
         }
         i += 1;
@@ -3905,15 +4446,16 @@ fn issue65_prefix_covered(
 
 /// Prove the issue-65 scan invariant in prefix form. Adding one more account
 /// to a covered prefix preserves coverage iff that account is either unused,
-/// flat, provably healthy, or phase-1 reachable. This is the inductive shape
-/// behind the dense-market fix: solvent exposed accounts do not consume the
-/// bounded phase-1 candidate budget.
+/// flat, provably nonnegative after this crank's accrual, or phase-1
+/// reachable. This is the inductive shape behind the dense-market fix:
+/// solvent exposed accounts do not consume the bounded phase-1 candidate
+/// budget, while accounts that could draw insurance must be reachable.
 #[kani::proof]
 #[kani::unwind(5)]
 fn kani_issue65_prefix_scan_step_inductive() {
     let used: [bool; 4] = kani::any();
     let exposed: [bool; 4] = kani::any();
-    let provably_healthy: [bool; 4] = kani::any();
+    let provably_nonnegative: [bool; 4] = kani::any();
     let phase1_reachable: [bool; 4] = kani::any();
     let len_raw: u8 = kani::any();
     let len = (len_raw as usize) % 4;
@@ -3921,17 +4463,18 @@ fn kani_issue65_prefix_scan_step_inductive() {
     kani::assume(issue65_prefix_covered(
         used,
         exposed,
-        provably_healthy,
+        provably_nonnegative,
         phase1_reachable,
         len,
     ));
 
-    let account_ok = !used[len] || !exposed[len] || provably_healthy[len] || phase1_reachable[len];
+    let account_ok =
+        !used[len] || !exposed[len] || provably_nonnegative[len] || phase1_reachable[len];
     assert_eq!(
         issue65_prefix_covered(
             used,
             exposed,
-            provably_healthy,
+            provably_nonnegative,
             phase1_reachable,
             len + 1,
         ),

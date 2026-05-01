@@ -13396,13 +13396,15 @@ fn test_attack_withdraw_decoy_cannot_walk_exposed_market() {
 /// Regression for issue 65.
 ///
 /// A permissionless KeeperCrank with an empty caller candidate list must not
-/// become a hidden market-progress walker for accounts outside the risk buffer.
+/// become a hidden insurance-draining market-progress walker for accounts
+/// outside the risk buffer.
 /// The setup fills the 4-entry risk buffer with larger over-collateralized
 /// stuffer positions, then opens a smaller target pair that is evicted from the
-/// buffer. Empty cranks must reject and roll back instead of walking the market
-/// price against the uncovered target. The final crank includes the target as a
-/// liquidation candidate. The invariant is that this sequence must not drain
-/// insurance below its pre-walk level.
+/// buffer. Empty cranks may advance while the uncovered accounts are still
+/// provably nonnegative, but they must stop before an uncovered step can draw
+/// insurance. The final crank includes the target as a liquidation candidate.
+/// The invariant is that this sequence must not drain insurance below its
+/// pre-walk level.
 #[test]
 fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target() {
     program_path();
@@ -13470,27 +13472,54 @@ fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target
     env.set_slot_and_price_raw_no_walk(start_slot + 10, p1);
     let first_empty = try_empty_crank(&mut env);
     assert!(
-        first_empty.is_err(),
-        "empty candidate crank must reject when an uncovered exposed target is outside the risk buffer"
+        env.read_insurance_balance() >= insurance_before,
+        "first empty crank must not drain insurance whether it safely advances or rejects: {first_empty:?}"
     );
-    assert_eq!(
-        env.read_last_market_slot(),
-        slot_before_walk,
-        "rejected empty crank must roll back market-clock progress"
-    );
+    if first_empty.is_err() {
+        assert_eq!(
+            env.read_last_market_slot(),
+            slot_before_walk,
+            "rejected empty crank must roll back market-clock progress"
+        );
+    }
 
+    let slot_before_second = env.read_last_market_slot();
     let p2 = (138_000_000f64 * 0.910) as i64;
     env.set_slot_and_price_raw_no_walk(start_slot + 20, p2);
     let second_empty = try_empty_crank(&mut env);
     assert!(
-        second_empty.is_err(),
-        "repeated empty candidate crank must keep rejecting while the exposed target remains uncovered"
+        env.read_insurance_balance() >= insurance_before,
+        "second empty crank must not drain insurance whether it safely advances or rejects: {second_empty:?}"
     );
-    assert_eq!(
-        env.read_last_market_slot(),
-        slot_before_walk,
-        "second rejected empty crank must also roll back market-clock progress"
+    if second_empty.is_err() {
+        assert_eq!(
+            env.read_last_market_slot(),
+            slot_before_second,
+            "second rejected empty crank must also roll back market-clock progress"
+        );
+    }
+
+    let before_danger_slot = env.read_last_market_slot();
+    let danger_clock = env.svm.get_sysvar::<Clock>().slot + 79;
+    let p_danger = (138_000_000f64 * 0.250) as i64;
+    env.set_slot_and_price_raw_no_walk(danger_clock, p_danger);
+    let dangerous_empty = try_empty_crank(&mut env);
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "dangerous empty crank must not drain insurance whether it safely advances or rejects: {dangerous_empty:?}"
     );
+    if dangerous_empty.is_err() {
+        assert_eq!(
+            env.read_last_market_slot(),
+            before_danger_slot,
+            "dangerous rejected empty crank must roll back market-clock progress"
+        );
+    } else {
+        assert!(
+            env.read_last_market_slot() >= before_danger_slot,
+            "successful empty crank must not roll market time backward"
+        );
+    }
 
     let after_walk = env.read_insurance_balance();
     let cap_after_walk = env.read_account_capital(target_a_idx);
@@ -13498,14 +13527,149 @@ fn test_attack_issue65_keeper_crank_empty_candidates_cannot_drain_evicted_target
     let insurance_after = env.read_insurance_balance();
 
     println!(
-        "issue65 regression: insurance_before={insurance_before}, after_walk={after_walk}, after={insurance_after}, cap_after_walk={cap_after_walk}, first_empty_ok={}, second_empty_ok={}, final_crank_ok={}, target_a={target_a_idx}, target_b={target_b_idx}, risk_buffer={buf_idxs:?}",
+        "issue65 regression: insurance_before={insurance_before}, after_walk={after_walk}, after={insurance_after}, cap_after_walk={cap_after_walk}, first_empty_ok={}, second_empty_ok={}, dangerous_empty_ok={}, final_crank_ok={}, target_a={target_a_idx}, target_b={target_b_idx}, risk_buffer={buf_idxs:?}",
         first_empty.is_ok(),
         second_empty.is_ok(),
+        dangerous_empty.is_ok(),
         final_crank.is_ok(),
     );
     assert!(
         insurance_after >= insurance_before,
         "empty-candidate market walking plus a final target crank must not drain insurance: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, first_empty={first_empty:?}, second_empty={second_empty:?}, final={final_crank:?}",
+    );
+}
+
+fn setup_issue65_evicted_target_probe() -> (TestEnv, u16, u16, Vec<u16>) {
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(100, 138_000_000);
+    let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
+        &env.payer.pubkey(),
+        &env.mint,
+        MAX_RISK_H_MAX,
+        80,
+    );
+    env.try_init_market_raw(data)
+        .expect("issue65 market config should pass wrapper validation");
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, 5_000_000_000);
+    env.crank();
+
+    let stuffer_size = 4_000_000_000i128;
+    let stuffer_deposit = 100_000_000_000u64;
+
+    let s1u = Keypair::new();
+    let s1u_idx = env.init_user(&s1u);
+    env.deposit(&s1u, s1u_idx, stuffer_deposit);
+    let s1l = Keypair::new();
+    let s1l_idx = env.init_lp(&s1l);
+    env.deposit(&s1l, s1l_idx, stuffer_deposit);
+    env.trade(&s1u, &s1l, s1l_idx, s1u_idx, stuffer_size);
+
+    let s2u = Keypair::new();
+    let s2u_idx = env.init_user(&s2u);
+    env.deposit(&s2u, s2u_idx, stuffer_deposit);
+    let s2l = Keypair::new();
+    let s2l_idx = env.init_lp(&s2l);
+    env.deposit(&s2l, s2l_idx, stuffer_deposit);
+    env.trade(&s2u, &s2l, s2l_idx, s2u_idx, stuffer_size);
+
+    let target_a = Keypair::new();
+    let target_a_idx = env.init_user(&target_a);
+    env.deposit(&target_a, target_a_idx, 20_000_000_000);
+    let target_b = Keypair::new();
+    let target_b_idx = env.init_lp(&target_b);
+    env.deposit(&target_b, target_b_idx, 20_000_000_000);
+    env.trade(
+        &target_a,
+        &target_b,
+        target_b_idx,
+        target_a_idx,
+        2_800_000_000,
+    );
+
+    let buf = env.read_risk_buffer();
+    let buf_idxs: Vec<u16> = (0..buf.count as usize)
+        .map(|i| buf.entries[i].idx)
+        .collect();
+    assert!(
+        !buf_idxs.contains(&target_a_idx) && !buf_idxs.contains(&target_b_idx),
+        "target pair must be evicted from risk buffer for the regression: buf={buf_idxs:?}, target_a={target_a_idx}, target_b={target_b_idx}",
+    );
+
+    (env, target_a_idx, target_b_idx, buf_idxs)
+}
+
+#[test]
+fn test_attack_issue65_single_useless_candidate_cannot_bypass_empty_crank_scan() {
+    program_path();
+
+    let (mut env, target_a_idx, target_b_idx, buf_idxs) = setup_issue65_evicted_target_probe();
+    let decoy_candidate = buf_idxs[0];
+    let insurance_before = env.read_insurance_balance();
+    let slot_before_walk = env.read_last_market_slot();
+    let start_slot = env.svm.get_sysvar::<Clock>().slot;
+
+    let p1 = (138_000_000f64 * 0.955) as i64;
+    env.set_slot_and_price_raw_no_walk(start_slot + 10, p1);
+    let first = try_crank_with_candidate_indices(&mut env, &[decoy_candidate]);
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "useless-candidate crank must not drain insurance: {first:?}"
+    );
+    if first.is_err() {
+        assert_eq!(
+            env.read_last_market_slot(),
+            slot_before_walk,
+            "rejected useless-candidate crank must roll back market-clock progress"
+        );
+    }
+
+    let slot_before_second = env.read_last_market_slot();
+    let p2 = (138_000_000f64 * 0.910) as i64;
+    env.set_slot_and_price_raw_no_walk(start_slot + 20, p2);
+    let second = try_crank_with_candidate_indices(&mut env, &[decoy_candidate]);
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "second useless-candidate crank must not drain insurance: {second:?}"
+    );
+    if second.is_err() {
+        assert_eq!(
+            env.read_last_market_slot(),
+            slot_before_second,
+            "second rejected useless-candidate crank must roll back market-clock progress"
+        );
+    }
+
+    let before_danger_slot = env.read_last_market_slot();
+    let danger_clock = env.svm.get_sysvar::<Clock>().slot + 79;
+    let p_danger = (138_000_000f64 * 0.250) as i64;
+    env.set_slot_and_price_raw_no_walk(danger_clock, p_danger);
+    let dangerous = try_crank_with_candidate_indices(&mut env, &[decoy_candidate]);
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "dangerous useless-candidate crank must not drain insurance: {dangerous:?}"
+    );
+    if dangerous.is_err() {
+        assert_eq!(
+            env.read_last_market_slot(),
+            before_danger_slot,
+            "dangerous rejected useless-candidate crank must roll back market-clock progress"
+        );
+    }
+
+    let after_walk = env.read_insurance_balance();
+    let final_crank = try_crank_with_candidate_indices(&mut env, &[target_a_idx, target_b_idx]);
+    let insurance_after = env.read_insurance_balance();
+    println!(
+        "issue65 useless-candidate regression: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, first_ok={}, second_ok={}, dangerous_ok={}, final_ok={}, target_a={target_a_idx}, target_b={target_b_idx}, risk_buffer={buf_idxs:?}",
+        first.is_ok(),
+        second.is_ok(),
+        dangerous.is_ok(),
+        final_crank.is_ok(),
+    );
+    assert!(
+        insurance_after >= insurance_before,
+        "useless-candidate market walking plus final target crank must not drain insurance: before={insurance_before}, after_walk={after_walk}, after={insurance_after}, first={first:?}, second={second:?}, dangerous={dangerous:?}, final={final_crank:?}",
     );
 }
 
@@ -13582,7 +13746,7 @@ fn test_issue65_keeper_crank_near_mm_accounts_do_not_grief_phase1_budget() {
 }
 
 #[test]
-fn test_issue65_tail_candidate_defers_phase2_after_phase1_closures() {
+fn test_issue65_tail_candidate_phase2_can_run_when_tail_is_nonnegative() {
     program_path();
 
     let (mut env, _lp, _lp_idx, actors) = setup_max_risk_probe(80, 0);
@@ -13595,16 +13759,146 @@ fn test_issue65_tail_candidate_defers_phase2_after_phase1_closures() {
     env.set_slot_and_price_raw_no_walk(start_slot + 1, target_price);
 
     let rr_cursor_before = env.read_rr_cursor_position();
+    let insurance_before = env.read_insurance_balance();
     let candidates: Vec<u16> = actors.iter().map(|a| a.idx).collect();
     let crank = try_crank_with_candidate_indices(&mut env, &candidates);
     assert!(
         crank.is_ok(),
-        "candidate-covered max-risk crank should execute phase 1 and defer phase 2 when a tail candidate would otherwise be reached without policy: {crank:?}"
+        "candidate-covered max-risk crank should keep progressing while tail candidates remain nonnegative: {crank:?}"
     );
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "tail-candidate phase2 progress must not drain insurance"
+    );
+    assert!(
+        env.read_rr_cursor_position() != rr_cursor_before
+            || actors.iter().any(|a| env.read_account_position(a.idx) == 0),
+        "the crank should either run phase2 or close at least one candidate"
+    );
+}
+
+#[test]
+fn test_issue65_deferred_phase2_candidate_cascade_keeps_making_progress() {
+    program_path();
+
+    let (mut env, _lp, _lp_idx, actors) = setup_max_risk_probe(80, 0);
+    assert!(
+        actors.len() > percolator_prog::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK as usize
+    );
+
+    let start_slot = env.read_last_market_slot();
+    let target_price = max_risk_next_price_signed_bps(MAX_RISK_P0_E6, -49) as i64;
+    env.set_slot_and_price_raw_no_walk(start_slot + 1, target_price);
+
+    let candidates: Vec<u16> = actors.iter().map(|a| a.idx).collect();
+    let insurance_start = env.read_insurance_balance();
+    let open_before = actors
+        .iter()
+        .filter(|a| env.read_account_position(a.idx) != 0)
+        .count();
+    let rr_cursor_before = env.read_rr_cursor_position();
+
+    let mut min_insurance = insurance_start;
+    let mut open_after_first = open_before;
+    let mut open_after_last = open_before;
+    for round in 0..8 {
+        let crank = try_crank_with_candidate_indices(&mut env, &candidates);
+        assert!(
+            crank.is_ok(),
+            "candidate-covered deferred-phase2 cascade must not brick on round {round}: {crank:?}"
+        );
+        min_insurance = min_insurance.min(env.read_insurance_balance());
+        let open_now = actors
+            .iter()
+            .filter(|a| env.read_account_position(a.idx) != 0)
+            .count();
+        if round == 0 {
+            open_after_first = open_now;
+        }
+        open_after_last = open_now;
+    }
+
     assert_eq!(
-        env.read_rr_cursor_position(),
-        rr_cursor_before,
-        "phase 2 must be suppressed when phase-1 closures can make an unhealthy tail candidate reachable beyond the phase-1 budget"
+        env.read_last_market_slot(),
+        start_slot + 1,
+        "first crank should install the target slot and later same-slot cranks should not roll it back"
+    );
+    assert!(
+        min_insurance >= insurance_start,
+        "candidate-covered cascade must not drain insurance: start={insurance_start}, min={min_insurance}"
+    );
+    assert!(
+        open_after_first < open_before || open_after_last < open_before,
+        "candidate-covered cascade must process at least one risky account: before={open_before}, after_first={open_after_first}, after_last={open_after_last}"
+    );
+    let _ = rr_cursor_before;
+}
+
+#[test]
+fn test_issue65_candidate_cap_dense_cascade_has_progress_path() {
+    program_path();
+
+    let over_cap = percolator_prog::constants::MAX_KEEPER_CANDIDATES + 1;
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
+    let admin = env.payer.pubkey();
+    let mint = env.mint;
+    let data = encode_init_market_bounty_sol_20x_max(&admin, &mint);
+    env.try_init_market_raw(data)
+        .expect("max-risk InitMarket should pass wrapper validation");
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, MAX_RISK_INSURANCE);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, MAX_RISK_LP_CAPITAL * 4);
+
+    let size = max_risk_position_size(MAX_RISK_CAPITAL_PER_USER, MAX_RISK_P0_E6);
+    let mut actors = Vec::with_capacity(over_cap);
+    for _ in 0..over_cap {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, MAX_RISK_CAPITAL_PER_USER);
+        // Keep the supplied candidate prefix ordered the way an honest keeper
+        // would submit it: every candidate inside the cap is on the losing
+        // side of the price move, and at least one additional losing account
+        // remains outside the cap. The regression is that this must still make
+        // bounded progress instead of requiring impossible all-account
+        // coverage in one instruction.
+        let direction = 1;
+        env.try_trade(&user, &lp, lp_idx, user_idx, size * direction as i128)
+            .expect("open dense max-risk long position");
+        actors.push(MaxRiskActor {
+            keypair: user,
+            idx: user_idx,
+            direction,
+        });
+    }
+    assert_eq!(actors.len(), over_cap);
+
+    let start_slot = env.read_last_market_slot();
+    let target_price = max_risk_next_price_signed_bps(MAX_RISK_P0_E6, -49) as i64;
+    env.set_slot_and_price_raw_no_walk(start_slot + 1, target_price);
+
+    let candidates: Vec<u16> = actors
+        .iter()
+        .take(percolator_prog::constants::MAX_KEEPER_CANDIDATES)
+        .map(|a| a.idx)
+        .collect();
+    let insurance_start = env.read_insurance_balance();
+    let crank = try_crank_with_candidate_indices(&mut env, &candidates);
+
+    assert!(
+        crank.is_ok(),
+        "dense candidate-covered cascade should have a progress path even when total risky accounts exceed one candidate tail: {crank:?}"
+    );
+    assert!(
+        env.read_insurance_balance() >= insurance_start,
+        "dense candidate-covered cascade must not drain insurance on the first progress crank"
+    );
+    assert!(
+        env.read_last_market_slot() >= start_slot,
+        "dense cascade crank must not roll market time backward"
     );
 }
 

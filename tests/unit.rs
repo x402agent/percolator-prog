@@ -11,7 +11,7 @@ use percolator_prog::{
     matcher_abi::{validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID},
     oracle,
     processor::process_instruction,
-    state, units, zc,
+    state, zc,
 };
 use solana_program::{
     account_info::AccountInfo, clock::Clock, program_error::ProgramError, program_pack::Pack,
@@ -411,6 +411,12 @@ fn encode_topup_insurance(amount: u64) -> Vec<u8> {
     data
 }
 
+fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
+    let mut data = vec![23u8];
+    encode_u64(amount, &mut data);
+    data
+}
+
 fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
     let engine = zc::engine_ref(data).ok()?;
     for i in 0..MAX_ACCOUNTS {
@@ -619,10 +625,10 @@ fn test_struct_sizes() {
 ///
 /// The audit flagged the theoretical risk of a future author adding a
 /// `bool` or `#[repr(u8)] enum` field to one of these structs, which
-/// would make the unsafe cast UB on first access even when
-/// `validate_raw_discriminants` succeeds. Today the slab-persisted
-/// types contain only fixed-width integer/array fields plus the two
-/// `#[repr(u8)]` enums `SideMode` and `MarketMode` (both validated).
+/// would make the unsafe cast UB on first access unless the raw bytes
+/// are validated first. Today the slab-persisted invalid-bit fields are
+/// the `SideMode` / `MarketMode` enums, all validated before casting in the
+/// currently pinned engine.
 ///
 /// This test asserts that structural invariant at runtime by
 /// instantiating every slab field through zero bytes (via
@@ -662,6 +668,64 @@ fn test_zc_cast_safety_invariant() {
     // discriminants, etc.) are already either all-bits-valid or
     // covered by validate_raw_discriminants; the audit concern was
     // specifically nested Account fields.
+}
+
+#[test]
+fn test_withdraw_insurance_limited_rejects_active_stress_envelope() {
+    let mut f = setup_market();
+    let data = encode_init_market(&f, 50);
+
+    {
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.clock.to_info(),
+            f.pyth_index.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &data).unwrap();
+    }
+
+    {
+        let mut config = state::read_config(&f.slab.data);
+        config.insurance_withdraw_max_bps = 10_000;
+        state::write_config(&mut f.slab.data, &config);
+
+        let engine = zc::engine_mut(&mut f.slab.data).unwrap();
+        engine.stress_consumed_bps_e9_since_envelope = 1;
+        engine.stress_envelope_remaining_indices = 1;
+        engine.stress_envelope_start_slot = engine.current_slot;
+        engine.stress_envelope_start_generation = engine.sweep_generation;
+    }
+
+    let mut operator_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, f.admin.key, 0),
+    )
+    .writable();
+    let mut vault_pda = TestAccount::new(f.vault_pda, Pubkey::default(), 0, vec![]);
+
+    let res = {
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            operator_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            vault_pda.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(
+            &f.program_id,
+            &accounts,
+            &encode_withdraw_insurance_limited(1),
+        )
+    };
+
+    assert_eq!(res, Err(PercolatorError::EngineInsufficientBalance.into()));
 }
 
 #[test]
