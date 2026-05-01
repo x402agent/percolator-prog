@@ -5658,7 +5658,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&1u128.to_le_bytes()); // new_acct_fee (permissionless anti-spam)
         data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-        let max_crank = 99u64; // permissionless > max_crank
+        let max_crank = 99u64; // legacy wire field, ignored by current engine
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
@@ -5669,10 +5669,8 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-                                                     // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 100 —
-                                                     // the upper bound. The test's 60+ slot dust-wash sequence must
-                                                     // now fit within this window (the test may need to tighten its
-                                                     // own cadence).
+                                                     // Short test stale window. Production permits a longer
+                                                     // permissionless horizon independent from MAX_ACCRUAL_DT_SLOTS.
         data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
                                                        // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
@@ -6112,7 +6110,7 @@ fn test_init_market_rejects_huge_funding_max_e9_per_slot_without_wrap() {
         // i64::MAX would overflow the envelope by ~17 orders of magnitude.
         env.init_market_with_funding(
             0,        // invert
-            80,       // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
+            80,       // short test stale window
             200,      // funding_horizon_slots
             200,      // funding_k_bps
             1_000,    // funding_max_premium_bps
@@ -6399,9 +6397,9 @@ fn test_fee_markets_survive_one_slot_gap_on_every_accrue_path() {
 /// maintenance fees swept on that crank as capital credit, the other
 /// 50% stays in insurance.
 ///
-/// Under v12.19.6 (perm_resolve <= MAX_ACCRUAL_DT_SLOTS=100) the window is
-/// tight; this test uses Hyperp mode to bypass the oracle-backed stale gate
-/// and exercise the reward math over a wider slot range.
+/// This test uses a short permissionless stale window and Hyperp mode to keep
+/// the oracle liveness gate out of the reward math. The production
+/// permissionless horizon is intentionally independent from MAX_ACCRUAL_DT_SLOTS.
 #[test]
 fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller() {
     program_path();
@@ -7190,7 +7188,7 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
     payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee (maintenance fee provides anti-spam)
     payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    payload.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=80 <= 100)
+    payload.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     payload.extend_from_slice(&50u64.to_le_bytes());
     payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
     payload.extend_from_slice(&100u64.to_le_bytes());
@@ -7199,7 +7197,7 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.extend_from_slice(&2u128.to_le_bytes());
     payload.extend_from_slice(&0u16.to_le_bytes());
     payload.extend_from_slice(&0u64.to_le_bytes());
-    payload.extend_from_slice(&80u64.to_le_bytes()); // perm_resolve = 80 (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
+    payload.extend_from_slice(&80u64.to_le_bytes()); // short test stale window
     payload.extend_from_slice(&500u64.to_le_bytes());
     payload.extend_from_slice(&100u64.to_le_bytes());
     payload.extend_from_slice(&500i64.to_le_bytes());
@@ -7242,7 +7240,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes()); // max_accounts
     payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    payload.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=80 <= 100)
+    payload.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     payload.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     payload.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -7253,7 +7251,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
                                                                                         // Extended tail
     payload.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     payload.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    payload.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots (<= MAX_ACCRUAL_DT_SLOTS=100)
+    payload.extend_from_slice(&80u64.to_le_bytes()); // short test stale window
     payload.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     payload.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     payload.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps

@@ -425,7 +425,9 @@ fn test_honest_user_standard_market_warmup_close() {
     program_path();
 
     let mut env = TestEnv::new();
-    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    // h_max is now capped by the wrapper's product horizon (30 days), not
+    // by the live-accrual dt envelope. This test keeps a short warmup so the
+    // lifecycle completes quickly.
     env.init_market_with_warmup(0, 50);
 
     let ins_payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -1171,10 +1173,10 @@ fn test_governance_free_full_lifecycle() {
     // horizon=200 (shorter for faster funding), k=200 (2x multiplier), max_premium=1000, max_per_slot=10
     env.init_market_with_funding(
         0, // invert=0 (direct, e.g., BTC/USD)
-        // permissionless_resolve_stale_slots: 80 slots (v12.19.6: must be
-        // <= MAX_ACCRUAL_DT_SLOTS=100). The natural slot advances in this
-        // test (init → 200 → 300 → 600) go well past the live window, so
-        // the final Resolve branch exercises the permissionless path.
+        // permissionless_resolve_stale_slots: short for the test. The
+        // production cap is independent from MAX_ACCRUAL_DT_SLOTS; this
+        // lifecycle intentionally uses a small stale window so the final
+        // Resolve branch exercises the permissionless path quickly.
         80, 200,  // funding_horizon_slots (custom, not default 500)
         200,  // funding_k_bps (2x, not default 1x)
         1000, // funding_max_premium_bps (10%, not default 5%)
@@ -1254,7 +1256,7 @@ fn test_governance_free_full_lifecycle_inverted() {
 
     env.init_market_with_funding(
         1,   // invert=1
-        80,  // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
+        80,  // short test stale window; not coupled to MAX_ACCRUAL_DT_SLOTS
         300, // custom horizon
         150, // 1.5x k
         800, // 8% max premium
@@ -1851,20 +1853,22 @@ fn test_sentinel_invariant_nonzero_oi_implies_oracle_initialized() {
 
 /// ResolvePermissionless must succeed after an oracle outage longer than
 /// `max_accrual_dt_slots`. The engine's Degenerate arm explicitly skips
-/// `accrue_market_to` and just jumps `current_slot`/`last_market_slot` to
-/// now_slot, so there's no dt envelope check on this path — even a years-
-/// long gap resolves.
+/// `accrue_market_to` and resolves at P_last/rate=0, so there is no live dt
+/// envelope check on this path.
 ///
-/// Setup: permissionless_resolve_stale_slots = 50_000, hardcoded
-/// MAX_ACCRUAL_DT_SLOTS = 100_000. Advance clock to 500_000 (5× envelope)
-/// without a crank, kill the oracle, then resolve.
+/// This is the integration counterpart to
+/// `kani_permissionless_resolve_horizon_policy_independent_from_accrual_window`:
+/// the Kani proof covers the wrapper init policy, this test executes the SBF
+/// wrapper -> engine Degenerate resolve call and proves the market gets
+/// unstuck instead of trying to accrue the dead interval.
 #[test]
 fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() {
     program_path();
     let mut env = TestEnv::new();
-    // perm-resolve threshold = 80 slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100).
-    // The test still drives the clock to 500_000 — far past the threshold —
-    // exercising the permissionless-resolve Degenerate path.
+    // Short test threshold. The production cap is independent from
+    // MAX_ACCRUAL_DT_SLOTS; this test drives the clock far past both the
+    // threshold and the live-accrual envelope to exercise the
+    // permissionless-resolve Degenerate path.
     env.init_market_with_cap(0, 80);
 
     // Tighten oracle staleness so clock advance → oracle death.
@@ -1876,7 +1880,7 @@ fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() 
 
     env.crank(); // seed engine.last_oracle_price with the real price
 
-    // Kill oracle, advance clock far past MAX_ACCRUAL_DT_SLOTS = 100_000.
+    // Kill oracle, advance clock far past MAX_ACCRUAL_DT_SLOTS.
     env.svm.set_sysvar(&Clock {
         slot: 500_000,
         unix_timestamp: 500_000,

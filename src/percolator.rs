@@ -274,9 +274,32 @@ pub mod constants {
     /// 6_480_000 slots is ~30 days at 400 ms/slot.
     pub const MAX_PROFIT_MATURITY_SLOTS: u64 = 6_480_000;
     /// Maximum hard oracle-staleness horizon for permissionless market
-    /// resolution. This is a product liveness bound, not an accrual envelope:
-    /// dead-oracle resolution uses the engine's Degenerate path at P_last,
-    /// while live catchup/progress is routed through KeeperCrank.
+    /// resolution.
+    ///
+    /// This is a product liveness bound, NOT an accrual envelope and NOT
+    /// coupled to `MAX_ACCRUAL_DT_SLOTS`. The two paths are deliberately
+    /// separate:
+    ///
+    /// - live market progress uses KeeperCrank and is chunked by
+    ///   `MAX_ACCRUAL_DT_SLOTS`;
+    /// - dead-oracle exit uses ResolvePermissionless, which calls the
+    ///   engine's Degenerate resolve arm at P_last with rate=0 and does not
+    ///   call `accrue_market_to`.
+    ///
+    /// Proof/test anchors for reviewers:
+    /// - `kani_permissionless_resolve_horizon_policy_independent_from_accrual_window`
+    ///   proves the wrapper init policy accepts horizons by this cap only,
+    ///   including horizons greater than `MAX_ACCRUAL_DT_SLOTS`.
+    /// - `test_attack_permissionless_resolve_cap_independent_from_accrual_window`
+    ///   checks the 30-day value is accepted and cap+1 is rejected.
+    /// - `test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt`
+    ///   executes the degenerate resolve path after a gap far beyond the
+    ///   accrual envelope, proving the market is not stuck by max_dt.
+    ///
+    /// Engine postconditions and conservation remain engine-owned; the
+    /// wrapper test above proves the wrapper routes to the engine resolve API
+    /// instead of trying to accrue a dead interval.
+    ///
     /// 6_480_000 slots is ~30 days at 400 ms/slot.
     pub const MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 6_480_000;
     /// InitMarket wire flag packed into insurance_withdraw_max_bps. When set,
@@ -1229,6 +1252,17 @@ pub mod policy {
     #[inline]
     pub fn init_market_scale_ok(unit_scale: u32) -> bool {
         unit_scale <= crate::constants::MAX_UNIT_SCALE
+    }
+
+    /// Validate the InitMarket permissionless-resolution horizon.
+    ///
+    /// This is intentionally independent from `MAX_ACCRUAL_DT_SLOTS`.
+    /// The accrual dt envelope bounds live KeeperCrank progress; this
+    /// predicate bounds the product's dead-oracle wait time before
+    /// ResolvePermissionless becomes available.
+    #[inline]
+    pub fn permissionless_resolve_horizon_ok(stale_slots: u64) -> bool {
+        stale_slots == 0 || stale_slots <= crate::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
     }
 
     /// Live insurance withdrawal health gate.
@@ -5772,10 +5806,19 @@ pub mod processor {
                 // max_accrual_dt_slots: dead-oracle settlement uses the
                 // engine's Degenerate path at P_last/rate=0, while live
                 // markets use KeeperCrank for explicit bounded progress.
-                if permissionless_resolve_stale_slots > 0
-                    && permissionless_resolve_stale_slots
-                        > crate::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
-                {
+                //
+                // See:
+                //   - constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
+                //   - policy::permissionless_resolve_horizon_ok
+                //   - kani_permissionless_resolve_horizon_policy_independent_from_accrual_window
+                //   - test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt
+                //
+                // These explicitly cover the reviewer question "why not
+                // <= MAX_ACCRUAL_DT_SLOTS?" The answer is that Resolve
+                // Permissionless does not accrue the dead interval.
+                if !crate::policy::permissionless_resolve_horizon_ok(
+                    permissionless_resolve_stale_slots,
+                ) {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
@@ -9676,6 +9719,24 @@ pub mod processor {
                 // settlement_price and live_oracle_price use P_last (the
                 // engine's stored last-accrued price) — the engine's
                 // Degenerate arm requires equality between the two.
+                //
+                // This is the reason `permissionless_resolve_stale_slots`
+                // is NOT bounded by `MAX_ACCRUAL_DT_SLOTS`: this path does
+                // not call `accrue_market_to`, and passes rate=0. A market
+                // can therefore wait a product-scale stale horizon (capped
+                // at MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS) and still exit
+                // permissionlessly without violating the live-accrual
+                // envelope. Regression coverage:
+                //
+                //   test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt
+                //
+                // Kani coverage is wrapper-policy only:
+                //
+                //   kani_permissionless_resolve_horizon_policy_independent_from_accrual_window
+                //
+                // Engine conservation/postconditions are enforced inside
+                // resolve_market_not_atomic and covered by engine tests; the
+                // wrapper proof deliberately does not model engine internals.
                 let engine = zc::engine_mut(&mut data)?;
                 let p_last = engine.last_oracle_price;
                 if p_last == 0 {

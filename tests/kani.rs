@@ -26,7 +26,8 @@ extern crate kani;
 // Import real types and helpers from the program crate
 use percolator_prog::constants::{
     DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS, MATCHER_ABI_VERSION, MAX_ABS_FUNDING_E9_PER_SLOT,
-    MAX_ACCRUAL_DT_SLOTS, MAX_PROFIT_MATURITY_SLOTS, MAX_UNIT_SCALE, MIN_FUNDING_LIFETIME_SLOTS,
+    MAX_ACCRUAL_DT_SLOTS, MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS, MAX_PROFIT_MATURITY_SLOTS,
+    MAX_UNIT_SCALE, MIN_FUNDING_LIFETIME_SLOTS,
 };
 use percolator_prog::ix::Instruction;
 use percolator_prog::matcher_abi::{
@@ -76,6 +77,7 @@ use percolator_prog::policy::{
     owner_ok,
     partial_crank_config_fields_to_write,
     pda_key_matches,
+    permissionless_resolve_horizon_ok,
     recurring_fee_pre_touch_safe_shape,
     // New: Oracle unit scale math
     scale_price_e6,
@@ -4533,4 +4535,45 @@ fn kani_recurring_fee_pre_touch_safe_shape_universal() {
         assert!(fee_credits <= 0);
         assert_ne!(fee_credits, i128::MIN);
     }
+}
+
+// =============================================================================
+// AD. PERMISSIONLESS RESOLVE HORIZON POLICY (1 proof)
+// =============================================================================
+
+/// Prove the wrapper's InitMarket policy for permissionless resolution is
+/// intentionally independent from the live-accrual dt envelope. The accepted
+/// set is exactly `0` (disabled) or `1..=MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS`;
+/// `MAX_ACCRUAL_DT_SLOTS` does not appear in the predicate and values above
+/// the accrual window are accepted up to the product cap.
+#[kani::proof]
+fn kani_permissionless_resolve_horizon_policy_independent_from_accrual_window() {
+    let stale_slots: u64 = kani::any();
+
+    let ok = permissionless_resolve_horizon_ok(stale_slots);
+    let expected = stale_slots == 0 || stale_slots <= MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS;
+    assert_eq!(
+        ok, expected,
+        "permissionless resolve horizon is bounded by its product cap, not max_accrual_dt"
+    );
+
+    assert!(
+        MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS > MAX_ACCRUAL_DT_SLOTS,
+        "the wrapper deliberately supports dead-oracle horizons above one live-accrual segment"
+    );
+
+    let above_accrual = MAX_ACCRUAL_DT_SLOTS.saturating_add(1);
+    if above_accrual <= MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS {
+        assert!(
+            permissionless_resolve_horizon_ok(above_accrual),
+            "horizons above MAX_ACCRUAL_DT_SLOTS are accepted when within the product cap"
+        );
+    }
+
+    assert!(
+        !permissionless_resolve_horizon_ok(
+            MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS.saturating_add(1)
+        ),
+        "cap+1 is rejected"
+    );
 }
