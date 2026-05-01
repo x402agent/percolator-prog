@@ -7098,22 +7098,19 @@ fn test_dust_account_drained_and_gc_by_crank_alone() {
     );
 }
 
-/// Stronger variant: account holds an open position. The chain is
-/// fees → equity drops below `min_nonzero_mm_req` (the absolute MM
-/// floor that prevents dust positions from staying "permanently
-/// healthy" at ~0 equity) → risk-buffer scan flags the account →
-/// next crank's liquidation pass closes the position → subsequent
-/// fee sweep drains residual capital → reclaim. End-to-end: just
-/// keep cranking.
+/// Nonflat dust cleanup must respect loss-senior fee ordering.
+///
+/// The maintenance-fee bitmap sweep is only allowed to drain flat/current
+/// accounts. An open position must first be touched by keeper liquidation or
+/// another account-local engine path so mark/funding losses are settled before
+/// recurring fees can consume principal. The public liveness guarantee is that
+/// a keeper candidate can still close and reclaim the account once a genuine
+/// price move makes it liquidatable.
 #[test]
-fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
+fn test_dust_position_cleanup_respects_loss_senior_fee_policy() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Aggressive fee so the test drains in reasonable iterations:
-    // capital 150M, fee 1M/slot → ~150 slots to bankruptcy. With
-    // each set_slot_and_price advancing the slot by 5, ~30 cranks
-    // drain capital and the position becomes liquidatable.
     let data = encode_init_market_with_maint_fee_bounded(
         &env.payer.pubkey(),
         &env.mint,
@@ -7129,15 +7126,14 @@ fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 100_000_000_000);
 
-    // User: 0.15 SOL capital (matches the "minimal-equity" pattern
-    // already used in `test_position_flip_minimal_equity`). Enough to
-    // back a 1M-size position at 10% initial margin (notional = 138M,
-    // IM = 13.8M).
+    // User: enough capital to pay the accrued fee at trade entry while still
+    // backing a high-leverage but valid position. At the seed price, notional
+    // = 1.38B and initial margin = 138M.
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 150_000_000);
+    env.deposit(&user, user_idx, 300_000_000);
     env.set_slot_and_price(100, 138_000_000);
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
     let pos_after_open = env.read_account_position(user_idx);
     assert!(
         pos_after_open != 0,
@@ -7148,28 +7144,55 @@ fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
     let used_after_open = env.read_num_used_accounts();
     assert_eq!(used_after_open, 2, "LP + user materialized");
 
-    // Crank repeatedly with advancing slots. Pipeline:
-    //   1. Maintenance fees drain user capital each crank.
-    //   2. Once equity < maint_margin (≈ 6.9M), risk-buffer scan
-    //      flags the user.
-    //   3. Following crank's `combined` candidate list runs
-    //      liquidation; FullClose closes the position.
-    //   4. User is now flat. Further fee-sweep visits drain residual
-    //      capital to 0 and reclaim the slot.
-    let mut user_freed = false;
-    for i in 1..=400 {
+    // Same-price empty cranks must not drain or reclaim a still-nonflat
+    // account by pre-touch fee sweep. This is the spec property the old
+    // regression accidentally contradicted. The test intentionally does not
+    // assert exact fee cursor/capital values here: a future keeper path may
+    // legitimately touch a nonflat account and then charge loss-senior fees.
+    // The invariant is that fee sweeping cannot erase the open position or
+    // free the slot before an account-local close/liquidation path runs.
+    for i in 1..=8 {
         env.set_slot_and_price(100 + i * 5, 138_000_000);
         env.crank();
+    }
+    assert_eq!(
+        env.read_account_position(user_idx),
+        pos_after_open,
+        "same-price fee cranks must not close a still-nonflat account",
+    );
+    assert_eq!(
+        env.read_num_used_accounts(),
+        used_after_open,
+        "same-price fee cranks must not reclaim a still-nonflat account",
+    );
+
+    // Now create a cap-compliant adverse move. The helper walks the oracle in
+    // bounded public crank steps so the hard-timeout gate cannot be used as a
+    // shortcut; cleanup must come from ordinary keeper progress.
+    env.set_slot_and_price(600, 117_300_000);
+    let mut closed = false;
+    let mut reclaimed = false;
+    for _ in 0..80 {
+        if env.read_account_position(user_idx) == 0 {
+            closed = true;
+        }
         if env.read_num_used_accounts() < used_after_open {
-            user_freed = true;
+            reclaimed = true;
             break;
         }
+        env.try_liquidate_target(user_idx)
+            .expect("keeper candidate crank should make bounded progress");
     }
 
     assert!(
-        user_freed,
-        "user account must be liquidated and reclaimed within 400 \
-         cranks purely from maintenance-fee accrual; saw num_used = {}",
+        closed,
+        "keeper candidate cranks must eventually close the liquidatable \
+         dust position",
+    );
+    assert!(
+        reclaimed,
+        "keeper candidate / flat sweep cranks must eventually reclaim the \
+         closed dust account; saw num_used = {}",
         env.read_num_used_accounts(),
     );
 }

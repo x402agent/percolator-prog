@@ -8993,9 +8993,12 @@ pub mod processor {
                 let clock_gate = Clock::from_account_info(a_clock)?;
 
                 // Explicit Degenerate branch: settle at engine.last_oracle_price
-                // with rate = 0. Used for dead-oracle markets (stale gate
-                // matured, or admin-observed deadness). Mirrors
-                // ResolvePermissionless's terminal settlement.
+                // with rate = 0. For non-Hyperp Pyth Pull markets this is
+                // gated only by the hard stale/restart predicate below: a
+                // caller-selected stale/conf-wide PriceUpdateV2 account proves
+                // only that this account is bad, not that the feed has no
+                // fresh update. Hyperp has no external update account, so its
+                // admin emergency gate is based on stored mark liveness.
                 if mode == 1 {
                     let stale_or_restarted =
                         oracle::permissionless_stale_matured(&config, clock_gate.slot);
@@ -9014,24 +9017,7 @@ pub mod processor {
                                 return Err(PercolatorError::OracleInvalid.into());
                             }
                         } else {
-                            let live = oracle::read_engine_price_e6(
-                                a_oracle,
-                                &config.index_feed_id,
-                                clock_gate.unix_timestamp,
-                                config.max_staleness_secs,
-                                config.conf_filter_bps,
-                                config.invert,
-                                config.unit_scale,
-                            );
-                            match live {
-                                Ok(_) => return Err(PercolatorError::OracleInvalid.into()),
-                                Err(e)
-                                    if e == ProgramError::from(PercolatorError::OracleStale)
-                                        || e == ProgramError::from(
-                                            PercolatorError::OracleConfTooWide,
-                                        ) => {}
-                                Err(e) => return Err(e),
-                            }
+                            return Err(PercolatorError::OracleStale.into());
                         }
                     }
                     let engine = zc::engine_mut(&mut data)?;

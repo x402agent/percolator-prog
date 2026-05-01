@@ -2177,6 +2177,124 @@ fn test_admin_degenerate_resolve_rejects_live_oracle() {
         .expect("Ordinary resolve should still succeed with the live oracle");
 }
 
+fn try_resolve_market_with_oracle(
+    env: &mut TestEnv,
+    admin: &Keypair,
+    oracle: Pubkey,
+    mode: u8,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(oracle, false),
+        ],
+        data: encode_resolve_market(mode),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+fn prepare_non_hyperp_degenerate_resolve_gate_env() -> (TestEnv, Keypair) {
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 80);
+    env.crank();
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        let mut config = percolator_prog::state::read_config(&slab.data);
+        config.max_staleness_secs = 30;
+        config.permissionless_resolve_stale_slots = 1_000;
+        percolator_prog::state::write_config(&mut slab.data, &config);
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    env.svm.set_sysvar(&Clock {
+        slot: 140,
+        unix_timestamp: 140,
+        ..Clock::default()
+    });
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    (env, admin)
+}
+
+#[test]
+fn test_admin_degenerate_resolve_rejects_caller_chosen_stale_pyth_before_hard_timeout() {
+    program_path();
+
+    let (mut env, admin) = prepare_non_hyperp_degenerate_resolve_gate_env();
+    let stale_update = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            stale_update,
+            Account {
+                lamports: 1_000_000,
+                data: make_pyth_data(&TEST_FEED_ID, 200_000_000, -6, 1, 100),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let err = try_resolve_market_with_oracle(&mut env, &admin, stale_update, 1)
+        .expect_err("caller-chosen stale Pyth update must not prove feed death");
+    assert!(
+        err.contains("0x6"),
+        "Degenerate resolve before hard timeout should reject as not \
+         stale-matured (0x6), got: {}",
+        err,
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "failed Degenerate resolve must not mutate market mode"
+    );
+}
+
+#[test]
+fn test_admin_degenerate_resolve_rejects_caller_chosen_conf_wide_pyth_before_hard_timeout() {
+    program_path();
+
+    let (mut env, admin) = prepare_non_hyperp_degenerate_resolve_gate_env();
+    let conf_wide_update = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            conf_wide_update,
+            Account {
+                lamports: 1_000_000,
+                data: make_pyth_data(&TEST_FEED_ID, 200_000_000, -6, 20_000_000, 140),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let err = try_resolve_market_with_oracle(&mut env, &admin, conf_wide_update, 1)
+        .expect_err("caller-chosen conf-wide Pyth update must not prove feed death");
+    assert!(
+        err.contains("0x6"),
+        "Degenerate resolve before hard timeout should reject as not \
+         stale-matured (0x6), got: {}",
+        err,
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "failed Degenerate resolve must not mutate market mode"
+    );
+}
+
 /// Strict hard-timeout regression: DepositCollateral must reject once
 /// the market has matured, even before the market is formally resolved.
 /// Users should exit via resolved-market close paths, not feed more
