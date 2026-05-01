@@ -14246,6 +14246,23 @@ fn test_attack_profit_maturity_cap_independent_from_accrual_window() {
 fn test_attack_permissionless_resolve_cap_independent_from_accrual_window() {
     program_path();
 
+    let above_accrual = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS + 1;
+    assert!(
+        above_accrual <= percolator_prog::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+        "test constants must keep stale horizon cap above the live accrual envelope"
+    );
+
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
+    let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(
+        &env.payer.pubkey(),
+        &env.mint,
+        MAX_RISK_H_MAX,
+        above_accrual,
+    );
+    env.try_init_market_raw(data)
+        .expect("MAX_ACCRUAL_DT_SLOTS + 1 should be accepted; the stale horizon is not max_dt");
+
     let mut env = TestEnv::new();
     env.set_slot_and_price_raw_no_walk(MAX_RISK_ATTACK_START_SLOT, MAX_RISK_P0_E6 as i64);
     let data = encode_init_market_bounty_sol_20x_with_h_max_and_perm_resolve(

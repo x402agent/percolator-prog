@@ -1874,9 +1874,22 @@ fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() 
     // Tighten oracle staleness so clock advance → oracle death.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        let mut config = percolator_prog::state::read_config(&slab.data);
+        config.max_staleness_secs = 30;
+        percolator_prog::state::write_config(&mut slab.data, &config);
         env.svm.set_account(env.slab, slab).unwrap();
     }
+
+    // Put real user capital in the market before the outage. This keeps the
+    // test from being a vacuous "empty market can flip resolved=true" check:
+    // after permissionless resolution, the user must still be able to exit
+    // through the resolved force-close path.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+    let used_before = env.read_num_used_accounts();
+    let capital_before = env.read_account_capital(user_idx);
+    assert!(capital_before > 0, "test account must carry capital");
 
     env.crank(); // seed engine.last_oracle_price with the real price
 
@@ -1886,6 +1899,12 @@ fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() 
         unix_timestamp: 500_000,
         ..Clock::default()
     });
+
+    let live_result = env.try_crank();
+    assert!(
+        live_result.is_err(),
+        "live crank must not be the recovery path once the oracle outage is stale"
+    );
 
     // If the audit were right, the engine would reject with Overflow on the
     // dt check and the market would be permanently stuck. The Degenerate
@@ -1898,6 +1917,28 @@ fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() 
     assert_eq!(
         settlement, 138_000_000,
         "settlement uses engine.last_oracle_price (last known good)"
+    );
+
+    let force_close_delay = {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        percolator_prog::state::read_config(&slab.data).force_close_delay_slots
+    };
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.slot = clock
+        .slot
+        .saturating_add(force_close_delay)
+        .saturating_add(1);
+    clock.unix_timestamp = clock
+        .unix_timestamp
+        .saturating_add(force_close_delay as i64 + 1);
+    env.svm.set_sysvar(&clock);
+
+    env.try_force_close_resolved(user_idx, &user.pubkey())
+        .expect("resolved account must be permissionlessly force-closable after delay");
+    assert_eq!(
+        env.read_num_used_accounts(),
+        used_before - 1,
+        "resolved force-close must free the funded account"
     );
 }
 

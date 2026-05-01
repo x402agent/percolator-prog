@@ -410,7 +410,7 @@ pub fn encode_init_market_with_conf_bps(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -460,7 +460,7 @@ pub fn encode_init_market_full_v2(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -504,8 +504,9 @@ pub fn encode_init_market_with_cap(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    // max_crank_staleness_slots: use bounded value when permissionless resolve is enabled
-    // (permissionless_resolve_stale_slots must exceed max_crank_staleness_slots)
+    // Legacy max_crank_staleness wire slot: keep it below the configured
+    // permissionless horizon for old decode paths. The live-accrual window is
+    // separately controlled by MAX_ACCRUAL_DT_SLOTS.
     let max_crank = if permissionless_resolve_stale_slots > 0 {
         permissionless_resolve_stale_slots.saturating_sub(1).max(1)
     } else {
@@ -645,7 +646,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -656,7 +657,7 @@ pub fn encode_init_market_with_trading_fee(
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
 
-    // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
+    // Use a short test stale horizon; production cap is independent from MAX_ACCRUAL_DT_SLOTS.
     let perm_resolve: u64 = if is_hyperp { 0 } else { 80 };
     data.extend_from_slice(&perm_resolve.to_le_bytes());
     // Custom funding params (required before mark_min_fee)
@@ -709,7 +710,7 @@ pub fn encode_init_market_with_maint_fee_bounded(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -729,7 +730,7 @@ pub fn encode_init_market_with_force_close(
     force_close_delay_slots: u64,
 ) -> Vec<u8> {
     // Build base with cap + permissionless resolve (full 82-byte tail).
-    // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Use 80.
+    // Use a short test stale horizon; production cap is independent from MAX_ACCRUAL_DT_SLOTS.
     let mut data = encode_init_market_with_cap(admin, mint, feed_id, 0, 80);
     // Truncate default force_close_delay_slots (last 8 bytes), replace with custom
     data.truncate(data.len() - 8);
@@ -968,21 +969,23 @@ impl TestEnv {
     }
 
     pub fn init_market_with_invert(&mut self, invert: u8) {
-        // v12.19.6: non-Hyperp resolvability invariant rejects
+        // Non-Hyperp resolvability invariant rejects
         // `permissionless_resolve_stale_slots == 0` (a market with no
-        // resolve path is un-resolvable once admin is burned). perm_resolve
-        // must also exceed `max_crank_staleness_slots` (now 50 in our
-        // encoders) AND be <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
+        // resolve path is un-resolvable once admin is burned). Pick a short
+        // test horizon; production horizons are bounded by
+        // MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS and intentionally independent
+        // from MAX_ACCRUAL_DT_SLOTS.
         self.init_market_with_cap(invert, 80);
     }
 
     /// Initialize a market with oracle price cap (enables EWMA) and optional permissionless resolution.
     ///
-    /// v12.19: non-Hyperp markets must set `permissionless_resolve_stale_slots`
-    /// above the default `max_crank_staleness_slots` (= 1_800) so the wrapper's
-    /// resolvability invariant admits the market. Callers that pass `0` will
-    /// be rejected by the engine; use `encode_init_market_with_cap` directly
-    /// if a test genuinely requires `perm_resolve == 0`.
+    /// Non-Hyperp markets must set `permissionless_resolve_stale_slots`
+    /// nonzero so the wrapper's resolvability invariant admits the market.
+    /// The stale horizon is not an accrual-dt envelope; callers may use values
+    /// above MAX_ACCRUAL_DT_SLOTS up to MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS.
+    /// Use `encode_init_market_with_cap` directly if a test genuinely needs to
+    /// assert rejection for `perm_resolve == 0`.
     pub fn init_market_with_cap(&mut self, invert: u8, permissionless_resolve_stale_slots: u64) {
         let admin = &self.payer;
         let dummy_ata = Pubkey::new_unique();
@@ -1031,9 +1034,10 @@ impl TestEnv {
 
     /// Initialize a market with permissionless resolution AND custom funding params.
     ///
-    /// Non-Hyperp markets must set `permissionless_resolve_stale_slots` above
-    /// the wrapper's default `max_crank_staleness_slots` (1_800); passing `0`
-    /// will be rejected by the engine.
+    /// Non-Hyperp markets must set `permissionless_resolve_stale_slots`
+    /// nonzero; passing `0` is rejected by the wrapper. The stale horizon is
+    /// capped by MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS, not by
+    /// MAX_ACCRUAL_DT_SLOTS.
     pub fn init_market_with_funding(
         &mut self,
         invert: u8,
@@ -1178,7 +1182,7 @@ impl TestEnv {
                 &self.mint,
                 &TEST_FEED_ID,
                 invert,
-                80, // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100)
+                80, // short test stale horizon; independent from max accrual dt
                 500,
                 100,
                 500,
@@ -1886,7 +1890,7 @@ pub fn encode_init_market_full(
     data.extend_from_slice(&new_account_fee_enforced.to_le_bytes());
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -1933,7 +1937,7 @@ pub fn encode_init_market_with_warmup(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -5302,7 +5306,7 @@ impl TestEnv {
         data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee
         data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-        data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+        data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -5311,7 +5315,7 @@ impl TestEnv {
         data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
         data.extend_from_slice(&TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot
                                                                                  // v12.19.6 extended tail: non-Hyperp needs perm_resolve > 0, and
-                                                                                 // perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 80.
+                                                                                 // stale horizon is intentionally independent from MAX_ACCRUAL_DT_SLOTS. Pick short test value 80.
         data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
         data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots
@@ -5389,7 +5393,7 @@ impl TestEnv {
         data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee (dust)
         data.extend_from_slice(&warmup_period_slots.max(1).to_le_bytes()); // h_max (must be >= h_min)
 
-        data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+        data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
         data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -7602,7 +7606,7 @@ pub fn encode_init_market_with_limits(
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
 
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -7647,7 +7651,7 @@ pub fn encode_init_market_with_maintenance_fee(
     let new_account_fee: u128 = if maintenance_fee_per_slot > 0 { 0 } else { 1 };
     data.extend_from_slice(&new_account_fee.to_le_bytes()); // new_account_fee
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness_slots (must be < perm_resolve=80 <= MAX_ACCRUAL_DT_SLOTS=100)
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps

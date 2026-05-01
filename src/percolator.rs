@@ -3845,30 +3845,13 @@ pub mod processor {
         ))
     }
 
-    /// Idempotent: the engine's per-account `last_fee_slot` cursor prevents
-    /// double-charging over the same interval, and a call at the same anchor
-    /// as the cursor is a no-op.
-    ///
-    /// No-op when `maintenance_fee_per_slot == 0` or the account is not safe
-    /// for pre-touch recurring fee collection. This helper is deliberately
-    /// conservative: collecting fees from nonflat/stale capital before the
-    /// engine's local touch would make fees senior to same-account losses.
-    ///
-    /// Invariant: capital-sensitive operations MUST fully accrue the
-    /// market (advance `last_market_slot` to `now_slot`) before syncing
-    /// per-account fees. Oracle-backed paths satisfy this via
-    /// `ensure_market_accrued_to_now` upstream. No-oracle paths (Deposit,
-    /// DepositFeeCredits, InitUser, InitLP, TopUpInsurance, crank candidate
-    /// GC) cannot advance `last_market_slot` (no price /
-    /// rate available), so they MUST pass an anchor that is already
-    /// accrued — use `sync_account_fee_bounded_to_market` below rather
-    /// than calling this helper with a wall-clock slot.
-    ///
-    /// Calling this with `now_slot > engine.last_market_slot` creates a
-    /// `current_slot > last_market_slot` split that later breaks the
-    /// accrual envelope: the next oracle-backed instruction will see an
-    /// inflated `clock.slot - last_market_slot` dt and fail Overflow.
-    fn sync_account_fee(
+    /// Recurring fee sync for accounts that have already gone through an
+    /// authoritative engine local touch in this instruction. Unlike
+    /// pre-touch fee sweeping, this intentionally does not require the account
+    /// to be flat: the loss-senior precondition was satisfied by the preceding
+    /// `settle_account_not_atomic` / keeper touch, so nonflat current accounts
+    /// must become fee-current before health-sensitive actions.
+    fn sync_account_fee_after_authoritative_touch(
         engine: &mut RiskEngine,
         config: &MarketConfig,
         idx: u16,
@@ -3878,9 +3861,6 @@ pub mod processor {
             return Ok(());
         }
         check_idx(engine, idx)?;
-        if !recurring_fee_pre_touch_safe(engine, idx as usize)? {
-            return Ok(());
-        }
         let is_resolved = engine.is_resolved();
         let resolved_slot = if is_resolved {
             engine.resolved_context().1
@@ -3898,6 +3878,68 @@ pub mod processor {
         engine
             .sync_account_fee_to_slot_not_atomic(idx, now_slot, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
+    }
+
+    fn settle_account_then_sync_fee_current(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        admit_h_min: u64,
+        admit_h_max: u64,
+        admit_threshold: Option<u128>,
+    ) -> Result<(), ProgramError> {
+        engine
+            .settle_account_not_atomic(
+                idx,
+                price,
+                now_slot,
+                funding_rate_e9,
+                admit_h_min,
+                admit_h_max,
+                admit_threshold,
+            )
+            .map_err(map_risk_error)?;
+        sync_account_fee_after_authoritative_touch(engine, config, idx, now_slot)
+    }
+
+    fn settle_pair_then_sync_fee_current(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        a: u16,
+        b: u16,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        admit_h_min: u64,
+        admit_h_max: u64,
+        admit_threshold: Option<u128>,
+    ) -> Result<(), ProgramError> {
+        let (first, second) = if a <= b { (a, b) } else { (b, a) };
+        settle_account_then_sync_fee_current(
+            engine,
+            config,
+            first,
+            now_slot,
+            price,
+            funding_rate_e9,
+            admit_h_min,
+            admit_h_max,
+            admit_threshold,
+        )?;
+        settle_account_then_sync_fee_current(
+            engine,
+            config,
+            second,
+            now_slot,
+            price,
+            funding_rate_e9,
+            admit_h_min,
+            admit_h_max,
+            admit_threshold,
+        )
     }
 
     /// Fee-sync variant for no-oracle instructions. Caps the fee anchor
@@ -4345,7 +4387,7 @@ pub mod processor {
     /// `test_fee_sync_does_not_erase_market_accrual_interval`) — making
     /// the ordering explicit in the wrapper removes all ambiguity and
     /// aligns with the auditor-requested pattern:
-    /// `ensure_market_accrued_to_now; sync_account_fee; engine.<op>_not_atomic`.
+    /// `ensure_market_accrued_to_now; touch/settle; sync fee; engine.<op>_not_atomic`.
     ///
     /// The main op's internal `accrue_market_to(now_slot, price, rate)`
     /// then hits the same-slot + same-price no-op branch (engine §5.4
@@ -5030,9 +5072,9 @@ pub mod processor {
     /// truth. When the cursor reaches an account, that account's sync call
     /// realizes fees for the *entire* elapsed interval
     /// `[account.last_fee_slot, now_slot]` in one charge — no fees are lost
-    /// between cursor visits. Self-acting accounts realize their own fees
-    /// inline on every capital-sensitive instruction (see `sync_account_fee`);
-    /// the sweep handles everything that hasn't self-acted.
+    /// between cursor visits. Self-acting accounts realize their own fees inline
+    /// on every capital-sensitive instruction after the engine local touch; the
+    /// sweep handles flat/current accounts that have not self-acted.
     ///
     /// CU bound: at most `FEE_SWEEP_BUDGET` sync calls per crank (strictly,
     /// thanks to the bit cursor), plus O(BITMAP_WORDS) word reads. Constant
@@ -6597,8 +6639,8 @@ pub mod processor {
                 // unrelated OI is exposed. If price/funding progress is
                 // equity-active, KeeperCrank must do the account-touching
                 // cascade first. When the strict gate allows progress, accrue
-                // before fee sync and withdraw so the engine's internal
-                // accrue no-ops at the same slot/price.
+                // first, then make this account authoritative and fee-current
+                // before the withdrawal health check.
                 ensure_market_accrued_to_now_for_account_limited_op(
                     engine,
                     &config,
@@ -6607,9 +6649,17 @@ pub mod processor {
                     funding_rate_e9,
                 )?;
                 reject_any_target_lag(&config, engine)?;
-                // Realize due maintenance fees BEFORE the withdrawal margin
-                // check, so the account can't withdraw against pre-fee capital.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                settle_account_then_sync_fee_current(
+                    engine,
+                    &config,
+                    user_idx,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                    admit_h_min,
+                    admit_h_max,
+                    Some(engine.params.maintenance_margin_bps as u128),
+                )?;
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
                 engine
                     .withdraw_not_atomic(
@@ -6829,8 +6879,9 @@ pub mod processor {
                 //   - New accounts joining mid-interval — seeded at the
                 //     materialization slot, so no back-charge (Goal 47).
                 //   - Self-acting accounts — realize fees in their own
-                //     instruction (via sync_account_fee below); KeeperCrank
-                //     re-visiting them is a no-op at the same anchor.
+                //     instruction after engine local touch; KeeperCrank
+                //     re-visiting flat/current accounts is a no-op at the
+                //     same anchor.
                 //   - Shortfalls — routed through charge_fee_to_insurance as
                 //     fee-credits debt; never fails with InsufficientBalance.
                 //
@@ -7318,18 +7369,26 @@ pub mod processor {
                 )?;
                 reject_any_target_lag(&config, engine)?;
 
-                // Pre-touch maintenance fees are collected only for
-                // flat/current counterparties. Nonflat/stale accounts must
-                // settle lazy A/K/F through execute_trade_not_atomic before
-                // recurring fee debt can safely become senior.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
-                sync_account_fee(engine, &config, lp_idx, clock.slot)?;
+                // Make both counterparties authoritative, then sync recurring
+                // fees before the trade's fee-current margin checks. This
+                // preserves loss-senior ordering while still charging nonflat
+                // current accounts.
+                settle_pair_then_sync_fee_current(
+                    engine,
+                    &config,
+                    user_idx,
+                    lp_idx,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                    engine.params.h_min,
+                    engine.params.h_max,
+                    Some(engine.params.maintenance_margin_bps as u128),
+                )?;
 
-                // Snapshot insurance fund balance for fee-weighted EWMA.
-                // The delta after execute_trade = trading_fees -
-                // losses_absorbed. Flat/current maintenance fees, if any,
-                // were synced before this snapshot; nonflat maintenance fees
-                // are intentionally deferred until after loss settlement.
+                // Snapshot insurance fund balance for fee-weighted EWMA after
+                // recurring fees. The delta after execute_trade is bounded to
+                // trade-fee impact below.
                 // NOTE: If loss absorption occurs during the same trade (spec §5.4),
                 // delta undercounts the actual fee. This is the conservative direction:
                 // mark is stickier during volatile loss-absorption events, never
@@ -7942,9 +8001,21 @@ pub mod processor {
                         funding_rate_e9_pre,
                     )?;
 
-                    // Same loss-senior pre-touch fee policy as TradeNoCpi.
-                    sync_account_fee(engine, &config, user_idx, clock.slot)?;
-                    sync_account_fee(engine, &config, lp_idx, clock.slot)?;
+                    // Same loss-senior fee-current policy as TradeNoCpi:
+                    // touch/settle both counterparties first, then charge
+                    // recurring fees before the trade's margin checks.
+                    settle_pair_then_sync_fee_current(
+                        engine,
+                        &config,
+                        user_idx,
+                        lp_idx,
+                        clock.slot,
+                        price,
+                        funding_rate_e9_pre,
+                        engine.params.h_min,
+                        engine.params.h_max,
+                        Some(engine.params.maintenance_margin_bps as u128),
+                    )?;
 
                     let trade_size = crate::policy::cpi_trade_size(ret.exec_size, size);
                     let current_fee_paid_cap = current_trade_fee_paid_cap(
@@ -7954,9 +8025,8 @@ pub mod processor {
                     )?;
 
                     // Snapshot insurance for fee-weighted EWMA (delta approach).
-                    // Flat/current maintenance fees were synced before this
-                    // snapshot; nonflat maintenance fees are intentionally
-                    // deferred until after loss settlement.
+                    // Recurring fees were synced before this snapshot; the
+                    // delta below is bounded to trade-fee impact.
                     // NOTE: Conservative undercount during volatile
                     // loss-absorption events (see TradeNoCpi comment).
                     let ins_before_cpi = engine.insurance_fund.balance.get();
@@ -8231,8 +8301,8 @@ pub mod processor {
                 } else {
                     let admit_h_min = engine.params.h_min;
                     let admit_h_max = engine.params.h_max;
-                    // Fully accrue market to clock.slot BEFORE fee sync +
-                    // close_account_not_atomic. Explicit accrue→sync→op.
+                    // Fully accrue market to clock.slot, then make the account
+                    // authoritative and fee-current before close preconditions.
                     ensure_market_accrued_to_now_for_account_limited_op(
                         engine,
                         &config,
@@ -8241,9 +8311,17 @@ pub mod processor {
                         funding_rate_e9,
                     )?;
                     reject_any_target_lag(&config, engine)?;
-                    // Realize due maintenance fees BEFORE close so the account
-                    // cannot escape the unpaid interval by closing between cranks.
-                    sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                    settle_account_then_sync_fee_current(
+                        engine,
+                        &config,
+                        user_idx,
+                        clock.slot,
+                        price,
+                        funding_rate_e9,
+                        admit_h_min,
+                        admit_h_max,
+                        Some(engine.params.maintenance_margin_bps as u128),
+                    )?;
                     engine
                         .close_account_not_atomic(
                             user_idx,
@@ -9497,12 +9575,10 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
-                // Phase 1: sync latent maintenance fees and read post-sync
-                // debt. Done under a mutable borrow so sync_account_fee can
-                // realize fees accrued since last_fee_slot BEFORE we compare
-                // `amount` against the outstanding-debt cap. Otherwise a user
-                // with zero realized debt but nonzero latent fees would get
-                // their legitimate repayment rejected as overpayment.
+                // Phase 1: sync latent flat/current maintenance fees and read
+                // post-sync debt. Nonflat/stale accounts are not fee-synced on
+                // this no-oracle path because losses must be settled first by
+                // an oracle-backed touch.
                 let (unit_scale, debt_units) = {
                     let mut data = state::slab_data_mut(a_slab)?;
                     slab_guard(program_id, a_slab, &data)?;
@@ -9538,8 +9614,8 @@ pub mod processor {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
                     check_no_oracle_live_envelope(engine, clock.slot)?;
-                    // No-oracle path: sync fees at an anchor bounded by
-                    // engine.last_market_slot (see sync_account_fee doc).
+                    // No-oracle path: sync flat/current fees at an anchor
+                    // bounded by engine.last_market_slot.
                     sync_account_fee_bounded_to_market(engine, &cfg, user_idx, clock.slot)?;
                     let fc = engine.accounts[user_idx as usize].fee_credits.get();
                     if fc > 0 || fc == i128::MIN {
@@ -9638,8 +9714,8 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Fully accrue market to clock.slot BEFORE fee sync +
-                // convert_released_pnl_not_atomic. Explicit accrue→sync→op.
+                // Fully accrue market to clock.slot, then make the account
+                // authoritative and fee-current before conversion bounds.
                 ensure_market_accrued_to_now_for_account_limited_op(
                     engine,
                     &config,
@@ -9648,9 +9724,17 @@ pub mod processor {
                     funding_rate_e9,
                 )?;
                 reject_any_target_lag(&config, engine)?;
-                // Realize due maintenance fees BEFORE conversion so the
-                // convertible-PnL bound reflects post-fee equity.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                settle_account_then_sync_fee_current(
+                    engine,
+                    &config,
+                    user_idx,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                    admit_h_min,
+                    admit_h_max,
+                    Some(engine.params.maintenance_margin_bps as u128),
+                )?;
                 engine
                     .convert_released_pnl_not_atomic(
                         user_idx,

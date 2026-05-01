@@ -4542,38 +4542,49 @@ fn kani_recurring_fee_pre_touch_safe_shape_universal() {
 // =============================================================================
 
 /// Prove the wrapper's InitMarket policy for permissionless resolution is
-/// intentionally independent from the live-accrual dt envelope. The accepted
-/// set is exactly `0` (disabled) or `1..=MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS`;
-/// `MAX_ACCRUAL_DT_SLOTS` does not appear in the predicate and values above
-/// the accrual window are accepted up to the product cap.
+/// intentionally independent from the live-accrual dt envelope. This is a
+/// boundary/case proof, not just an equality-to-a-duplicate-expression check:
+///
+/// - zero is accepted as "disabled" at the pure-policy layer;
+/// - every nonzero value through the product cap is accepted;
+/// - every value above the product cap is rejected;
+/// - `MAX_ACCRUAL_DT_SLOTS + 1` is accepted, proving the live-accrual
+///   envelope is not the stale-resolution horizon.
 #[kani::proof]
 fn kani_permissionless_resolve_horizon_policy_independent_from_accrual_window() {
     let stale_slots: u64 = kani::any();
 
     let ok = permissionless_resolve_horizon_ok(stale_slots);
-    let expected = stale_slots == 0 || stale_slots <= MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS;
-    assert_eq!(
-        ok, expected,
-        "permissionless resolve horizon is bounded by its product cap, not max_accrual_dt"
-    );
 
     assert!(
         MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS > MAX_ACCRUAL_DT_SLOTS,
         "the wrapper deliberately supports dead-oracle horizons above one live-accrual segment"
     );
 
-    let above_accrual = MAX_ACCRUAL_DT_SLOTS.saturating_add(1);
-    if above_accrual <= MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS {
+    if stale_slots == 0 {
+        assert!(ok, "zero is accepted as the disabled sentinel");
+    }
+    if stale_slots > 0 && stale_slots <= MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS {
         assert!(
-            permissionless_resolve_horizon_ok(above_accrual),
-            "horizons above MAX_ACCRUAL_DT_SLOTS are accepted when within the product cap"
+            ok,
+            "all nonzero horizons through the product cap are accepted"
         );
     }
+    if stale_slots > MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS {
+        assert!(!ok, "horizons above the product cap are rejected");
+    }
 
+    let above_accrual = MAX_ACCRUAL_DT_SLOTS + 1;
     assert!(
-        !permissionless_resolve_horizon_ok(
-            MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS.saturating_add(1)
-        ),
+        above_accrual <= MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+        "test constants must keep the product horizon above one accrual segment"
+    );
+    assert!(
+        permissionless_resolve_horizon_ok(above_accrual),
+        "horizons above MAX_ACCRUAL_DT_SLOTS are accepted when within the product cap"
+    );
+    assert!(
+        !permissionless_resolve_horizon_ok(MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS + 1),
         "cap+1 is rejected"
     );
 }

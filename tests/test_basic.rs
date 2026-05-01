@@ -6187,14 +6187,14 @@ fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
 
 /// Disproof of the "fee sync erases market accrual" audit claim.
 ///
-/// Hypothesis under test: when sync_account_fee self-advances
+/// Hypothesis under test: when recurring fee sync self-advances
 /// engine.current_slot = clock.slot, a subsequent accrue_market_to
 /// becomes a no-op and the funding interval [prev, clock.slot] is lost.
 ///
 /// Actual engine contract: accrue_market_to's dt is measured from
 /// `last_market_slot`, NOT `current_slot` (engine v12.18.x,
 /// accrue_market_to line 2143: `let total_dt = now_slot - last_market_slot`).
-/// sync_account_fee advances current_slot but NOT last_market_slot.
+/// fee sync advances current_slot but NOT last_market_slot.
 /// So the next accrue_market_to still sees the full interval.
 ///
 /// This test verifies empirically by reading `last_market_slot` before
@@ -6232,7 +6232,7 @@ fn test_fee_sync_does_not_erase_market_accrual_interval() {
     let before = read_last_market_slot(&env);
     assert_eq!(before, 100, "seeded last_market_slot at 100");
 
-    // Advance one slot. sync_account_fee will self-advance current_slot to
+    // Advance one slot. Recurring fee sync will self-advance current_slot to
     // 101. If the audit hypothesis held, the subsequent
     // accrue_market_to(101, ...) inside withdraw_not_atomic would become a
     // no-op and last_market_slot would stay at 100. Under the real engine
@@ -6286,7 +6286,7 @@ fn test_fee_sync_anchor_accepts_future_now_slot_for_every_path() {
     env.crank();
 
     // Exact auditor shape #1: advance clock by ONE slot. engine.current_slot
-    // still points at the last crank. sync_account_fee(..., clock.slot)
+    // still points at the last crank. Recurring fee sync at clock.slot
     // MUST succeed — the engine self-advances current_slot to clock.slot.
     env.set_slot(1); // clock = 101; engine.current_slot still 100
     env.try_withdraw(&user, user_idx, 100)
@@ -6313,6 +6313,70 @@ fn test_fee_sync_anchor_accepts_future_now_slot_for_every_path() {
     // Withdraw remaining deposited amount, then close.
     env.try_close_account(&user, user_idx)
         .expect("CloseAccount after 50k-slot gap (fees ON) MUST succeed");
+}
+
+#[test]
+fn test_trade_nocpi_charges_nonflat_recurring_fees_after_touch() {
+    program_path();
+    let mut env = TestEnv::new();
+    let fee_per_slot = 1_000u128;
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        fee_per_slot,
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+    assert_ne!(env.read_account_position(user_idx), 0);
+    assert_ne!(env.read_account_position(lp_idx), 0);
+
+    let user_fee_slot_before = env.read_account_last_fee_slot(user_idx);
+    let lp_fee_slot_before = env.read_account_last_fee_slot(lp_idx);
+    assert_eq!(user_fee_slot_before, 120);
+    assert_eq!(lp_fee_slot_before, 120);
+    let user_cap_before = env.read_account_capital(user_idx);
+    let lp_cap_before = env.read_account_capital(lp_idx);
+    let insurance_before = env.read_insurance_balance();
+
+    env.set_slot_and_price_raw_no_walk(121, 138_000_000);
+    env.try_trade(&user, &lp, lp_idx, user_idx, -1_000_000)
+        .expect("risk-reducing trade should sync nonflat recurring fees");
+
+    assert_eq!(env.read_account_last_fee_slot(user_idx), 121);
+    assert_eq!(env.read_account_last_fee_slot(lp_idx), 121);
+
+    let user_fee = user_cap_before.saturating_sub(env.read_account_capital(user_idx));
+    let lp_fee = lp_cap_before.saturating_sub(env.read_account_capital(lp_idx));
+    assert_eq!(
+        user_fee, fee_per_slot,
+        "nonflat user must pay the one-slot recurring fee after touch"
+    );
+    assert_eq!(
+        lp_fee, fee_per_slot,
+        "nonflat LP must pay the one-slot recurring fee after touch"
+    );
+    assert_eq!(
+        env.read_insurance_balance()
+            .saturating_sub(insurance_before),
+        fee_per_slot * 2,
+        "recurring fees from both nonflat counterparties should accrue to insurance"
+    );
 }
 
 /// Disproof of the "fee sync ordering" audit claim: with maintenance fees
