@@ -49,7 +49,7 @@ fn assert_no_sbf_panic(err: &str, context: &str) {
 
 fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 912;
+    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 1000;
     u64::from_le_bytes(
         d[LAST_ORACLE_PRICE_OFFSET..LAST_ORACLE_PRICE_OFFSET + 8]
             .try_into()
@@ -2443,6 +2443,77 @@ fn test_crank_candidate_liquidation_reduces_position_and_charges_fee() {
         engine_vault as u64, spl_vault,
         "Conservation: engine vault ({}) must match SPL vault ({}) after liquidation",
         engine_vault, spl_vault
+    );
+}
+
+/// Regression: dense books must eventually honor honest FullClose candidates.
+///
+/// The wrapper used to downgrade FullClose hints to touch-only once the
+/// liquidated side had more than a small number of stored positions. That was
+/// a stale CU guard: with the current bounded engine ADL path it suppresses the
+/// honest keeper's liquidation action after bounded catchup has made the market
+/// loss-current, leaving an underwater account open.
+#[test]
+fn test_crank_dense_same_side_fullclose_candidate_eventually_liquidates() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(50, 138_000_000);
+    let mut init_data =
+        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 200);
+    put_u64(&mut init_data, 144, 800); // maintenance_margin_bps
+    env.try_init_market_raw(init_data)
+        .expect("dense liquidation market init");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
+
+    let mut users = Vec::new();
+    for _ in 0..9 {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_500_000_000);
+        env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
+        assert_ne!(
+            env.read_account_position(user_idx),
+            0,
+            "setup must create a dense same-side position"
+        );
+        users.push((user, user_idx));
+    }
+
+    // The authenticated target is far enough below P_last that repeated
+    // bounded cranks make the target account liquidatable but not bankrupt.
+    // While the market is loss-stale, candidates are touch-only; once catchup
+    // is current, the same honest FullClose hint must be honored.
+    env.set_slot_and_price_raw_no_walk(150, 132_480_000);
+
+    let target_idx = users[0].1;
+    let before_pos = env.read_account_position(target_idx);
+    assert_ne!(before_pos, 0, "precondition: target is still open");
+    assert!(
+        env.read_account_capital(target_idx) > 0,
+        "precondition: target should be liquidatable but not bankrupt"
+    );
+
+    for _ in 0..16 {
+        let result = env.try_liquidate(target_idx);
+        assert!(
+            result.is_ok(),
+            "honest dense FullClose candidate should not reject: {:?}",
+            result
+        );
+        if env.read_account_position(target_idx) == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        env.read_account_position(target_idx),
+        0,
+        "dense same-side FullClose candidate must liquidate once bounded catchup is current"
     );
 }
 

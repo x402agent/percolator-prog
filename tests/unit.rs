@@ -420,11 +420,15 @@ fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
 fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
     let engine = zc::engine_ref(data).ok()?;
     for i in 0..MAX_ACCOUNTS {
-        if engine.is_used(i) && engine.accounts[i].owner == owner.to_bytes() {
+        if engine_slot_is_used(engine, i) && engine.accounts[i].owner == owner.to_bytes() {
             return Some(i as u16);
         }
     }
     None
+}
+
+fn engine_slot_is_used(engine: &percolator::RiskEngine, idx: usize) -> bool {
+    idx < MAX_ACCOUNTS && ((engine.used[idx >> 6] >> (idx & 63)) & 1) == 1
 }
 
 // --- Tests ---
@@ -1075,7 +1079,10 @@ fn test_permissionless_crank_gc() {
     // Record state before GC
     let (used_before, is_used_before) = {
         let engine = zc::engine_ref(&f.slab.data).unwrap();
-        (engine.num_used_accounts, engine.is_used(user_idx as usize))
+        (
+            engine.num_used_accounts,
+            engine_slot_is_used(engine, user_idx as usize),
+        )
     };
     assert!(is_used_before, "User account should be used before GC");
 
@@ -1145,7 +1152,7 @@ fn test_permissionless_crank_gc() {
             "num_used_accounts should decrease by 1"
         );
         assert!(
-            !engine.is_used(user_idx as usize),
+            !engine_slot_is_used(engine, user_idx as usize),
             "User account should no longer be used after reclaim"
         );
     }
@@ -1259,7 +1266,7 @@ fn sum_account_capitals(slab_data: &[u8]) -> u128 {
     let engine = zc::engine_ref(slab_data).unwrap();
     let mut total = 0u128;
     for idx in 0..percolator::MAX_ACCOUNTS {
-        if engine.is_used(idx) {
+        if engine_slot_is_used(engine, idx) {
             total = total.saturating_add(engine.accounts[idx].capital.get());
         }
     }

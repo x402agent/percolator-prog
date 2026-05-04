@@ -26,11 +26,11 @@ use std::path::PathBuf;
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
 // BPF-target SLAB_LEN, cfg-gated by deployment-size feature.
 #[cfg(all(feature = "small", not(feature = "medium")))]
-const SLAB_LEN: usize = 111288;
+const SLAB_LEN: usize = 111376;
 #[cfg(all(feature = "medium", not(feature = "small")))]
-const SLAB_LEN: usize = 440088;
+const SLAB_LEN: usize = 440176;
 #[cfg(not(any(feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1755288;
+const SLAB_LEN: usize = 1755376;
 const TEST_MAX_STALENESS_SECS: u64 = percolator_prog::constants::MAX_ORACLE_STALENESS_SECS;
 #[cfg(all(feature = "small", not(feature = "medium")))]
 const MAX_ACCOUNTS: usize = 256;

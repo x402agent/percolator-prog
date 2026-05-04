@@ -18,6 +18,8 @@ This README is intentionally **high-level**: it explains the trust model, accoun
 - [Instruction overview](#instruction-overview)
 - [Matcher CPI model](#matcher-cpi-model)
 - [Side-mode gating and insurance floor](#side-mode-gating-and-insurance-floor)
+- [Hyperp mode](#hyperp-mode)
+- [Expected risk engine behavior](#expected-risk-engine-behavior)
 - [Operational runbook](#operational-runbook)
 - [Deployment flow](#deployment-flow)
 - [Security properties and verification](#security-properties-and-verification)
@@ -151,8 +153,9 @@ This section describes intent and operational ordering, not argument-by-argument
 ### Risk / maintenance
 - **KeeperCrank**
   - permissionless global maintenance entrypoint
-  - two-phase design: keeper computes candidate shortlist off-chain using `preview_account_at_barrier`, then passes the candidate list in instruction data; on-chain processing operates only on shortlisted candidates
-  - charges maintenance fees, liquidates stale/unsafe accounts, settles touch-only candidates, and reclaims empty candidate accounts; funding is handled internally via K-coefficient mechanism
+  - authenticates clock/oracle state in the wrapper, then delegates bounded public progress to the engine
+  - candidate accounts are untrusted hints, not a liveness precondition; honest keepers should include the worst known stale/bankrupt/liquidatable accounts, but the engine also makes cursored progress
+  - may perform bounded catchup/recovery, liquidation, touch-only settlement, round-robin lifecycle progress, empty-account reclaim, and post-touch maintenance-fee realization
   - optionally updates insurance floor via smoothed auto-threshold policy
 - **TopUpInsurance**
   - transfers collateral into vault; credits insurance fund in engine
@@ -245,6 +248,100 @@ Hyperp is an alternative pricing mode for markets that use an internal mark/inde
 
 ---
 
+## Expected risk engine behavior
+
+This section describes the product-level behavior the wrapper expects from the pinned `percolator` engine. It is intentionally separate from the low-level spec: operators should be able to reason about when users get fast PnL, when markets slow down, and how permissionless cranks unstick state.
+
+### Healthy lane and fast PnL
+
+`RiskParams.h_min` may be zero. That is a product feature: in a healthy, loss-current market the engine can make fresh positive PnL usable immediately.
+
+The fast lane requires the market to be current and solvent in the senior-residual sense:
+
+- no target/effective oracle lag for extraction-sensitive operations
+- no durable bankruptcy h-lock or stress-envelope reconciliation in progress
+- no senior residual deficit, meaning `vault - c_tot - insurance` is non-negative after senior obligations
+- account-local losses, fees, and PnL have been settled through the relevant engine path
+
+When those conditions hold, `h_min = 0` gives users fast withdrawals or positive-PnL usability. If the residual lane is not healthy, fresh positive PnL is admitted under `h_max` instead.
+
+### Clamp and target/effective lag
+
+The wrapper authenticates a raw oracle target, but the engine does not have to jump to that target in one instruction. The effective engine price moves toward the raw target by at most the configured per-slot price cap.
+
+If the raw target outruns the cap, the market enters target/effective lag or loss-stale catchup. That state is **h-max-effective**, but it is not automatically a durable `bankruptcy_hmax_lock_active`.
+
+Expected behavior while lagged:
+
+- cranks keep moving the effective price toward the authenticated target in bounded segments
+- extraction-sensitive actions such as withdrawals, close, conversion, and live insurance withdrawal reject or remain conservative
+- fresh positive PnL uses `h_max`, not the fast `h_min` lane
+- trades are expected to go through the conservative engine/wrapper path and must not create positive-credit extraction from stale or lagged state
+
+Once permissionless progress catches the market up and there is no bankruptcy, stress, or residual deficit, the market returns to the healthy lane.
+
+### Bankruptcy, h-lock, and residual queues
+
+Clamping by itself is not the durable bankruptcy h-lock. Durable h-lock is for bankruptcy or stress states where the engine has discovered residual loss that must be worked through before ordinary positive-PnL usability resumes.
+
+The engine is expected to make these states explicit and incremental:
+
+- bankruptcy residuals are represented in engine state, not hidden in wrapper accounting
+- account-local B/residual settlement is cursored and bounded
+- active close and terminal recovery progress are chunked
+- no public crank should require a full-market atomic scan to preserve safety
+
+This is the A/K/B design goal: worst-case bankruptcies and stale accounts are handled by repeated bounded cranks. Keepers can pass account hints so the worst known accounts get processed first, while the engine still advances structural cursors so empty or imperfect candidate lists do not permanently brick the market.
+
+### Permissionless progress
+
+`KeeperCrank` is the public progress entrypoint for live markets. The wrapper authenticates accounts, time, oracle input, and policy bounds, then calls the engine's permissionless progress API.
+
+The engine may choose a recovery-priority branch, including:
+
+- resolved-market cursor close/reconciliation
+- active close continuation
+- account-B or global P-last recovery
+- ordinary bounded keeper crank
+
+The important product invariant is that a public crank should either commit bounded progress or return a clear terminal/recovery error. It should not depend on a privileged operator to handle ordinary stale-account, residual, or catchup work.
+
+Recovery is not normal live trading. It is a policy-bound terminal or conservative progress path used when the market cannot safely continue ordinary accrual.
+
+### Insurance withdrawal policy
+
+There are two different insurance withdrawal surfaces:
+
+- resolved/terminal insurance withdrawal, which runs after the market is resolved and positions are closed
+- live `WithdrawInsuranceLimited`, which is a bounded operator path
+
+Live insurance withdrawal is intentionally stricter. It is expected to be allowed only when the live market is flat or loss-current, target/effective-lag-free, stress-free, h-lock-free, and has non-negative senior residual. In other words, live insurance can be withdrawn from an empty or fully healthy market, but not while the insurance fund is still protecting unresolved loss or bankruptcy work.
+
+Deposit-only mode limits live withdrawals to explicit `TopUpInsurance` principal. The default mode can withdraw fee-grown insurance too, but only through the same healthy-market gate.
+
+### Product intuition
+
+The per-slot price cap is the meltdown brake. It should be chosen relative to leverage and expected keeper cadence, roughly on the order of the price move the market can safely absorb between cranks.
+
+The cap does not guarantee safety if keepers disappear. It slows effective loss recognition so repeated permissionless cranks can touch, liquidate, settle, or recover accounts in bounded work units. During that slowdown the system intentionally becomes conservative around profit usability and extraction.
+
+### Verification anchors
+
+The wrapper proof suite does not re-prove engine conservation. It proves wrapper policy and routing properties around the engine boundary, while the pinned engine crate owns arithmetic/accounting invariants.
+
+Relevant wrapper anchors include:
+
+- clamp law: `kani_effective_price_zero_oi_adopts_target` and the clamp staircase proofs in `tests/kani.rs`
+- "user path rejects, crank progresses" policy: `kani_issue33_exposed_price_move_rejected_by_user_paths_but_crank_progresses` and `kani_issue33_exposed_funding_rejected_by_user_paths_but_crank_progresses`
+- target/effective lag gates: `kani_target_lag_pending_universal`, `kani_target_lag_after_read_universal`, and `kani_user_value_op_allowed_iff_no_target_lag`
+- partial crank state persistence: `kani_partial_crank_config_write_field_sources`
+- live insurance withdrawal health/residual gate: `kani_live_insurance_withdraw_residual_gate_is_preserved_by_withdrawal`, `kani_live_insurance_withdraw_market_health_rejects_stress_envelope`, and `kani_live_insurance_withdraw_residual_gate_rejects_senior_overflow`
+- permissionless resolve horizon policy: `kani_permissionless_resolve_horizon_policy_independent_from_accrual_window`
+
+The integration tests exercise the same behavior through SBF/LiteSVM paths, including stale-catchup, target lag, risk-buffer refill, live insurance withdrawal optionality, and permissionless resolution after outages longer than the live accrual window.
+
+---
+
 ## Operational runbook
 
 ### Who runs what?
@@ -257,9 +354,11 @@ Run `KeeperCrank` often enough to satisfy engine freshness rules:
 - engine may enforce staleness bounds (e.g., `max_crank_staleness_slots`)
 - in stressed markets, higher cadence reduces liquidation latency and funding drift
 
-The two-phase keeper design keeps on-chain CU predictable. The keeper bot:
-1. Off-chain: calls `preview_account_at_barrier` for each account to build a candidate shortlist
-2. On-chain: submits `KeeperCrank` with the shortlist embedded in instruction data
+The keeper candidate list is a hint channel. A keeper bot should:
+1. Off-chain: identify the worst known liquidatable, bankrupt, stale, or close-continuation accounts
+2. On-chain: submit `KeeperCrank` with those hints so the bounded engine progress unit spends CU on the most useful accounts
+
+Empty or imperfect candidate lists should still let the engine make structural cursored progress. Candidate quality affects how quickly a bad market clears, not whether the public progress API exists.
 
 A typical ops approach:
 - a keeper bot that calls `KeeperCrank` every N slots (or every M seconds) and retries on failure

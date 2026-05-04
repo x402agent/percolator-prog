@@ -1959,6 +1959,7 @@ fn test_withdraw_limited_deposit_only_failed_withdrawals_preserve_budget() {
     );
 
     env.set_slot(4);
+    env.crank();
     send_withdraw_limited(&mut env, &admin, 1_100)
         .expect("operator may withdraw the exact remaining deposited principal");
     assert_eq!(env.read_insurance_balance(), 0);
@@ -1996,7 +1997,9 @@ fn test_withdraw_limited_deposit_only_can_be_enabled_at_init() {
 
 /// 10c. Deposit-only mode must leave fee/new-account growth behind. Once the
 ///      top-up principal budget is exhausted, further bounded withdrawals fail
-///      even though the insurance fund still has non-deposited growth.
+///      even though the insurance fund still has non-deposited growth. The
+///      latest engine permits live insurance withdrawal only from a flat,
+///      loss-current market, so the fee-growth setup flattens before withdraw.
 #[test]
 fn test_withdraw_limited_deposit_only_leaves_fee_growth_behind() {
     program_path();
@@ -2025,6 +2028,7 @@ fn test_withdraw_limited_deposit_only_leaves_fee_growth_behind() {
     env.deposit(&user, user_idx, 10_000_000_000);
 
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, -5_000_000);
     env.set_slot(200);
     env.crank();
 
@@ -2082,7 +2086,8 @@ fn test_withdraw_limited_deposit_only_invalid_flag_rejected() {
 
 /// 10e. Optionality: with the boolean left at its default 0, tag 23 keeps the
 ///      legacy behavior and may withdraw fee-grown insurance even when no
-///      TopUpInsurance principal budget exists.
+///      TopUpInsurance principal budget exists, provided the live market is
+///      flat and loss-current.
 #[test]
 fn test_withdraw_limited_default_mode_not_capped_by_deposit_budget() {
     program_path();
@@ -2103,6 +2108,7 @@ fn test_withdraw_limited_default_mode_not_capped_by_deposit_budget() {
     env.deposit(&user, user_idx, 10_000_000_000);
 
     env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, -5_000_000);
     env.set_slot(200);
     env.crank();
 

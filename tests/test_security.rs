@@ -8349,8 +8349,11 @@ fn test_attack_trade_at_extreme_high_price() {
     // Trade at default price
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
 
-    // Extreme high oracle price
-    env.set_slot_and_price(50, 10_000_000_000); // $10,000
+    // Extreme high raw oracle target. Do not walk the helper all the way to
+    // $10,000 at the default 4 bps/slot cap; this regression only needs to
+    // prove the crank accepts the target as authenticated input, clamps bounded
+    // progress, and does not overflow accounting.
+    env.set_slot_and_price_raw_no_walk(50, 10_000_000_000); // $10,000
     for i in 0..10u64 {
         env.set_slot(50 + i * 100);
         env.crank();
@@ -12982,14 +12985,13 @@ fn test_attack_bad_oracle_with_authority_requires_external_success() {
 ///
 /// Scenario:
 ///   1. Alice long 10M at oracle=$1.00.
-///   2. Price moves to $1.10 (engine still uses stored mark; accrue
+///   2. Price moves to $1.004 (engine still uses stored mark; accrue
 ///      happens inside next trade's preamble).
-///   3. Alice sells 20M at $1.10. Should flip to short 10M.
+///   3. Alice sells 20M at $1.004. Should flip to short 10M.
 ///
 /// Expected:
-///   - Alice's realized PnL from the 10M close at $1.10: +$1.0M
-///     (+10M × $0.10/1e6 in the 1e6-scaled POS units).
-///   - Alice's new position: -10M short, entry around $1.10.
+///   - Alice's realized PnL from the 10M close at $1.004 is positive.
+///   - Alice's new position: -10M short, entry around $1.004.
 ///   - LP's capital ~ mirror (zero fees).
 ///
 /// Weird:
@@ -13009,6 +13011,31 @@ fn test_attack_position_flip_through_zero_with_pnl() {
         0, // no maintenance fee
         0,
     );
+    let pyth_data = common::make_pyth_data(&common::TEST_FEED_ID, 1_000_000, -6, 1, 100);
+    env.svm
+        .set_account(
+            env.pyth_index,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data.clone(),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            env.pyth_col,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     env.try_init_market_raw(data).expect("init_market");
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     env.top_up_insurance(&admin, 100_000_000_000);
@@ -13022,19 +13049,28 @@ fn test_attack_position_flip_through_zero_with_pnl() {
     env.deposit(&alice, alice_idx, 10_000_000_000);
 
     // Step 1: open long 10M at $1.00 (1_000_000 in e6 scale).
-    env.set_slot_and_price(100, 1_000_000);
+    env.try_crank_once().expect("seed low-price oracle");
     env.trade(&alice, &lp, lp_idx, alice_idx, 10_000_000);
     let alice_pos_after_long = env.read_account_position(alice_idx);
     assert_eq!(alice_pos_after_long, 10_000_000, "open long failed");
 
-    // Step 2: advance slot + bump price to $1.10.
-    env.set_slot_and_price(200, 1_100_000);
+    // Step 2: advance slot + bump price to $1.004. The 40-slot gap is within
+    // both the hard stale window and the configured price-move envelope.
+    env.set_slot_and_price_raw_no_walk(140, 1_004_000);
+    for _ in 0..5 {
+        env.try_crank_once().expect("crank to updated oracle price");
+        if env.read_last_market_slot() >= 140 {
+            break;
+        }
+    }
+    assert_eq!(env.read_last_effective_price(), 1_004_000);
+    assert!(env.read_last_market_slot() >= 140);
     env.svm.expire_blockhash();
 
     let vault_pre_flip = env.vault_balance();
 
     // Step 3: sell 20M — should close 10M long (+PnL) and open 10M
-    // short at $1.10.
+    // short at $1.004.
     env.trade(&alice, &lp, lp_idx, alice_idx, -20_000_000);
 
     let alice_pos_after_flip = env.read_account_position(alice_idx);
