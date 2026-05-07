@@ -9,9 +9,9 @@ use percolator_prog::{
     constants::MAGIC,
     error::PercolatorError,
     matcher_abi::{validate_matcher_return, MatcherReturn, FLAG_PARTIAL_OK, FLAG_VALID},
-    oracle,
+    oracle, policy,
     processor::process_instruction,
-    state, units, zc,
+    state, zc,
 };
 use solana_program::{
     account_info::AccountInfo, clock::Clock, program_error::ProgramError, program_pack::Pack,
@@ -110,6 +110,7 @@ const PYTH_RECEIVER_BYTES: [u8; 32] = [
 /// PriceFeedMessage begins at byte 41.
 fn make_pyth(feed_id: &[u8; 32], price: i64, expo: i32, conf: u64, publish_time: i64) -> Vec<u8> {
     let mut data = vec![0u8; 134];
+    data[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
     // verification_level = Full (discriminant 0x01) at offset 40
     data[40] = 1;
     // feed_id at offset 41
@@ -404,14 +405,14 @@ fn encode_close_slab() -> Vec<u8> {
     vec![13u8]
 }
 
-fn encode_reclaim_empty_account(user_idx: u16) -> Vec<u8> {
-    let mut data = vec![25u8];
-    encode_u16(user_idx, &mut data);
+fn encode_topup_insurance(amount: u64) -> Vec<u8> {
+    let mut data = vec![9u8];
+    encode_u64(amount, &mut data);
     data
 }
 
-fn encode_topup_insurance(amount: u64) -> Vec<u8> {
-    let mut data = vec![9u8];
+fn encode_withdraw_insurance_limited(amount: u64) -> Vec<u8> {
+    let mut data = vec![23u8];
     encode_u64(amount, &mut data);
     data
 }
@@ -419,11 +420,15 @@ fn encode_topup_insurance(amount: u64) -> Vec<u8> {
 fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
     let engine = zc::engine_ref(data).ok()?;
     for i in 0..MAX_ACCOUNTS {
-        if engine.is_used(i) && engine.accounts[i].owner == owner.to_bytes() {
+        if engine_slot_is_used(engine, i) && engine.accounts[i].owner == owner.to_bytes() {
             return Some(i as u16);
         }
     }
     None
+}
+
+fn engine_slot_is_used(engine: &percolator::RiskEngine, idx: usize) -> bool {
+    idx < MAX_ACCOUNTS && ((engine.used[idx >> 6] >> (idx & 63)) & 1) == 1
 }
 
 // --- Tests ---
@@ -490,6 +495,49 @@ fn test_external_oracle_with_open_interest_respects_zero_dt_clamp() {
     assert_eq!(price, 100_000_000);
     assert_eq!(config.last_effective_price_e6, 100_000_000);
     assert_eq!(config.oracle_target_price_e6, 120_000_000);
+}
+
+#[test]
+fn test_recurring_fee_pre_touch_policy_is_loss_senior() {
+    assert!(policy::recurring_fee_pre_touch_safe_shape(
+        true, 0, 0, 0, 0, 0, 0, 0,
+    ));
+    assert!(policy::recurring_fee_pre_touch_safe_shape(
+        true, 0, 0, 10, 0, 0, 0, -5,
+    ));
+
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 1, 0, 0, 0, 0, 0, 0),
+        "raw nonflat accounts may have lazy A/K/F losses even when effective position is zero"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 1, 0, 0, 0, 0, 0),
+        "effective exposure must be flat before pre-touch fee collection"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 0, -1, 0, 0, 0, 0),
+        "materialized negative PnL is senior to recurring fees"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 0, 1, 1, 0, 0, 0),
+        "reserved PnL state requires engine finalization before fees"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 0, 1, 0, 1, 0, 0),
+        "scheduled reserves require engine finalization before fees"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 0, 1, 0, 0, 1, 0),
+        "pending reserves require engine finalization before fees"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 0, 1, 0, 0, 0, 1),
+        "positive fee credits are corrupt and fail closed"
+    );
+    assert!(
+        !policy::recurring_fee_pre_touch_safe_shape(true, 0, 0, 1, 0, 0, 0, i128::MIN),
+        "i128::MIN fee credits are corrupt and fail closed"
+    );
 }
 
 #[test]
@@ -620,14 +668,14 @@ fn test_struct_sizes() {
 /// / `zc::engine_mut`. The cast is sound only if every field of
 /// `RiskEngine` (including its nested `accounts: [Account;
 /// MAX_ACCOUNTS]`) either (a) has no invalid bit patterns, or (b) is
-/// explicitly validated by `validate_raw_discriminants`.
+/// explicitly validated by `validate_raw_engine_state_shape`.
 ///
 /// The audit flagged the theoretical risk of a future author adding a
 /// `bool` or `#[repr(u8)] enum` field to one of these structs, which
-/// would make the unsafe cast UB on first access even when
-/// `validate_raw_discriminants` succeeds. Today the slab-persisted
-/// types contain only fixed-width integer/array fields plus the two
-/// `#[repr(u8)]` enums `SideMode` and `MarketMode` (both validated).
+/// would make the unsafe cast UB on first access unless the raw bytes
+/// are validated first. Today the slab-persisted invalid-bit fields are
+/// the `SideMode` / `MarketMode` enums plus the persistent h-max bool, all
+/// validated before casting in the currently pinned engine.
 ///
 /// This test asserts that structural invariant at runtime by
 /// instantiating every slab field through zero bytes (via
@@ -664,9 +712,84 @@ fn test_zc_cast_safety_invariant() {
     let _ = acct.pending_present;
     // If the above compiles and runs clean, every field in Account
     // is all-bits-valid. RiskEngine-level fields (vault, params, enum
-    // discriminants, etc.) are already either all-bits-valid or
-    // covered by validate_raw_discriminants; the audit concern was
+    // discriminants, persistent bools, etc.) are already either all-bits-valid
+    // or covered by validate_raw_engine_state_shape; the audit concern was
     // specifically nested Account fields.
+}
+
+#[test]
+fn test_zc_rejects_invalid_persistent_bool_before_casting_engine_ref() {
+    use core::mem::offset_of;
+    use percolator::RiskEngine;
+    use percolator_prog::constants::{ENGINE_OFF, SLAB_LEN};
+
+    let mut slab = vec![0u8; SLAB_LEN];
+    let bool_off = ENGINE_OFF + offset_of!(RiskEngine, bankruptcy_hmax_lock_active);
+    slab[bool_off] = 2;
+
+    assert_eq!(
+        zc::validate_raw_engine_bytes_for_test(&slab),
+        Err(ProgramError::InvalidAccountData),
+        "persistent bool fields must be raw-validated before unsafe zero-copy cast"
+    );
+}
+
+#[test]
+fn test_withdraw_insurance_limited_rejects_active_stress_envelope() {
+    let mut f = setup_market();
+    let data = encode_init_market(&f, 50);
+
+    {
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            f.mint.to_info(),
+            f.vault.to_info(),
+            f.clock.to_info(),
+            f.pyth_index.to_info(),
+        ];
+        process_instruction(&f.program_id, &accounts, &data).unwrap();
+    }
+
+    {
+        let mut config = state::read_config(&f.slab.data);
+        config.insurance_withdraw_max_bps = 10_000;
+        state::write_config(&mut f.slab.data, &config);
+
+        let engine = zc::engine_mut(&mut f.slab.data).unwrap();
+        engine.stress_consumed_bps_e9_since_envelope = 1;
+        engine.stress_envelope_remaining_indices = 1;
+        engine.stress_envelope_start_slot = engine.current_slot;
+        engine.stress_envelope_start_generation = engine.sweep_generation;
+    }
+
+    let mut operator_ata = TestAccount::new(
+        Pubkey::new_unique(),
+        spl_token::ID,
+        0,
+        make_token_account(f.mint.key, f.admin.key, 0),
+    )
+    .writable();
+    let mut vault_pda = TestAccount::new(f.vault_pda, Pubkey::default(), 0, vec![]);
+
+    let res = {
+        let accounts = vec![
+            f.admin.to_info(),
+            f.slab.to_info(),
+            operator_ata.to_info(),
+            f.vault.to_info(),
+            f.token_prog.to_info(),
+            vault_pda.to_info(),
+            f.clock.to_info(),
+        ];
+        process_instruction(
+            &f.program_id,
+            &accounts,
+            &encode_withdraw_insurance_limited(1),
+        )
+    };
+
+    assert_eq!(res, Err(PercolatorError::EngineInsufficientBalance.into()));
 }
 
 #[test]
@@ -956,7 +1079,10 @@ fn test_permissionless_crank_gc() {
     // Record state before GC
     let (used_before, is_used_before) = {
         let engine = zc::engine_ref(&f.slab.data).unwrap();
-        (engine.num_used_accounts, engine.is_used(user_idx as usize))
+        (
+            engine.num_used_accounts,
+            engine_slot_is_used(engine, user_idx as usize),
+        )
     };
     assert!(is_used_before, "User account should be used before GC");
 
@@ -998,16 +1124,23 @@ fn test_permissionless_crank_gc() {
         assert_eq!(account.reserved_pnl, 0, "reserved_pnl should be 0");
     }
 
-    // Call ReclaimEmptyAccount - should reclaim the dust account
-    // ReclaimEmptyAccount (opcode 25) expects 2 accounts: slab (writable), clock
+    // Public ReclaimEmptyAccount is retired; KeeperCrank candidate GC should
+    // reclaim the dust account.
     {
-        let accs = vec![f.slab.to_info(), f.clock.to_info()];
-        process_instruction(
-            &f.program_id,
-            &accs,
-            &encode_reclaim_empty_account(user_idx),
+        let mut caller = TestAccount::new(
+            Pubkey::new_unique(),
+            solana_program::system_program::id(),
+            0,
+            vec![],
         )
-        .unwrap();
+        .signer();
+        let accs = vec![
+            caller.to_info(),
+            f.slab.to_info(),
+            f.clock.to_info(),
+            f.pyth_index.to_info(),
+        ];
+        process_instruction(&f.program_id, &accs, &encode_crank_permissionless(0)).unwrap();
     }
 
     // Verify reclaim freed the account
@@ -1019,7 +1152,7 @@ fn test_permissionless_crank_gc() {
             "num_used_accounts should decrease by 1"
         );
         assert!(
-            !engine.is_used(user_idx as usize),
+            !engine_slot_is_used(engine, user_idx as usize),
             "User account should no longer be used after reclaim"
         );
     }
@@ -1133,7 +1266,7 @@ fn sum_account_capitals(slab_data: &[u8]) -> u128 {
     let engine = zc::engine_ref(slab_data).unwrap();
     let mut total = 0u128;
     for idx in 0..percolator::MAX_ACCOUNTS {
-        if engine.is_used(idx) {
+        if engine_slot_is_used(engine, idx) {
             total = total.saturating_add(engine.accounts[idx].capital.get());
         }
     }

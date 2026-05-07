@@ -4,6 +4,177 @@ use common::*;
 
 use solana_sdk::signature::{Keypair, Signer};
 
+fn write_risk_buffer_for_test(env: &mut TestEnv, buf: &percolator_prog::risk_buffer::RiskBuffer) {
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    let buf_size = core::mem::size_of::<percolator_prog::risk_buffer::RiskBuffer>();
+    let gen_table_size = MAX_ACCOUNTS * 8;
+    let buf_off = SLAB_LEN - gen_table_size - buf_size;
+    slab.data[buf_off..buf_off + buf_size].copy_from_slice(bytemuck::bytes_of(buf));
+    env.svm.set_account(env.slab, slab).unwrap();
+}
+
+fn set_risk_buffer_scan_cursor_for_test(env: &mut TestEnv, cursor: u16) {
+    let mut buf = env.read_risk_buffer();
+    buf.scan_cursor = cursor;
+    write_risk_buffer_for_test(env, &buf);
+}
+
+fn move_used_account_slot_for_test(env: &mut TestEnv, from: u16, to: u16) {
+    assert_ne!(from, to, "test helper requires distinct slots");
+    assert!((to as usize) < MAX_ACCOUNTS, "target slot out of range");
+    assert!(env.is_slot_used(from), "source slot must be used");
+    assert!(
+        !env.is_slot_used(to),
+        "target slot must start unused so it carries canonical empty bytes"
+    );
+
+    let mut slab = env.svm.get_account(&env.slab).unwrap();
+    const ACCOUNT_SIZE: usize = 416;
+    let accounts_off = ENGINE_OFFSET + ENGINE_ACCOUNTS_OFFSET;
+    let src = accounts_off + (from as usize) * ACCOUNT_SIZE;
+    let dst = accounts_off + (to as usize) * ACCOUNT_SIZE;
+    let src_bytes = slab.data[src..src + ACCOUNT_SIZE].to_vec();
+    let dst_bytes = slab.data[dst..dst + ACCOUNT_SIZE].to_vec();
+    slab.data[dst..dst + ACCOUNT_SIZE].copy_from_slice(&src_bytes);
+    slab.data[src..src + ACCOUNT_SIZE].copy_from_slice(&dst_bytes);
+
+    let src_word = from as usize / 64;
+    let src_bit = from as usize % 64;
+    let dst_word = to as usize / 64;
+    let dst_bit = to as usize % 64;
+    let src_word_off = ENGINE_OFFSET + ENGINE_BITMAP_OFFSET + src_word * 8;
+    let dst_word_off = ENGINE_OFFSET + ENGINE_BITMAP_OFFSET + dst_word * 8;
+    let mut src_word_bits = u64::from_le_bytes(
+        slab.data[src_word_off..src_word_off + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let mut dst_word_bits = u64::from_le_bytes(
+        slab.data[dst_word_off..dst_word_off + 8]
+            .try_into()
+            .unwrap(),
+    );
+    src_word_bits &= !(1u64 << src_bit);
+    dst_word_bits |= 1u64 << dst_bit;
+    slab.data[src_word_off..src_word_off + 8].copy_from_slice(&src_word_bits.to_le_bytes());
+    slab.data[dst_word_off..dst_word_off + 8].copy_from_slice(&dst_word_bits.to_le_bytes());
+
+    env.svm.set_account(env.slab, slab).unwrap();
+    assert!(!env.is_slot_used(from), "source slot should now be free");
+    assert!(env.is_slot_used(to), "target slot should now be used");
+}
+
+fn crank_with_candidates_for_test(env: &mut TestEnv, candidates: &[u16]) {
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_crank_with_candidates(candidates),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("candidate crank failed");
+}
+
+fn crank_until_all_positions_zero_for_test(env: &mut TestEnv, idxs: &[u16]) {
+    for _ in 0..40 {
+        crank_with_candidates_for_test(env, &[]);
+        if idxs.iter().all(|&idx| env.read_account_position(idx) == 0) {
+            return;
+        }
+        env.svm.expire_blockhash();
+    }
+}
+
+fn setup_risk_buffer_refill_market() -> (TestEnv, u16, Vec<u16>, Vec<u16>) {
+    program_path();
+    let mut env = TestEnv::new();
+    let mut data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        40_000_000,
+        0,
+    );
+    // This refill fixture intentionally drives a multi-segment bounded catchup
+    // from the same fresh oracle observation. Keep the stale horizon longer
+    // than the test's raw clock gap so the crank validates the update instead
+    // of routing to permissionless resolve.
+    const INIT_PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET: usize = 306;
+    data[INIT_PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET
+        ..INIT_PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET + 8]
+        .copy_from_slice(&600u64.to_le_bytes());
+    env.try_init_market_raw(data)
+        .expect("init market with maintenance fee");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let risky_sizes: [i128; 3] = [100_000_000, 90_000_000, 80_000_000];
+    let survivor_sizes: [i128; 3] = [7_000_000, 6_000_000, 5_000_000];
+    let mut risky = Vec::new();
+    let mut survivors = Vec::new();
+
+    // These accounts are large and thinly margined. They should be in the
+    // initial top-4 buffer and become liquidatable after a bounded price walk.
+    for &size in &risky_sizes {
+        let user = Keypair::new();
+        let idx = env.init_user(&user);
+        env.deposit(&user, idx, 1_500_000_000);
+        env.trade(&user, &lp, lp_idx, idx, size);
+        risky.push(idx);
+    }
+
+    // These accounts have smaller notional, so they start outside the full
+    // buffer, but have enough capital to survive the same fee interval.
+    for &size in &survivor_sizes {
+        let user = Keypair::new();
+        let idx = env.init_user(&user);
+        env.deposit(&user, idx, 10_000_000_000);
+        env.trade(&user, &lp, lp_idx, idx, size);
+        survivors.push(idx);
+    }
+
+    let buf = env.read_risk_buffer();
+    assert_eq!(buf.count, 4, "setup must start with a full risk buffer");
+    assert!(
+        buf.find(lp_idx).is_some(),
+        "LP must be the largest buffer entry"
+    );
+    for &idx in &risky {
+        assert!(
+            buf.find(idx).is_some(),
+            "risky account {idx} must start in buffer"
+        );
+    }
+    for &idx in &survivors {
+        assert!(
+            buf.find(idx).is_none(),
+            "survivor account {idx} must start outside the full buffer"
+        );
+    }
+
+    (env, lp_idx, risky, survivors)
+}
+
 // ============================================================================
 // A. Buffer populated by trades
 // ============================================================================
@@ -132,10 +303,12 @@ fn test_buffer_survives_empty_crank() {
         "Buffer must persist through empty-candidate crank"
     );
 
-    // Scan cursor must advance
+    // Sparse markets can complete a full bitmap cycle in one crank and reset
+    // the cursor to the same point. The important invariant is that live
+    // buffer entries survive and the cursor stays valid.
     assert!(
-        buf_after.scan_cursor > buf_before.scan_cursor,
-        "Scan cursor must advance: before={} after={}",
+        (buf_after.scan_cursor as usize) < MAX_ACCOUNTS,
+        "Scan cursor must stay in range: before={} after={}",
         buf_before.scan_cursor,
         buf_after.scan_cursor
     );
@@ -164,19 +337,23 @@ fn test_scan_cursor_wraps() {
     env.top_up_insurance(&admin, 1_000_000_000);
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
 
-    // Cursor advances by RISK_SCAN_WINDOW (32) per crank, mod MAX_ACCOUNTS.
-    // set_slot + deposit/trade helpers may internally crank, so the exact
-    // final offset isn't predictable — assert the advance is a non-zero
-    // multiple of 32, which is the window invariant.
-    let before = env.read_risk_buffer().scan_cursor as u32;
-    for i in 0..5u64 {
-        env.set_slot(200 + i * 10);
-        env.crank();
-    }
-    let after = env.read_risk_buffer().scan_cursor as u32;
-    let delta = after.wrapping_sub(before) % (MAX_ACCOUNTS as u32);
-    assert!(delta > 0 && delta % 32 == 0,
-        "scan_cursor delta must be a non-zero multiple of 32: before={before} after={after} delta={delta}");
+    // Start near the physical end. The bitmap scan should wrap and still see
+    // the low-index LP/user positions in the same crank.
+    set_risk_buffer_scan_cursor_for_test(&mut env, (MAX_ACCOUNTS - 1) as u16);
+    env.set_slot(200);
+    env.crank();
+
+    let buf = env.read_risk_buffer();
+    assert!(
+        (buf.scan_cursor as usize) < MAX_ACCOUNTS,
+        "scan_cursor must remain in range after wrap: {}",
+        buf.scan_cursor
+    );
+    assert!(buf.find(lp_idx).is_some(), "wrapped scan must see LP");
+    assert!(
+        buf.find(user_idx).is_some(),
+        "wrapped scan must see low-index user"
+    );
 }
 
 // ============================================================================
@@ -320,15 +497,100 @@ fn test_empty_buffer_first_crank() {
     env.crank();
 
     let buf = env.read_risk_buffer();
-    // Scan cursor should advance even with no accounts
-    assert!(buf.scan_cursor > 0, "Scan cursor must advance after crank");
+    assert_eq!(buf.count, 0, "Empty market must keep empty risk buffer");
+    assert_eq!(
+        env.read_rr_cursor_position(),
+        0,
+        "Empty-market crank must scan the whole engine RR range and wrap"
+    );
+    assert!(
+        env.read_sweep_generation() > 0,
+        "Empty-market crank must complete a sweep generation"
+    );
+    assert!(
+        (buf.scan_cursor as usize) < MAX_ACCOUNTS,
+        "Scan cursor must remain valid after empty crank"
+    );
+}
+
+#[test]
+fn test_crank_greedy_sweep_touches_sparse_positions_across_empty_bitmap() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        1,
+        0,
+    );
+    env.try_init_market_raw(data)
+        .expect("init market with maintenance fee");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let near = Keypair::new();
+    let near_idx = env.init_user(&near);
+    env.deposit(&near, near_idx, 1_000_000_000);
+    env.trade(&near, &lp, lp_idx, near_idx, 1_000_000);
+
+    let far_source = Keypair::new();
+    let far_source_idx = env.init_user(&far_source);
+    env.deposit(&far_source, far_source_idx, 1_000_000_000);
+    env.trade(&far_source, &lp, lp_idx, far_source_idx, 1_000_000);
+
+    let far_idx = core::cmp::min(1024usize, MAX_ACCOUNTS - 1) as u16;
+    assert!(
+        far_idx > far_source_idx,
+        "test requires a sparse target beyond the sequential source"
+    );
+    move_used_account_slot_for_test(&mut env, far_source_idx, far_idx);
+
+    assert!(env.read_account_position(near_idx) != 0);
+    assert!(env.read_account_position(far_idx) != 0);
+    let generation_before = env.read_sweep_generation();
+
+    env.set_slot_and_price_raw_no_walk(100, 143_000_000);
+    env.crank();
+
+    assert_eq!(
+        env.read_account_last_fee_slot(near_idx),
+        100,
+        "near open position should be fee-synced by the bitmap sweep"
+    );
+    assert_eq!(
+        env.read_account_last_fee_slot(far_idx),
+        100,
+        "far open position should be fee-synced despite the empty bitmap span"
+    );
+    assert_eq!(
+        env.read_rr_cursor_position(),
+        0,
+        "Greedy RR sweep should skip empty slots and wrap in one crank"
+    );
+    assert!(
+        env.read_sweep_generation() > generation_before,
+        "Greedy RR sweep should complete a full generation"
+    );
+    let buf = env.read_risk_buffer();
+    assert!(
+        buf.find(near_idx).is_some(),
+        "risk-buffer discovery should see the near sparse position"
+    );
+    assert!(
+        buf.find(far_idx).is_some(),
+        "risk-buffer discovery should see the far sparse position"
+    );
 }
 
 // ============================================================================
 // F4: Liquidation removes from buffer
 // ============================================================================
 
-/// LiquidateAtOracle removes liquidated account from buffer.
+/// KeeperCrank candidate liquidation removes liquidated account from buffer.
 #[test]
 fn test_liquidation_removes_from_buffer() {
     program_path();
@@ -556,8 +818,8 @@ fn test_buffer_correct_after_many_cranks() {
         );
     }
     assert!(
-        buf.scan_cursor > 0,
-        "Scan cursor must advance after 20 cranks: cursor={}",
+        (buf.scan_cursor as usize) < MAX_ACCOUNTS,
+        "Scan cursor must stay inside configured account capacity: cursor={}",
         buf.scan_cursor
     );
 }
@@ -750,6 +1012,141 @@ fn test_buffer_with_five_accounts_evicts_smallest() {
     // Smallest two evicted
     assert!(buf.find(idxs[0]).is_none(), "user1 (1M) must be evicted");
     assert!(buf.find(idxs[1]).is_none(), "user2 (2M) must be evicted");
+}
+
+// ============================================================================
+// E (integration). Refill after crank clears buffered entries
+// ============================================================================
+
+/// When repeated cranks liquidate buffered accounts and the progressive scan
+/// window covers lower-ranked live positions, Phase C refills the holes.
+#[test]
+fn test_crank_scan_refills_after_buffer_entries_are_liquidated() {
+    let (mut env, lp_idx, risky, survivors) = setup_risk_buffer_refill_market();
+
+    // Default scan_cursor is 0, so the post-liquidation scan visits all account
+    // indices created by the setup.
+    let buf = env.read_risk_buffer();
+    assert_eq!(buf.scan_cursor, 0, "setup should not have cranked yet");
+    env.set_slot_and_price_raw_no_walk(499, 120_000_000);
+    crank_until_all_positions_zero_for_test(&mut env, &risky);
+
+    for &idx in &risky {
+        assert_eq!(
+            env.read_account_position(idx),
+            0,
+            "risky account {idx} should be liquidated by the crank"
+        );
+    }
+    for &idx in &survivors {
+        assert_ne!(
+            env.read_account_position(idx),
+            0,
+            "survivor account {idx} should keep its position"
+        );
+    }
+
+    let buf = env.read_risk_buffer();
+    assert_eq!(buf.count, 4, "scan refill should restore the full buffer");
+    assert!(buf.find(lp_idx).is_some(), "LP should remain in buffer");
+    for &idx in &risky {
+        assert!(
+            buf.find(idx).is_none(),
+            "liquidated account {idx} must be removed from buffer"
+        );
+    }
+    for &idx in &survivors {
+        assert!(
+            buf.find(idx).is_some(),
+            "scan should refill survivor account {idx}"
+        );
+    }
+}
+
+/// If the bitmap scan spends its used-account budget before reaching a live
+/// position, honest keeper candidates still refill holes in Phase D.
+#[test]
+fn test_crank_candidate_refills_after_bitmap_scan_budget_exhausted() {
+    use bytemuck::Zeroable;
+
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    // Create enough empty-but-used accounts before the candidate to exhaust
+    // Phase C's used-account scan budget. These consume bitmap scan budget but
+    // have no position, so they should not refill the risk buffer.
+    for _ in 0..percolator_prog::constants::RISK_SCAN_WINDOW {
+        let filler = Keypair::new();
+        let _idx = env.init_user(&filler);
+    }
+
+    let survivor = Keypair::new();
+    let survivor_idx = env.init_user(&survivor);
+    env.deposit(&survivor, survivor_idx, 10_000_000_000);
+    env.trade(&survivor, &lp, lp_idx, survivor_idx, 5_000_000);
+
+    write_risk_buffer_for_test(
+        &mut env,
+        &percolator_prog::risk_buffer::RiskBuffer::zeroed(),
+    );
+    set_risk_buffer_scan_cursor_for_test(&mut env, 0);
+
+    env.set_slot(200);
+    crank_with_candidates_for_test(&mut env, &[survivor_idx]);
+
+    let buf = env.read_risk_buffer();
+    assert!(buf.find(lp_idx).is_some(), "Phase C should refill LP");
+    assert!(
+        buf.find(survivor_idx).is_some(),
+        "candidate Phase D should refill account after scan budget is exhausted"
+    );
+}
+
+/// Sparse bitmap scanning wraps to lower-ranked live positions even when the
+/// cursor starts past them; holes are refilled without requiring candidates.
+#[test]
+fn test_crank_bitmap_scan_wraps_to_sparse_survivors_when_cursor_starts_past_them() {
+    let (mut env, lp_idx, risky, survivors) = setup_risk_buffer_refill_market();
+
+    // Cursor starts after all used accounts. Phase C must scan the bitmap,
+    // wrap, and consume live accounts rather than spending its budget on the
+    // empty dense range 32..63.
+    set_risk_buffer_scan_cursor_for_test(&mut env, 32);
+
+    env.set_slot_and_price_raw_no_walk(499, 120_000_000);
+    crank_until_all_positions_zero_for_test(&mut env, &risky);
+
+    for &idx in &risky {
+        assert_eq!(
+            env.read_account_position(idx),
+            0,
+            "risky account {idx} should be liquidated by the crank"
+        );
+    }
+
+    let buf_after_refill = env.read_risk_buffer();
+    assert_eq!(
+        buf_after_refill.count, 4,
+        "bitmap scan should restore the full buffer in one sparse-market crank"
+    );
+    assert!(
+        buf_after_refill.find(lp_idx).is_some(),
+        "LP should remain in buffer"
+    );
+    for &idx in &survivors {
+        assert!(
+            buf_after_refill.find(idx).is_some(),
+            "bitmap scan should refill survivor account {idx}"
+        );
+    }
 }
 
 // ============================================================================

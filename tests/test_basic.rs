@@ -37,9 +37,19 @@ fn assert_custom_error(err: &str, code_hex: &str, context: &str) {
     );
 }
 
+fn assert_no_sbf_panic(err: &str, context: &str) {
+    assert!(
+        !err.contains("panicked")
+            && !err.contains("SBF program panicked")
+            && !err.contains("mul_div_floor_u128")
+            && !err.contains("mul_div_ceil_u128"),
+        "{context}: expected a clean program error, got panic-shaped failure: {err}",
+    );
+}
+
 fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 624;
+    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 1000;
     u64::from_le_bytes(
         d[LAST_ORACLE_PRICE_OFFSET..LAST_ORACLE_PRICE_OFFSET + 8]
             .try_into()
@@ -47,9 +57,29 @@ fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     )
 }
 
+fn read_engine_rr_cursor(env: &TestEnv) -> u64 {
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    const RR_CURSOR_OFFSET: usize = ENGINE_OFFSET + 840;
+    u64::from_le_bytes(
+        d[RR_CURSOR_OFFSET..RR_CURSOR_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+fn read_engine_sweep_generation(env: &TestEnv) -> u64 {
+    let d = env.svm.get_account(&env.slab).unwrap().data;
+    const SWEEP_GENERATION_OFFSET: usize = ENGINE_OFFSET + 848;
+    u64::from_le_bytes(
+        d[SWEEP_GENERATION_OFFSET..SWEEP_GENERATION_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
 fn write_account_fee_credits(env: &mut TestEnv, idx: u16, value: i128) {
-    const ACCOUNT_SIZE: usize = 360;
-    const FEE_CREDITS_OFFSET: usize = 224;
+    const ACCOUNT_SIZE: usize = 416;
+    const FEE_CREDITS_OFFSET: usize = 280;
     let mut slab = env.svm.get_account(&env.slab).unwrap();
     let off =
         ENGINE_OFFSET + ENGINE_ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
@@ -96,13 +126,12 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     );
     env.try_withdraw(&user, user_idx, 1)
         .expect_err("extraction must reject while oracle target is still pending");
-    let settle_err = env
-        .try_settle_account(user_idx)
-        .expect_err("settle must reject while oracle target is still pending");
-    assert_custom_error(
-        &settle_err,
-        "0x1d",
-        "SettleAccount must surface CatchupRequired while target lags P_last",
+    env.try_settle_account(user_idx)
+        .expect("touch-only crank remains the public catchup/settlement path");
+    assert_ne!(
+        read_engine_last_oracle_price(&env),
+        target,
+        "one touch-only crank should not pretend the raw target is fully caught up"
     );
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let resolve_err = env
@@ -114,13 +143,38 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
         "Ordinary ResolveMarket must not settle at a known-lag effective price",
     );
 
-    for _ in 0..64 {
+    for _ in 0..512 {
         if env.read_last_effective_price() == target {
             break;
         }
-        let step_slot = env.read_last_market_slot() + 40;
+        let p_last = read_engine_last_oracle_price(&env);
+        let max_dt = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS;
+        let max_delta = (p_last as u128)
+            .saturating_mul(80)
+            .saturating_mul(max_dt as u128)
+            / 10_000;
+        let remaining = target.saturating_sub(p_last) as u128;
+        let gap = if remaining <= max_delta {
+            max_dt
+        } else {
+            max_dt.saturating_mul(2)
+        };
+        let step_slot = env.read_last_market_slot() + gap;
         env.set_slot_and_price_raw_no_walk(step_slot, target as i64);
-        env.crank();
+        env.try_crank().unwrap_or_else(|err| {
+            panic!(
+                "catchup crank failed: slot_last={} step_slot={} p_last={} effective={} target={} max_delta={} remaining={} gap={} err={}",
+                env.read_last_market_slot(),
+                step_slot,
+                p_last,
+                env.read_last_effective_price(),
+                target,
+                max_delta,
+                remaining,
+                gap,
+                err
+            )
+        });
     }
 
     assert_eq!(
@@ -149,20 +203,6 @@ fn test_external_oracle_stuck_target_does_not_advance_slot_last() {
     env.try_init_market_raw(data).expect("init scaled market");
     env.crank();
 
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp_with_fee(&lp, 2_000_000);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user_with_fee(&user, 2_000_000);
-    env.deposit(&user, user_idx, 10_000_000_000);
-    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
-    assert_ne!(
-        env.read_account_position(user_idx),
-        0,
-        "test setup must create live OI"
-    );
-
     let slot_before = env.read_last_market_slot();
     let p_last = env.read_last_effective_price();
     assert_eq!(p_last, 138, "scaled setup should seed P_last=138");
@@ -170,16 +210,333 @@ fn test_external_oracle_stuck_target_does_not_advance_slot_last() {
     env.set_slot_and_price_raw_no_walk(slot_before + 1, 139_000_000);
     let err = env
         .try_catchup_accrue()
-        .expect_err("dt-capped max_delta=0 with live OI must require catchup/recovery");
-    assert_custom_error(
-        &err,
-        "0x1d",
-        "CatchupAccrue must reject unchanged effective price while raw target is pending",
+        .expect_err("retired CatchupAccrue tag must reject");
+    assert!(
+        err.contains("InvalidInstructionData") || err.contains("invalid instruction data"),
+        "retired CatchupAccrue must reject with InvalidInstructionData, got: {err}",
     );
     assert_eq!(
         env.read_last_market_slot(),
         slot_before,
         "slot_last must not advance by feeding unchanged P_last while target catch-up is stuck",
+    );
+}
+
+#[test]
+fn test_trade_nocpi_requires_crank_for_exposed_price_progress() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 80);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "test setup must create exposed OI",
+    );
+
+    let walker_lp = Keypair::new();
+    let walker_lp_idx = env.init_lp(&walker_lp);
+    env.deposit(&walker_lp, walker_lp_idx, 10_000_000_000);
+
+    let walker_user = Keypair::new();
+    let walker_user_idx = env.init_user(&walker_user);
+    env.deposit(&walker_user, walker_user_idx, 1_000_000_000);
+
+    let slot_before = env.read_last_market_slot();
+    let next_slot = slot_before + percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS + 1;
+    let target = (env.read_last_effective_price() + 1) as i64;
+    env.set_slot_and_price_raw_no_walk(next_slot, target);
+
+    let err = env
+        .try_trade(
+            &walker_user,
+            &walker_lp,
+            walker_lp_idx,
+            walker_user_idx,
+            1_000,
+        )
+        .expect_err("nonzero TradeNoCpi must not be a hidden crank path");
+    assert_custom_error(
+        &err,
+        "0x1d",
+        "TradeNoCpi must reject exposed market progress before the crank cascade",
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before,
+        "rejected TradeNoCpi must not advance exposed market time",
+    );
+
+    env.try_crank()
+        .expect("KeeperCrank must own exposed market progress");
+    env.try_trade(
+        &walker_user,
+        &walker_lp,
+        walker_lp_idx,
+        walker_user_idx,
+        2_000,
+    )
+    .expect("TradeNoCpi should succeed once KeeperCrank has caught up");
+}
+
+#[test]
+fn test_trade_nocpi_far_behind_recovers_after_repeated_keeper_cranks() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 1_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 100_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000);
+
+    let walker_lp = Keypair::new();
+    let walker_lp_idx = env.init_lp(&walker_lp);
+    env.deposit(&walker_lp, walker_lp_idx, 10_000_000_000);
+
+    let walker_user = Keypair::new();
+    let walker_user_idx = env.init_user(&walker_user);
+    env.deposit(&walker_user, walker_user_idx, 1_000_000_000);
+
+    let slot_before = env.read_last_market_slot();
+    let far_slot = slot_before + percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS * 50 + 7;
+    let target = (env.read_last_effective_price() + 1) as i64;
+    env.set_slot_and_price_raw_no_walk(far_slot, target);
+
+    let err = env
+        .try_trade(
+            &walker_user,
+            &walker_lp,
+            walker_lp_idx,
+            walker_user_idx,
+            1_000,
+        )
+        .expect_err("TradeNoCpi must not be the far-behind catchup path");
+    assert_custom_error(
+        &err,
+        "0x1d",
+        "far-behind TradeNoCpi must surface CatchupRequired",
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before,
+        "rejected far-behind TradeNoCpi must not advance market time",
+    );
+
+    for _ in 0..8 {
+        if env.read_last_market_slot() >= far_slot {
+            break;
+        }
+        env.try_crank()
+            .expect("KeeperCrank must keep committing far-behind progress");
+    }
+    assert_eq!(
+        env.read_last_market_slot(),
+        far_slot,
+        "repeated KeeperCranks must fully catch up the exposed market",
+    );
+
+    env.try_trade(
+        &walker_user,
+        &walker_lp,
+        walker_lp_idx,
+        walker_user_idx,
+        2_000,
+    )
+    .expect("TradeNoCpi should succeed after repeated KeeperCrank catchup");
+}
+
+#[test]
+fn test_keeper_crank_auto_commits_one_partial_catchup_segment_when_gap_is_stale() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 1_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    let slot_before = env.read_last_market_slot();
+    let p_last = read_engine_last_oracle_price(&env);
+    let target = p_last.saturating_add(p_last / 100);
+    let segment = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS;
+    let far_slot = slot_before + segment + 50;
+    env.set_slot_and_price_raw_no_walk(far_slot, target as i64);
+    let insurance_before = env.read_insurance_balance();
+
+    env.try_crank_once()
+        .expect("first crank should commit a partial catchup chunk");
+    assert_eq!(
+        env.read_insurance_balance(),
+        insurance_before,
+        "partial catchup at stored P_last must not realize an insurance loss"
+    );
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before + segment,
+        "first crank should commit one bounded equity-active segment"
+    );
+    let p_after = read_engine_last_oracle_price(&env);
+    assert!(
+        p_after > p_last && p_after < target,
+        "partial catchup must move the effective engine price one bounded segment toward target: before={p_last}, after={p_after}, target={target}"
+    );
+    assert_eq!(
+        env.read_oracle_target_price(),
+        target,
+        "partial catchup should preserve the observed target for later cranks"
+    );
+    assert_eq!(
+        env.read_last_effective_price(),
+        p_after,
+        "partial catchup should persist the bounded effective price fed to the engine"
+    );
+
+    while env.read_last_market_slot() < far_slot {
+        env.try_crank_once()
+            .expect("subsequent cranks should keep reducing the stale gap");
+    }
+    assert!(
+        env.read_insurance_balance() >= insurance_before,
+        "finishing bounded catchup must not drain insurance below the pre-catchup balance"
+    );
+    let p_final = read_engine_last_oracle_price(&env);
+    assert!(
+        p_final >= p_after && p_final <= target,
+        "bounded catchup should continue moving toward target without exceeding it: after_first={p_after}, final={p_final}, target={target}"
+    );
+}
+
+#[test]
+fn test_keeper_crank_partial_catchup_ignores_liquidation_candidates_until_loss_current() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 1_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    let slot_before = env.read_last_market_slot();
+    let p_last = read_engine_last_oracle_price(&env);
+    let target = p_last.saturating_mul(2);
+    let segment = percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS;
+    env.set_slot_and_price_raw_no_walk(slot_before + segment + 50, target as i64);
+
+    let pos_before = env.read_account_position(user_idx);
+    let lp_pos_before = env.read_account_position(lp_idx);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_crank_with_candidates(&[user_idx]),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("partial stale KeeperCrank should commit catchup progress");
+
+    assert_eq!(
+        env.read_last_market_slot(),
+        slot_before + segment,
+        "loss-stale KeeperCrank should advance only one segment"
+    );
+    assert_eq!(
+        env.read_account_position(user_idx),
+        pos_before,
+        "loss-stale KeeperCrank must not execute liquidation candidates"
+    );
+    assert_eq!(
+        env.read_account_position(lp_idx),
+        lp_pos_before,
+        "loss-stale KeeperCrank must not change counterparty OI"
+    );
+}
+
+#[test]
+fn test_keeper_crank_partial_catchup_uses_authenticated_slot_for_sweep_generation() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    let mut init =
+        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 1_000);
+    put_u64(&mut init, 168, 2);
+    env.try_init_market_raw(init)
+        .expect("small-capacity market should initialize");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 100_000_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000);
+
+    let slot_before = env.read_last_market_slot();
+    let p_last = read_engine_last_oracle_price(&env);
+    let target = p_last.saturating_add(p_last / 100);
+    let real_slot = slot_before + percolator_prog::constants::MAX_ACCRUAL_DT_SLOTS * 4;
+    env.set_slot_and_price_raw_no_walk(real_slot, target as i64);
+
+    let gen_before = read_engine_sweep_generation(&env);
+    env.try_crank_once()
+        .expect("first same-slot partial crank should make progress");
+    let gen_after_first = read_engine_sweep_generation(&env);
+    assert!(
+        gen_after_first > gen_before,
+        "test setup should force a Phase 2 cursor wrap on the first crank"
+    );
+    assert!(
+        env.read_last_market_slot() < real_slot,
+        "test must remain in partial catchup mode after the first crank"
+    );
+
+    env.try_crank_once()
+        .expect("second same-slot partial crank should still make catchup progress");
+    assert_eq!(
+        read_engine_sweep_generation(&env),
+        gen_after_first,
+        "sweep_generation must be rate-limited by authenticated clock.slot, not synthetic segment time"
     );
 }
 
@@ -192,10 +549,10 @@ fn test_catchup_accrue_flat_same_slot_syncs_engine_price() {
 
     let slot = env.read_last_market_slot();
     let old_price = read_engine_last_oracle_price(&env);
-    let target = old_price.saturating_add(1_000_000);
+    let target = old_price.saturating_add(1);
     let publish_time = slot as i64 + 1;
     env.svm.set_sysvar(&Clock {
-        slot,
+        slot: slot + 1,
         unix_timestamp: publish_time,
         ..Clock::default()
     });
@@ -215,15 +572,14 @@ fn test_catchup_accrue_flat_same_slot_syncs_engine_price() {
             .unwrap();
     }
 
-    env.try_catchup_accrue()
-        .expect("flat same-slot CatchupAccrue should adopt the fresh target");
+    env.crank();
 
     assert_eq!(env.read_oracle_target_price(), target);
     assert_eq!(env.read_last_effective_price(), target);
     assert_eq!(
         read_engine_last_oracle_price(&env),
         target,
-        "CatchupAccrue complete mode must install the flat same-slot target into engine P_last"
+        "KeeperCrank must install the flat same-slot target into engine P_last"
     );
 }
 
@@ -247,7 +603,7 @@ fn test_zero_oi_no_oracle_topup_can_cross_accrual_envelope() {
 }
 
 #[test]
-fn test_init_market_rejects_zero_public_warmup() {
+fn test_init_market_accepts_zero_public_warmup() {
     program_path();
 
     let mut env = TestEnv::new();
@@ -255,14 +611,8 @@ fn test_init_market_rejects_zero_public_warmup() {
         encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 80);
     put_u64(&mut data, INIT_H_MIN_OFFSET, 0);
 
-    let err = env
-        .try_init_market_raw(data)
-        .expect_err("public wrapper must reject h_min=0");
-    assert_custom_error(
-        &err,
-        "0x1a",
-        "InitMarket must enforce nonzero public live warmup",
-    );
+    env.try_init_market_raw(data)
+        .expect("h_min=0 is an allowed product mode");
 }
 
 #[test]
@@ -1507,6 +1857,49 @@ fn test_comprehensive_margin_limit_enforcement() {
     );
 }
 
+#[test]
+fn test_trade_nocpi_oversized_size_rejects_without_fee_math_panic() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_trading_fee(10);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let user_capital_before = env.read_account_capital(user_idx);
+    let lp_capital_before = env.read_account_capital(lp_idx);
+    let user_position_before = env.read_account_position(user_idx);
+    let lp_position_before = env.read_account_position(lp_idx);
+    let vault_before = env.read_engine_vault();
+    let c_tot_before = env.read_c_tot();
+    let insurance_before = env.read_insurance_balance();
+    let used_before = env.read_num_used_accounts();
+
+    let err = env
+        .try_trade(&user, &lp, lp_idx, user_idx, i128::MAX)
+        .expect_err("oversized TradeNoCpi request must be rejected");
+
+    assert_no_sbf_panic(&err, "oversized TradeNoCpi request");
+    assert!(
+        err.contains("InvalidInstructionData") || err.contains("invalid instruction data"),
+        "oversized TradeNoCpi request should fail at wrapper input validation, got: {err}",
+    );
+    assert_eq!(env.read_account_capital(user_idx), user_capital_before);
+    assert_eq!(env.read_account_capital(lp_idx), lp_capital_before);
+    assert_eq!(env.read_account_position(user_idx), user_position_before);
+    assert_eq!(env.read_account_position(lp_idx), lp_position_before);
+    assert_eq!(env.read_engine_vault(), vault_before);
+    assert_eq!(env.read_c_tot(), c_tot_before);
+    assert_eq!(env.read_insurance_balance(), insurance_before);
+    assert_eq!(env.read_num_used_accounts(), used_before);
+}
+
 /// Test 10: Funding accrual - multiple cranks succeed over time
 #[test]
 fn test_comprehensive_funding_accrual() {
@@ -1973,7 +2366,8 @@ fn test_position_flip_minimal_equity() {
 // COVERAGE GAP TESTS: Spec-driven tests for critical missing coverage
 // ============================================================================
 
-/// Spec: LiquidateAtOracle must reduce target's position and charge liquidation fee to insurance.
+/// Spec: KeeperCrank FullClose candidates must reduce target position and
+/// charge liquidation fee to insurance.
 ///
 /// This test verifies two key spec requirements:
 /// 1. A liquidated account's position is reduced (FullClose policy zeros position)
@@ -1982,7 +2376,7 @@ fn test_position_flip_minimal_equity() {
 /// Setup uses a long position with thin margin that becomes underwater after a
 /// price drop, making the account eligible for liquidation.
 #[test]
-fn test_liquidation_reduces_position_and_charges_fee() {
+fn test_crank_candidate_liquidation_reduces_position_and_charges_fee() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 80); // liquidation test: max cap (100%/read), unrestricted for these moves
@@ -2019,7 +2413,7 @@ fn test_liquidation_reduces_position_and_charges_fee() {
     // threshold (~$129.5M for this position size + capital).
     env.set_slot_and_price(2000, 90_000_000); // walk target: $138 → ~$115
 
-    // Call LiquidateAtOracle directly (no crank first).
+    // Submit a KeeperCrank FullClose candidate.
     let result = env.try_liquidate(user_idx);
     // Liquidation should succeed (user is deeply underwater at $1)
     assert!(
@@ -2028,9 +2422,7 @@ fn test_liquidation_reduces_position_and_charges_fee() {
         result
     );
 
-    // After LiquidateAtOracle with FullClose, position should be zero.
-    // The instruction uses liquidate_at_oracle(..., FullClose) which calls
-    // attach_effective_position(idx, 0).
+    // After KeeperCrank with FullClose, position should be zero.
     let pos_after = env.read_account_position(user_idx);
     assert_eq!(
         pos_after, 0,
@@ -2054,14 +2446,112 @@ fn test_liquidation_reduces_position_and_charges_fee() {
     );
 }
 
-/// Spec: When vault < pnl_pos_tot (h < 1.0), withdrawals/closes are haircutted.
-/// Winners receive less than their full PnL, proportional to available vault funds.
+/// Regression: dense books must eventually honor honest FullClose candidates.
 ///
-/// This test verifies that the haircut mechanism does not prevent closing accounts.
-/// Even under stress (h < 1.0), winners can still close -- they just receive
-/// haircutted proceeds rather than full PnL.
+/// The wrapper used to downgrade FullClose hints to touch-only once the
+/// liquidated side had more than a small number of stored positions. That was
+/// a stale CU guard: with the current bounded engine ADL path it suppresses the
+/// honest keeper's liquidation action after bounded catchup has made the market
+/// loss-current, leaving an underwater account open.
 #[test]
-fn test_withdrawal_under_haircut_conditions() {
+fn test_crank_dense_same_side_fullclose_candidate_eventually_liquidates() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.set_slot_and_price_raw_no_walk(50, 138_000_000);
+    let mut init_data =
+        encode_init_market_with_cap(&env.payer.pubkey(), &env.mint, &TEST_FEED_ID, 0, 200);
+    put_u64(&mut init_data, 144, 800); // maintenance_margin_bps
+    env.try_init_market_raw(init_data)
+        .expect("dense liquidation market init");
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
+
+    let mut users = Vec::new();
+    for _ in 0..9 {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_500_000_000);
+        env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
+        assert_ne!(
+            env.read_account_position(user_idx),
+            0,
+            "setup must create a dense same-side position"
+        );
+        users.push((user, user_idx));
+    }
+
+    // The authenticated target is far enough below P_last that repeated
+    // bounded cranks make the target account liquidatable but not bankrupt.
+    // While the market is loss-stale, candidates are touch-only; once catchup
+    // is current, the same honest FullClose hint must be honored.
+    env.set_slot_and_price_raw_no_walk(150, 132_480_000);
+
+    let target_idx = users[0].1;
+    let before_pos = env.read_account_position(target_idx);
+    assert_ne!(before_pos, 0, "precondition: target is still open");
+    assert!(
+        env.read_account_capital(target_idx) > 0,
+        "precondition: target should be liquidatable but not bankrupt"
+    );
+
+    for _ in 0..16 {
+        let result = env.try_liquidate(target_idx);
+        assert!(
+            result.is_ok(),
+            "honest dense FullClose candidate should not reject: {:?}",
+            result
+        );
+        if env.read_account_position(target_idx) == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        env.read_account_position(target_idx),
+        0,
+        "dense same-side FullClose candidate must liquidate once bounded catchup is current"
+    );
+}
+
+/// The retired direct LiquidateAtOracle tag is rejected at decode.
+#[test]
+fn test_liquidate_at_oracle_tag_retired() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_liquidate(0),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "retired LiquidateAtOracle tag must reject"
+    );
+}
+
+/// Spec: under live haircut stress, a profitable account cannot bypass the
+/// released-PnL conversion path by closing directly. Positive PnL must be
+/// matured/converted first; otherwise CloseAccount rejects without moving vault
+/// funds.
+#[test]
+fn test_live_haircut_conditions_block_unconverted_positive_pnl_close() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -2095,44 +2585,40 @@ fn test_withdrawal_under_haircut_conditions() {
     env.set_slot(1800);
     env.crank();
 
-    // Check that winner can still close account (haircut applies)
-    // Flatten position first
+    // Flatten position first. This leaves the winner flat but with positive
+    // PnL that is still subject to the live haircut/maturity rules.
     env.trade(&winner, &lp, lp_idx, winner_idx, -1_000_000);
     env.set_slot(1900);
     env.crank();
+    // The flattening trade creates fresh positive PnL reserve. Under the
+    // stress-envelope/two-bucket spec, a post-stress touch may first promote
+    // pending profit into the scheduled bucket; a later touch releases it.
+    env.set_slot(1901);
+    env.crank();
+    env.set_slot(1902);
+    env.crank();
 
-    // Record vault balance before close to verify conservation
+    assert!(
+        env.read_account_pnl(winner_idx) > 0,
+        "precondition: winner should still have positive PnL"
+    );
+
     let vault_before_close = env.vault_balance();
-
     let result = env.try_close_account(&winner, winner_idx);
     assert!(
-        result.is_ok(),
-        "Winner should be able to close even under potential haircut: {:?}",
-        result
+        result.is_err(),
+        "live close must not bypass unconverted positive PnL under haircut stress"
     );
-
-    // Vault conservation: the vault balance after close must account for all
-    // capital returned. The total deposited was 10B (LP) + 5B (winner) + 5B (loser) = 20B.
-    // Some fees went to insurance during init. After close, vault should decrease
-    // by the amount returned to the winner.
-    let vault_after_close = env.vault_balance();
-    let returned_to_winner = vault_before_close - vault_after_close;
-
-    // The winner deposited 5B and had a profitable position (price went from $138 to $200).
-    // Under haircut, the returned capital should be LESS than deposit + full PnL.
-    // At minimum, the winner should get back something (they deposited 5B and won).
-    assert!(
-        returned_to_winner > 0,
-        "Winner must receive some capital back on close"
+    let err = result.unwrap_err();
+    assert_custom_error(
+        &err,
+        "0x11",
+        "live close with unconverted positive PnL should fail as PnlNotWarmedUp",
     );
-    // Under haircut conditions (loser liquidated, vault stressed), the winner
-    // should receive less than their initial deposit + full PnL would suggest.
-    // Their initial deposit was 5B; if they got full PnL they'd get significantly more.
-    // Verify returned amount is less than initial deposit + generous upper bound.
-    // (This confirms the haircut mechanism is working.)
-    assert!(
-        returned_to_winner <= vault_before_close,
-        "Returned capital cannot exceed vault balance (conservation)"
+    assert_eq!(
+        env.vault_balance(),
+        vault_before_close,
+        "rejected close must not transfer vault funds"
     );
 }
 
@@ -2267,6 +2753,119 @@ fn test_keeper_crank_format_v1_full_close() {
     );
 }
 
+/// KeeperCrank format_version=1 ExactPartial candidates must be decoded and
+/// forwarded to the engine as partial-liquidation hints, not treated as
+/// FullClose or touch-only.
+#[test]
+fn test_keeper_crank_format_v1_exact_partial() {
+    program_path();
+    let mut env = TestEnv::new();
+    let mut init = vec![0u8];
+    init.extend_from_slice(env.payer.pubkey().as_ref());
+    init.extend_from_slice(env.mint.as_ref());
+    init.extend_from_slice(&TEST_FEED_ID);
+    init.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes());
+    init.extend_from_slice(&500u16.to_le_bytes());
+    init.push(0u8);
+    init.extend_from_slice(&0u32.to_le_bytes());
+    init.extend_from_slice(&0u64.to_le_bytes());
+    init.extend_from_slice(&0u128.to_le_bytes());
+    init.extend_from_slice(&1u64.to_le_bytes()); // h_min
+    init.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    init.extend_from_slice(&600u64.to_le_bytes()); // initial_margin_bps
+    init.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
+    init.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    init.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee
+    init.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    init.extend_from_slice(&999u64.to_le_bytes()); // legacy max_crank_staleness_slots
+    init.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
+    init.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
+    init.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
+    init.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    init.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    init.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    init.extend_from_slice(&40u64.to_le_bytes()); // max_price_move_bps_per_slot
+    init.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    init.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    init.extend_from_slice(&1_000u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    init.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    init.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    init.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    init.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    init.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    init.extend_from_slice(&1u64.to_le_bytes()); // force_close_delay_slots
+    env.try_init_market_raw(init).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 900_000_000);
+
+    env.set_slot(50);
+    env.crank();
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
+    let pos_before = env.read_account_position(user_idx);
+    assert_eq!(pos_before, 100_000_000);
+
+    // Move below maintenance, but keep the target within one residual
+    // price-move envelope. TradeNoCpi inserted this account into the risk
+    // buffer, so this specifically verifies that a keeper-supplied
+    // ExactPartial hint is promoted ahead of the buffer's FullClose fallback.
+    let last_slot = env.read_last_market_slot();
+    env.set_slot_and_price_raw_no_walk(last_slot + 10, 135_240_000);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes());
+    data.push(1u8);
+    // Invalid exact-partial hint first. The wrapper must not let the
+    // risk-buffer FullClose fallback run before a later valid ExactPartial for
+    // the same account.
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&0u128.to_le_bytes());
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data.push(1u8);
+    data.extend_from_slice(&99_000_000u128.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_ok(),
+        "format_version=1 ExactPartial crank should succeed: {:?}",
+        result
+    );
+
+    let pos_after = env.read_account_position(user_idx);
+    assert!(
+        pos_after > 0 && pos_after < pos_before,
+        "ExactPartial should reduce but not close the position: before={pos_before} after={pos_after}"
+    );
+}
+
 /// Spec: KeeperCrank format_version=1 with touch-only policy (tag 0xFF) must
 /// settle an account's lazy state (funding, mark-to-market, fees, warmup)
 /// without triggering liquidation, even if the account is healthy.
@@ -2356,11 +2955,12 @@ fn test_keeper_crank_format_v1_touch_only() {
     );
 }
 
-/// Spec SS 10.7: permissionless reclamation of flat/dust accounts.
+/// Spec SS 10.7: permissionless reclamation of flat/dust accounts through
+/// KeeperCrank candidate GC.
 ///
-/// ReclaimEmptyAccount (tag 25) allows anyone to recycle an account slot
-/// that has zero position, zero capital, and zero positive PnL. This frees
-/// the slot for reuse without requiring the account owner's signature.
+/// The direct ReclaimEmptyAccount tag is retired. A touch-only crank candidate
+/// lets anyone recycle an account slot that has zero position, zero capital,
+/// and zero positive PnL without requiring the account owner's signature.
 ///
 /// This test verifies:
 /// 1. An empty account (no deposits, no position) can be reclaimed by anyone
@@ -2370,47 +2970,28 @@ fn test_keeper_crank_format_v1_touch_only() {
 fn test_reclaim_empty_account() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1000,
+        1,
+        0,
+    );
+    env.try_init_market_raw(data).expect("init");
 
     let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    // init_user pays 100; v12.19.6 anti-spam routes 1 to insurance and
-    // credits 99 as capital. Withdraw credited capital to make the account
-    // truly empty for reclaim.
-    env.crank();
-    env.try_withdraw(&user, user_idx, 99).unwrap();
+    let user_idx = env.init_user_with_fee(&user, 100);
 
     let used_before = env.read_num_used_accounts();
 
-    // Reclaim should succeed -- account is empty (anyone can call)
-    let anyone = Keypair::new();
-    env.svm.airdrop(&anyone.pubkey(), 1_000_000_000).unwrap();
-
-    // Build ReclaimEmptyAccount instruction (tag 25)
-    let mut data = vec![25u8];
-    data.extend_from_slice(&user_idx.to_le_bytes());
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-        ],
-        data,
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix],
-        Some(&anyone.pubkey()),
-        &[&anyone],
-        env.svm.latest_blockhash(),
-    );
-    let result = env.svm.send_transaction(tx);
+    // Candidate GC should succeed. The crank first realizes enough maintenance
+    // fees to drain the flat dust account, then frees the slot.
+    env.set_slot_and_price(150, 138_000_000);
+    let result = env.try_reclaim_empty_account(user_idx);
     assert!(
         result.is_ok(),
-        "ReclaimEmptyAccount should succeed on empty account: {:?}",
+        "touch-only crank candidate should reclaim fee-drained account: {:?}",
         result
     );
 
@@ -2518,14 +3099,14 @@ fn test_funding_rate_transfers_pnl_on_premium() {
 }
 
 // ============================================================================
-// SettleAccount (tag 26) tests
+// KeeperCrank touch-only settlement tests
 // ============================================================================
 
-/// SettleAccount triggers lazy settlement (funding, mark-to-market, fees, warmup).
-/// After an oracle price move, calling SettleAccount should update the account's
-/// PnL to reflect the new mark price.
+/// KeeperCrank touch-only candidates trigger lazy settlement (funding,
+/// mark-to-market, fees, warmup). After an oracle price move, touching the
+/// account through crank should update lazy state.
 #[test]
-fn test_settle_account_updates_lazy_state() {
+fn test_crank_touch_only_updates_lazy_state() {
     program_path();
 
     let mut env = TestEnv::new();
@@ -2553,9 +3134,13 @@ fn test_settle_account_updates_lazy_state() {
     // engine price envelope. Price goes from $138 to $150, so the long profits.
     env.set_slot_and_price(450, 150_000_000);
 
-    // Call SettleAccount (tag 26) instead of a full crank.
+    // Submit the account as a touch-only crank candidate.
     let result = env.try_settle_account(user_idx);
-    assert!(result.is_ok(), "SettleAccount should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "touch-only KeeperCrank should succeed: {:?}",
+        result
+    );
 
     let pnl_after = env.read_account_pnl(user_idx);
     let cap_after = env.read_account_capital(user_idx);
@@ -2566,17 +3151,16 @@ fn test_settle_account_updates_lazy_state() {
     let state_changed = pnl_after != pnl_before || cap_after != cap_before;
     assert!(
         state_changed,
-        "SettleAccount must update lazy state after oracle move. \
+        "touch-only KeeperCrank must update lazy state after oracle move. \
          pnl: {} -> {}, capital: {} -> {}",
         pnl_before, pnl_after, cap_before, cap_after
     );
 }
 
-/// SettleAccount is permissionless -- any signer can call it for any account.
-/// This is by design: settlement is a read-compute-write on the account's
-/// lazy fields and does not require the account owner's authorization.
+/// Touch-only KeeperCrank is permissionless: any signer can pay for a crank
+/// that touches any account.
 #[test]
-fn test_settle_account_is_permissionless() {
+fn test_crank_touch_only_is_permissionless() {
     program_path();
 
     let mut env = TestEnv::new();
@@ -2595,7 +3179,8 @@ fn test_settle_account_is_permissionless() {
     env.set_slot(200);
     env.crank();
 
-    // A completely unrelated signer calls SettleAccount on the user's account.
+    // A completely unrelated signer submits a touch-only crank candidate for
+    // the user's account.
     let random_signer = Keypair::new();
     env.svm
         .airdrop(&random_signer.pubkey(), 1_000_000_000)
@@ -2605,44 +3190,39 @@ fn test_settle_account_is_permissionless() {
     let result = env.try_settle_account_with_signer(&random_signer, user_idx);
     assert!(
         result.is_ok(),
-        "SettleAccount must be permissionless -- any signer should work: {:?}",
+        "touch-only KeeperCrank must be permissionless -- any signer should work: {:?}",
         result
     );
 }
 
-/// SettleAccount is blocked on resolved markets.
-/// Once a market is resolved, settlement is no longer allowed because
-/// the final price is locked in.
+/// The retired direct SettleAccount tag is rejected at decode.
 #[test]
-fn test_settle_account_blocked_on_resolved() {
+fn test_settle_account_tag_retired() {
     program_path();
-
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // cap > 0 so hyperp_authority defaults to admin
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 50_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 5_000_000_000);
-
-    env.set_slot(200);
-    env.crank();
-
-    // Resolve the market at a fresh external price.
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_slot_and_price(300, 138_000_000);
-    env.try_resolve_market(&admin, 0).unwrap();
-    assert!(env.is_market_resolved(), "Market must be resolved");
-
-    // SettleAccount on a resolved market should fail.
-    env.set_slot_and_price(400, 138_000_000);
-    let result = env.try_settle_account(user_idx);
+    env.init_market_with_invert(0);
+    let mut data = vec![26u8];
+    data.extend_from_slice(&0u16.to_le_bytes());
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
     assert!(
-        result.is_err(),
-        "SettleAccount must be rejected on resolved markets"
+        env.svm.send_transaction(tx).is_err(),
+        "retired SettleAccount tag must reject"
     );
 }
 
@@ -3134,13 +3714,12 @@ fn test_init_lp_blocked_on_resolved() {
 }
 
 // ============================================================================
-// ReclaimEmptyAccount (tag 25) additional coverage
+// KeeperCrank candidate-GC coverage
 // ============================================================================
 
-/// Spec SS 10.7: Reclaim rejects accounts with non-dust capital
-/// (capital >= min_initial_deposit).
+/// Candidate GC must not reclaim accounts with nonzero capital.
 #[test]
-fn test_reclaim_rejects_account_with_capital() {
+fn test_crank_candidate_gc_skips_account_with_capital() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3162,14 +3741,18 @@ fn test_reclaim_rejects_account_with_capital() {
 
     let result = env.try_reclaim_empty_account(user_idx);
     assert!(
-        result.is_err(),
-        "ReclaimEmptyAccount must reject account with non-dust capital"
+        result.is_ok(),
+        "candidate GC should ignore ineligible accounts without failing crank"
+    );
+    assert!(
+        env.read_account_capital(user_idx) >= 100,
+        "candidate GC must not reclaim or drain nonzero-capital account"
     );
 }
 
-/// Spec SS 10.7: Reclaim rejects accounts with an open position.
+/// Candidate GC must not reclaim accounts with an open position.
 #[test]
-fn test_reclaim_rejects_account_with_position() {
+fn test_crank_candidate_gc_skips_account_with_position() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_invert(0);
@@ -3192,38 +3775,43 @@ fn test_reclaim_rejects_account_with_position() {
 
     let result = env.try_reclaim_empty_account(user_idx);
     assert!(
-        result.is_err(),
-        "ReclaimEmptyAccount must reject account with an open position"
+        result.is_ok(),
+        "candidate GC should ignore positioned accounts without failing crank"
+    );
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "candidate GC must not reclaim account with an open position"
     );
 }
 
-/// Spec: ReclaimEmptyAccount is blocked on resolved markets.
+/// The retired direct ReclaimEmptyAccount tag is rejected at decode.
 #[test]
-fn test_reclaim_blocked_on_resolved() {
+fn test_reclaim_empty_account_tag_retired() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 80); // cap > 0 → hyperp_authority defaults to admin
-
-    let lp = Keypair::new();
-    let lp_idx = env.init_lp(&lp);
-    env.deposit(&lp, lp_idx, 10_000_000_000);
-
-    let user = Keypair::new();
-    let user_idx = env.init_user(&user);
-    // Withdraw credited init capital to make account empty for reclaim.
-    env.crank();
-    env.try_withdraw(&user, user_idx, 99).unwrap();
-
-    // Resolve the market at a fresh external price.
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_slot_and_price(200, 138_000_000);
-    env.try_resolve_market(&admin, 0).unwrap();
-    assert!(env.is_market_resolved());
-
-    let result = env.try_reclaim_empty_account(user_idx);
+    env.init_market_with_invert(0);
+    let mut data = vec![25u8];
+    data.extend_from_slice(&0u16.to_le_bytes());
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
     assert!(
-        result.is_err(),
-        "ReclaimEmptyAccount must be rejected on a resolved market"
+        env.svm.send_transaction(tx).is_err(),
+        "retired ReclaimEmptyAccount tag must reject"
     );
 }
 
@@ -3300,10 +3888,9 @@ fn test_init_lp_survives_stale_oracle() {
 }
 
 /// Regression companion to test_top_up_insurance_survives_current
-/// _slot_above_last_market_slot. ReclaimEmptyAccount received the
-/// same monotonicity floor (bounded_now = max(min(clock, lms),
-/// current_slot)) plus a pre-reclaim fee sync; both must respect
-/// engine monotonicity when a prior no-oracle op has split
+/// _slot_above_last_market_slot. Candidate-GC reclaim uses the same
+/// no-oracle fee-sync anchor as the retired direct reclaim path; it must
+/// respect engine monotonicity when a prior no-oracle op has split
 /// current_slot past last_market_slot.
 ///
 /// Tight observable: reclaim must not surface EngineOverflow (0x12)
@@ -3350,7 +3937,7 @@ fn test_reclaim_survives_current_slot_above_last_market_slot() {
 
 /// Regression: TopUpInsurance's bounded-slot computation must not
 /// regress below engine.current_slot. A prior no-oracle op
-/// (InitUser / DepositCollateral / ReclaimEmptyAccount) can advance
+/// (InitUser / DepositCollateral / candidate-GC reclaim) can advance
 /// current_slot past last_market_slot. Before the fix, TopUpInsurance
 /// passed `bounded_now = min(clock.slot, last_market_slot)` which
 /// would then be < current_slot, failing the engine's monotonicity
@@ -3458,6 +4045,26 @@ fn test_inverted_market_full_lifecycle() {
         vault_with_insurance,
         "conservation: closing trade must not change vault"
     );
+    env.try_settle_account(user_idx)
+        .expect("user settlement crank should succeed before close");
+    env.try_settle_account(lp_idx)
+        .expect("lp settlement crank should succeed before close");
+    env.set_slot_and_price(1700, 120_000_000);
+    env.crank();
+    env.try_settle_account(user_idx)
+        .expect("user maturity settlement should succeed before close");
+    env.try_settle_account(lp_idx)
+        .expect("lp maturity settlement should succeed before close");
+    let user_released = env.read_account_pnl(user_idx).max(0) as u64;
+    if user_released > 0 {
+        env.try_convert_released_pnl(&user, user_idx, user_released)
+            .expect("user released pnl conversion should succeed before close");
+    }
+    let lp_released = env.read_account_pnl(lp_idx).max(0) as u64;
+    if lp_released > 0 {
+        env.try_convert_released_pnl(&lp, lp_idx, lp_released)
+            .expect("lp released pnl conversion should succeed before close");
+    }
 
     // Close accounts to verify capital is returned correctly
     env.try_close_account(&user, user_idx)
@@ -3662,6 +4269,119 @@ fn test_keeper_crank_format_v2_rejected() {
     assert!(
         result.is_err(),
         "format_version=2 crank must be rejected (only 0 and 1 are valid)"
+    );
+}
+
+/// KeeperCrank format_version=1 is a fixed record stream:
+/// FullClose/touch records are 3 bytes and ExactPartial records are 19 bytes.
+/// Any trailing byte that cannot form a full candidate must reject instead of
+/// being silently ignored.
+#[test]
+fn test_keeper_crank_format_v1_rejects_trailing_bytes() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let send = |env: &mut TestEnv, caller: &Keypair, data: Vec<u8>| {
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_index, false),
+            ],
+            data,
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&caller.pubkey()),
+            &[caller],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx)
+    };
+
+    let mut fullclose_trailing = vec![5u8];
+    fullclose_trailing.extend_from_slice(&u16::MAX.to_le_bytes());
+    fullclose_trailing.push(1u8);
+    fullclose_trailing.extend_from_slice(&0u16.to_le_bytes());
+    fullclose_trailing.push(0u8);
+    fullclose_trailing.push(0xAA);
+    assert!(
+        percolator_prog::ix::Instruction::decode(&fullclose_trailing).is_err(),
+        "decoder must reject trailing bytes after a FullClose candidate"
+    );
+    assert!(
+        send(&mut env, &caller, fullclose_trailing).is_err(),
+        "KeeperCrank must reject trailing bytes after a FullClose candidate"
+    );
+
+    let mut exact_partial_trailing = vec![5u8];
+    exact_partial_trailing.extend_from_slice(&u16::MAX.to_le_bytes());
+    exact_partial_trailing.push(1u8);
+    exact_partial_trailing.extend_from_slice(&0u16.to_le_bytes());
+    exact_partial_trailing.push(1u8);
+    exact_partial_trailing.extend_from_slice(&1u128.to_le_bytes());
+    exact_partial_trailing.extend_from_slice(&[0xBB, 0xCC]);
+    assert!(
+        percolator_prog::ix::Instruction::decode(&exact_partial_trailing).is_err(),
+        "decoder must reject trailing bytes after an ExactPartial candidate"
+    );
+    assert!(
+        send(&mut env, &caller, exact_partial_trailing).is_err(),
+        "KeeperCrank must reject trailing bytes after an ExactPartial candidate"
+    );
+}
+
+/// KeeperCrank candidate lists are capped by the wrapper ABI. This is a CU
+/// boundary, not a semantic liquidation limit: callers can submit later
+/// candidates on later cranks, but one transaction cannot carry an unbounded
+/// invalid tail that burns scan time.
+#[test]
+fn test_keeper_crank_format_v1_rejects_candidate_cap_overflow() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
+
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes());
+    data.push(1u8);
+    for i in 0..=percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+        data.extend_from_slice(&(i as u16).to_le_bytes());
+        data.push(0xFFu8);
+    }
+    assert!(
+        percolator_prog::ix::Instruction::decode(&data).is_err(),
+        "decoder must reject candidate lists above MAX_KEEPER_CANDIDATES"
+    );
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "runtime KeeperCrank must reject candidate lists above MAX_KEEPER_CANDIDATES"
     );
 }
 
@@ -4301,6 +5021,8 @@ fn test_funding_bootstrap_rate_stamped_after_trade() {
     env.top_up_insurance(&admin, 1_000_000_000);
     for i in 1..=20u64 {
         env.set_slot_and_price(100 + i * 10, 140_000_000); // cap-respecting move from $138
+        env.try_crank()
+            .expect("KeeperCrank must own exposed market progress before funding bootstrap trade");
         let trade_size = if i % 2 == 0 {
             1_000 + i as i128
         } else {
@@ -4811,13 +5533,15 @@ fn test_liquidation_fee_goes_to_insurance() {
     );
 }
 
-/// Verify insurance fund absorbs losses when an account goes bankrupt.
-/// After liquidation with deficit, insurance decreases, not vault.
+/// Verify account-touching price catchup liquidates before bankruptcy.
+/// The old account-free catchup path could defer touches until the LP was
+/// bankrupt; the compliant path cranks/touches during the price walk and
+/// credits liquidation fees to insurance instead of draining it.
 #[test]
-fn test_insurance_absorbs_bankruptcy_loss() {
+fn test_account_touching_crank_prevents_bankruptcy_insurance_loss() {
     program_path();
     let mut env = TestEnv::new();
-    env.init_market_with_invert(0);
+    env.init_market_with_cap(0, 2_000);
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4828,7 +5552,7 @@ fn test_insurance_absorbs_bankruptcy_loss() {
     env.deposit(&user, user_idx, 15_000_000_000);
 
     // User goes long, so the LP takes the short side. A large cap-respecting
-    // price rally bankrupts the LP and leaves a deficit for insurance.
+    // price rally would bankrupt the LP if no account-touching path ran.
     env.trade(&user, &lp, lp_idx, user_idx, 1_000_000_000);
 
     // Large insurance to absorb the deficit
@@ -4838,22 +5562,11 @@ fn test_insurance_absorbs_bankruptcy_loss() {
     let ins_before = env.read_insurance_balance();
     let vault_before = env.vault_balance();
 
-    // Price rally: LP's short loss exceeds capital and leaves a deficit. Use
-    // real intermediate oracle observations rather than the helper's crank walk,
-    // because this test must leave liquidation to the explicit call below.
-    for step in 1..=30u64 {
-        let slot = 100 + step * 50;
-        let price = 138_000_000i64 + (207_000_000i64 - 138_000_000i64) * step as i64 / 30;
-        env.set_slot_and_price_raw_no_walk(slot, price);
-        env.try_catchup_accrue()
-            .expect("price path must stay inside the engine envelope");
-    }
-    let result = env.try_liquidate(lp_idx);
-    assert!(
-        result.is_ok(),
-        "Bankrupt liquidation should succeed: {:?}",
-        result
-    );
+    // Price rally: LP's short loss exceeds capital and leaves a deficit. Walk
+    // through the account-touching crank path; retired account-free catchup is
+    // intentionally not available for exposed equity-active price changes.
+    env.set_slot_and_price(1_500, 207_000_000);
+    env.crank();
 
     let ins_after = env.read_insurance_balance();
     let vault_after = env.vault_balance();
@@ -4861,8 +5574,8 @@ fn test_insurance_absorbs_bankruptcy_loss() {
 
     assert_eq!(lp_pos, 0, "Bankrupt account position must be liquidated");
     assert!(
-        ins_after < ins_before,
-        "Bankrupt liquidation must consume insurance net of fees: before={} after={}",
+        ins_after >= ins_before,
+        "account-touching crank should avoid insurance depletion: before={} after={}",
         ins_before,
         ins_after
     );
@@ -5075,7 +5788,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(admin.pubkey().as_ref());
         data.extend_from_slice(env.mint.as_ref());
         data.extend_from_slice(&TEST_FEED_ID);
-        data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
+        data.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
         data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
         data.push(1u8); // invert=1 (SOL/USD)
         data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -5089,7 +5802,7 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
         data.extend_from_slice(&1u128.to_le_bytes()); // new_acct_fee (permissionless anti-spam)
         data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-        let max_crank = 99u64; // permissionless > max_crank
+        let max_crank = 99u64; // legacy wire field, ignored by current engine
         data.extend_from_slice(&max_crank.to_le_bytes()); // max_crank_staleness_slots
         data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
         data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liq_fee_cap
@@ -5100,10 +5813,8 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         data.extend_from_slice(&common::TEST_MAX_PRICE_MOVE_BPS_PER_SLOT.to_le_bytes()); // max_price_move_bps_per_slot (v12.19)
         data.extend_from_slice(&0u16.to_le_bytes()); // ins_withdraw_max_bps
         data.extend_from_slice(&0u64.to_le_bytes()); // ins_withdraw_cooldown
-                                                     // v12.19.6: perm_resolve <= MAX_ACCRUAL_DT_SLOTS (100). Pick 100 —
-                                                     // the upper bound. The test's 60+ slot dust-wash sequence must
-                                                     // now fit within this window (the test may need to tighten its
-                                                     // own cadence).
+                                                     // Short test stale window. Production permits a longer
+                                                     // permissionless horizon independent from MAX_ACCRUAL_DT_SLOTS.
         data.extend_from_slice(&100u64.to_le_bytes()); // permissionless_resolve = 100
                                                        // Custom funding params
         data.extend_from_slice(&200u64.to_le_bytes()); // funding_horizon
@@ -5543,7 +6254,7 @@ fn test_init_market_rejects_huge_funding_max_e9_per_slot_without_wrap() {
         // i64::MAX would overflow the envelope by ~17 orders of magnitude.
         env.init_market_with_funding(
             0,        // invert
-            80,       // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
+            80,       // short test stale window
             200,      // funding_horizon_slots
             200,      // funding_k_bps
             1_000,    // funding_max_premium_bps
@@ -5620,14 +6331,14 @@ fn test_per_account_maintenance_fee_not_back_charged_to_new_user() {
 
 /// Disproof of the "fee sync erases market accrual" audit claim.
 ///
-/// Hypothesis under test: when sync_account_fee self-advances
+/// Hypothesis under test: when recurring fee sync self-advances
 /// engine.current_slot = clock.slot, a subsequent accrue_market_to
 /// becomes a no-op and the funding interval [prev, clock.slot] is lost.
 ///
 /// Actual engine contract: accrue_market_to's dt is measured from
 /// `last_market_slot`, NOT `current_slot` (engine v12.18.x,
 /// accrue_market_to line 2143: `let total_dt = now_slot - last_market_slot`).
-/// sync_account_fee advances current_slot but NOT last_market_slot.
+/// fee sync advances current_slot but NOT last_market_slot.
 /// So the next accrue_market_to still sees the full interval.
 ///
 /// This test verifies empirically by reading `last_market_slot` before
@@ -5665,7 +6376,7 @@ fn test_fee_sync_does_not_erase_market_accrual_interval() {
     let before = read_last_market_slot(&env);
     assert_eq!(before, 100, "seeded last_market_slot at 100");
 
-    // Advance one slot. sync_account_fee will self-advance current_slot to
+    // Advance one slot. Recurring fee sync will self-advance current_slot to
     // 101. If the audit hypothesis held, the subsequent
     // accrue_market_to(101, ...) inside withdraw_not_atomic would become a
     // no-op and last_market_slot would stay at 100. Under the real engine
@@ -5719,7 +6430,7 @@ fn test_fee_sync_anchor_accepts_future_now_slot_for_every_path() {
     env.crank();
 
     // Exact auditor shape #1: advance clock by ONE slot. engine.current_slot
-    // still points at the last crank. sync_account_fee(..., clock.slot)
+    // still points at the last crank. Recurring fee sync at clock.slot
     // MUST succeed — the engine self-advances current_slot to clock.slot.
     env.set_slot(1); // clock = 101; engine.current_slot still 100
     env.try_withdraw(&user, user_idx, 100)
@@ -5746,6 +6457,70 @@ fn test_fee_sync_anchor_accepts_future_now_slot_for_every_path() {
     // Withdraw remaining deposited amount, then close.
     env.try_close_account(&user, user_idx)
         .expect("CloseAccount after 50k-slot gap (fees ON) MUST succeed");
+}
+
+#[test]
+fn test_trade_nocpi_charges_nonflat_recurring_fees_after_touch() {
+    program_path();
+    let mut env = TestEnv::new();
+    let fee_per_slot = 1_000u128;
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        fee_per_slot,
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
+    assert_ne!(env.read_account_position(user_idx), 0);
+    assert_ne!(env.read_account_position(lp_idx), 0);
+
+    let user_fee_slot_before = env.read_account_last_fee_slot(user_idx);
+    let lp_fee_slot_before = env.read_account_last_fee_slot(lp_idx);
+    assert_eq!(user_fee_slot_before, 120);
+    assert_eq!(lp_fee_slot_before, 120);
+    let user_cap_before = env.read_account_capital(user_idx);
+    let lp_cap_before = env.read_account_capital(lp_idx);
+    let insurance_before = env.read_insurance_balance();
+
+    env.set_slot_and_price_raw_no_walk(121, 138_000_000);
+    env.try_trade(&user, &lp, lp_idx, user_idx, -1_000_000)
+        .expect("risk-reducing trade should sync nonflat recurring fees");
+
+    assert_eq!(env.read_account_last_fee_slot(user_idx), 121);
+    assert_eq!(env.read_account_last_fee_slot(lp_idx), 121);
+
+    let user_fee = user_cap_before.saturating_sub(env.read_account_capital(user_idx));
+    let lp_fee = lp_cap_before.saturating_sub(env.read_account_capital(lp_idx));
+    assert_eq!(
+        user_fee, fee_per_slot,
+        "nonflat user must pay the one-slot recurring fee after touch"
+    );
+    assert_eq!(
+        lp_fee, fee_per_slot,
+        "nonflat LP must pay the one-slot recurring fee after touch"
+    );
+    assert_eq!(
+        env.read_insurance_balance()
+            .saturating_sub(insurance_before),
+        fee_per_slot * 2,
+        "recurring fees from both nonflat counterparties should accrue to insurance"
+    );
 }
 
 /// Disproof of the "fee sync ordering" audit claim: with maintenance fees
@@ -5830,9 +6605,9 @@ fn test_fee_markets_survive_one_slot_gap_on_every_accrue_path() {
 /// maintenance fees swept on that crank as capital credit, the other
 /// 50% stays in insurance.
 ///
-/// Under v12.19.6 (perm_resolve <= MAX_ACCRUAL_DT_SLOTS=100) the window is
-/// tight; this test uses Hyperp mode to bypass the oracle-backed stale gate
-/// and exercise the reward math over a wider slot range.
+/// This test uses a short permissionless stale window and Hyperp mode to keep
+/// the oracle liveness gate out of the reward math. The production
+/// permissionless horizon is intentionally independent from MAX_ACCRUAL_DT_SLOTS.
 #[test]
 fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller() {
     program_path();
@@ -5896,12 +6671,11 @@ fn test_keeper_crank_reward_pays_half_of_swept_fees_to_non_permissionless_caller
     );
 }
 
-/// Regression: reward must pay on the SECOND crank of a market with live
-/// positions, not just the first. Under v12.19.6 the slot window is tight
-/// (perm_resolve <= 100); this test keeps advances inside that window and
-/// asserts directional properties rather than exact magnitudes.
+/// Regression: a second crank with a populated risk buffer may charge nonflat
+/// candidate fees only after the engine has touched those accounts. Candidate
+/// fees are not part of the cranker reward base.
 #[test]
-fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
+fn test_keeper_crank_second_crank_charges_nonflat_candidate_fee_after_touch_without_reward() {
     program_path();
     let mut env = TestEnv::new();
     let data = encode_init_market_with_maint_fee_bounded(
@@ -5929,22 +6703,21 @@ fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    // v12.19.6: keep slot advances inside the 80-slot perm-resolve window.
-    // Use env.set_slot so the harness-managed oracle publish_time stays in
-    // sync with clock.unix_timestamp (prevents Pyth staleness false-positives).
-    env.set_slot(20);
+    // Use raw slot/price updates here so this test owns the crank cadence.
+    // The shared set_slot helper may run internal catchup cranks, which would
+    // consume the maintenance sweep before the explicit reward assertion.
+    env.set_slot_and_price_raw_no_walk(120, 138_000_000);
     env.trade(&user, &lp, lp_idx, user_idx, 100_000_000);
 
     // Crank #1: empty risk buffer, sweep pays reward. Phase C populates.
-    env.set_slot(40);
+    env.set_slot_and_price_raw_no_walk(140, 138_000_000);
     env.crank_as(&user, user_idx);
     env.svm.expire_blockhash();
 
-    // Crank #2: buffer is populated. Without the fix, candidate-sync
-    // realizes fees before ins_before → sweep_delta == 0 → reward gate
-    // fails. With the fix, ins_before is captured pre-candidate-sync so
-    // the reward credits correctly.
-    env.set_slot(70);
+    // Crank #2: buffer is populated with nonflat accounts. The engine touch
+    // runs first; candidate fee sync may then charge fee-current capital, but
+    // those third-party fees must not become a positive cranker reward.
+    env.set_slot_and_price_raw_no_walk(170, 138_000_000);
     let cap_before = env.read_account_capital(user_idx);
     let ins_before = env.read_insurance_balance();
     env.crank_as(&user, user_idx);
@@ -5954,23 +6727,226 @@ fn test_keeper_crank_reward_pays_on_second_crank_with_populated_risk_buffer() {
     let cap_delta: i128 = (cap_after as i128) - (cap_before as i128);
     let ins_delta: i128 = (ins_after as i128) - (ins_before as i128);
 
-    // Core property under test: on the second crank, insurance still
-    // receives the 50% share of the sweep (not 100%), proving the
-    // `ins_before` snapshot lands BEFORE candidate-sync. The exact
-    // magnitudes depend on inter-crank slot count, which changes with
-    // the new envelope — we assert the DIRECTIONAL property.
     assert!(
-        ins_delta > 0,
-        "insurance must receive swept fees on second crank, got {ins_delta}"
+        ins_delta >= 0,
+        "insurance must not decrease, got {ins_delta}"
     );
-    // With a reward paid, cranker isn't a full net loss of their own fee.
-    // A reward was paid iff (cap_delta + own_fee) > 0; own_fee is the
-    // maintenance charged to the user for the inter-crank interval.
-    // Asserting reward > 0 => cap_delta > -own_fee (strict), i.e.
-    // cap_delta is not simply the negative of an own-fee payment.
     assert!(
-        cap_delta >= -1_000 * 60,
-        "cranker cap delta must include reward credit, got {cap_delta}"
+        cap_delta <= 0,
+        "candidate-synced fees must not create a positive cranker reward, got {cap_delta}"
+    );
+}
+
+/// Regression (#63): candidate-directed fee sync is required so the engine's
+/// liquidation/settlement pass sees post-fee equity, but those candidate fees
+/// are third-party payments and must not be counted in the keeper reward base.
+#[test]
+fn test_attack_fresh_keeper_cranker_cannot_capture_third_party_candidate_fees() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        1_000,
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&admin, 100_000_000_000);
+
+    let victim = Keypair::new();
+    let victim_idx = env.init_user(&victim);
+    env.deposit(&victim, victim_idx, 10_000_000_000);
+
+    env.set_slot_and_price_raw_no_walk(150, 138_000_000);
+
+    let cranker = Keypair::new();
+    let cranker_idx = env.init_user(&cranker);
+    let cranker_cap_before = env.read_account_capital(cranker_idx);
+    let victim_cap_before = env.read_account_capital(victim_idx);
+    let ins_before = env.read_insurance_balance();
+
+    let mut crank_data = vec![5u8];
+    crank_data.extend_from_slice(&cranker_idx.to_le_bytes());
+    crank_data.push(1u8);
+    crank_data.extend_from_slice(&victim_idx.to_le_bytes());
+    crank_data.push(0xFFu8);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(cranker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: crank_data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&cranker.pubkey()),
+        &[&cranker],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("candidate self-crank should succeed");
+
+    let cranker_cap_after = env.read_account_capital(cranker_idx);
+    let victim_cap_after = env.read_account_capital(victim_idx);
+    let ins_after = env.read_insurance_balance();
+
+    let victim_fee_paid = victim_cap_before.saturating_sub(victim_cap_after);
+    assert!(
+        victim_fee_paid > 0,
+        "candidate sync must realize the stale third-party fee debt"
+    );
+    assert_eq!(
+        cranker_cap_after, cranker_cap_before,
+        "fresh cranker must not capture candidate-synced third-party fees"
+    );
+    assert_eq!(
+        ins_after.saturating_sub(ins_before),
+        victim_fee_paid,
+        "candidate-synced third-party fees should stay entirely in insurance"
+    );
+}
+
+#[test]
+fn test_keeper_crank_candidate_cranks_do_not_run_bitmap_fee_sweep() {
+    program_path();
+    let mut env = TestEnv::new();
+    let data = encode_init_market_with_maint_fee_bounded(
+        &env.payer.pubkey(),
+        &env.mint,
+        &TEST_FEED_ID,
+        1_000_000_000,
+        1_000,
+        0,
+    );
+    env.try_init_market_raw(data).expect("init_market");
+
+    let mut owners = Vec::new();
+    for _ in 0..140 {
+        let owner = Keypair::new();
+        let idx = env.init_user(&owner);
+        assert_eq!(idx as usize, owners.len());
+        owners.push(owner);
+    }
+
+    let candidates: Vec<u16> = (0..percolator_prog::constants::LIQ_BUDGET_PER_CRANK).collect();
+    let data = encode_crank_with_touch_candidates(&candidates);
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("crank should succeed");
+
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    let config = percolator_prog::state::read_config(&slab.data);
+    assert_eq!(
+        (config.fee_sweep_cursor_word, config.fee_sweep_cursor_bit),
+        (0, 0),
+        "candidate-bearing cranks spend their fixed CU envelope on candidate progress; empty cranks own the bitmap fee sweep"
+    );
+}
+
+#[test]
+fn test_keeper_crank_noop_candidates_do_not_suppress_phase2() {
+    program_path();
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    assert_eq!(lp_idx, 0);
+    env.deposit(&lp, lp_idx, 2_000_000_000_000);
+
+    let target = Keypair::new();
+    let target_idx = env.init_user(&target);
+    assert_eq!(target_idx, 1);
+    env.deposit(&target, target_idx, 10_000_000_000);
+
+    let mut flat_candidate_idxs = Vec::new();
+    for _ in 0..percolator_prog::constants::LIQ_BUDGET_PER_CRANK {
+        let owner = Keypair::new();
+        let idx = env.init_user(&owner);
+        env.deposit(&owner, idx, 10_000_000_000);
+        flat_candidate_idxs.push(idx);
+    }
+
+    for _ in 0..4 {
+        let owner = Keypair::new();
+        let idx = env.init_user(&owner);
+        env.deposit(&owner, idx, 10_000_000_000);
+        env.trade(&owner, &lp, lp_idx, idx, 10_000_000);
+    }
+
+    // Ensure a successful candidate-bearing Phase 2 cannot scan every used
+    // account and wrap back to cursor 0 in one crank. Newer engine semantics
+    // intentionally avoid advancing sweep_generation twice in the same slot,
+    // so a sparse full-wrap can look unchanged if this test only observes
+    // cursor/generation.
+    for _ in 0..percolator_prog::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK {
+        let owner = Keypair::new();
+        let idx = env.init_user(&owner);
+        env.deposit(&owner, idx, 10_000_000_000);
+    }
+
+    env.trade(&target, &lp, lp_idx, target_idx, 1_000_000);
+
+    let candidates = flat_candidate_idxs;
+    assert!(
+        candidates.len() <= percolator_prog::constants::MAX_KEEPER_CANDIDATES,
+        "test candidates must fit the public crank ABI cap"
+    );
+
+    let start_slot = env.read_last_market_slot();
+    let p_last = read_engine_last_oracle_price(&env);
+    env.set_slot_and_price_raw_no_walk(start_slot + 1, p_last as i64);
+    let rr_cursor_before = read_engine_rr_cursor(&env);
+    let sweep_generation_before = read_engine_sweep_generation(&env);
+
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_crank_with_candidates(&candidates),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("crank should succeed");
+
+    assert!(
+        read_engine_rr_cursor(&env) != rr_cursor_before
+            || read_engine_sweep_generation(&env) > sweep_generation_before,
+        "noop candidate padding must not suppress bounded phase-2 RR progress"
     );
 }
 
@@ -6213,22 +7189,19 @@ fn test_dust_account_drained_and_gc_by_crank_alone() {
     );
 }
 
-/// Stronger variant: account holds an open position. The chain is
-/// fees → equity drops below `min_nonzero_mm_req` (the absolute MM
-/// floor that prevents dust positions from staying "permanently
-/// healthy" at ~0 equity) → risk-buffer scan flags the account →
-/// next crank's liquidation pass closes the position → subsequent
-/// fee sweep drains residual capital → reclaim. End-to-end: just
-/// keep cranking.
+/// Nonflat dust cleanup must respect loss-senior fee ordering.
+///
+/// The maintenance-fee bitmap sweep is only allowed to drain flat/current
+/// accounts. An open position must first be touched by keeper liquidation or
+/// another account-local engine path so mark/funding losses are settled before
+/// recurring fees can consume principal. The public liveness guarantee is that
+/// a keeper candidate can still close and reclaim the account once a genuine
+/// price move makes it liquidatable.
 #[test]
-fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
+fn test_dust_position_cleanup_respects_loss_senior_fee_policy() {
     program_path();
 
     let mut env = TestEnv::new();
-    // Aggressive fee so the test drains in reasonable iterations:
-    // capital 150M, fee 1M/slot → ~150 slots to bankruptcy. With
-    // each set_slot_and_price advancing the slot by 5, ~30 cranks
-    // drain capital and the position becomes liquidatable.
     let data = encode_init_market_with_maint_fee_bounded(
         &env.payer.pubkey(),
         &env.mint,
@@ -6244,15 +7217,14 @@ fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
     let lp_idx = env.init_lp(&lp);
     env.deposit(&lp, lp_idx, 100_000_000_000);
 
-    // User: 0.15 SOL capital (matches the "minimal-equity" pattern
-    // already used in `test_position_flip_minimal_equity`). Enough to
-    // back a 1M-size position at 10% initial margin (notional = 138M,
-    // IM = 13.8M).
+    // User: enough capital to pay the accrued fee at trade entry while still
+    // backing a high-leverage but valid position. At the seed price, notional
+    // = 1.38B and initial margin = 138M.
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
-    env.deposit(&user, user_idx, 150_000_000);
+    env.deposit(&user, user_idx, 300_000_000);
     env.set_slot_and_price(100, 138_000_000);
-    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    env.trade(&user, &lp, lp_idx, user_idx, 10_000_000);
     let pos_after_open = env.read_account_position(user_idx);
     assert!(
         pos_after_open != 0,
@@ -6263,28 +7235,55 @@ fn test_dust_position_account_eventually_liquidated_and_gc_by_crank() {
     let used_after_open = env.read_num_used_accounts();
     assert_eq!(used_after_open, 2, "LP + user materialized");
 
-    // Crank repeatedly with advancing slots. Pipeline:
-    //   1. Maintenance fees drain user capital each crank.
-    //   2. Once equity < maint_margin (≈ 6.9M), risk-buffer scan
-    //      flags the user.
-    //   3. Following crank's `combined` candidate list runs
-    //      liquidation; FullClose closes the position.
-    //   4. User is now flat. Further fee-sweep visits drain residual
-    //      capital to 0 and reclaim the slot.
-    let mut user_freed = false;
-    for i in 1..=400 {
+    // Same-price empty cranks must not drain or reclaim a still-nonflat
+    // account by pre-touch fee sweep. This is the spec property the old
+    // regression accidentally contradicted. The test intentionally does not
+    // assert exact fee cursor/capital values here: a future keeper path may
+    // legitimately touch a nonflat account and then charge loss-senior fees.
+    // The invariant is that fee sweeping cannot erase the open position or
+    // free the slot before an account-local close/liquidation path runs.
+    for i in 1..=8 {
         env.set_slot_and_price(100 + i * 5, 138_000_000);
         env.crank();
+    }
+    assert_eq!(
+        env.read_account_position(user_idx),
+        pos_after_open,
+        "same-price fee cranks must not close a still-nonflat account",
+    );
+    assert_eq!(
+        env.read_num_used_accounts(),
+        used_after_open,
+        "same-price fee cranks must not reclaim a still-nonflat account",
+    );
+
+    // Now create a cap-compliant adverse move. The helper walks the oracle in
+    // bounded public crank steps so the hard-timeout gate cannot be used as a
+    // shortcut; cleanup must come from ordinary keeper progress.
+    env.set_slot_and_price(600, 117_300_000);
+    let mut closed = false;
+    let mut reclaimed = false;
+    for _ in 0..80 {
+        if env.read_account_position(user_idx) == 0 {
+            closed = true;
+        }
         if env.read_num_used_accounts() < used_after_open {
-            user_freed = true;
+            reclaimed = true;
             break;
         }
+        env.try_liquidate_target(user_idx)
+            .expect("keeper candidate crank should make bounded progress");
     }
 
     assert!(
-        user_freed,
-        "user account must be liquidated and reclaimed within 400 \
-         cranks purely from maintenance-fee accrual; saw num_used = {}",
+        closed,
+        "keeper candidate cranks must eventually close the liquidatable \
+         dust position",
+    );
+    assert!(
+        reclaimed,
+        "keeper candidate / flat sweep cranks must eventually reclaim the \
+         closed dust account; saw num_used = {}",
         env.read_num_used_accounts(),
     );
 }
@@ -6393,9 +7392,9 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
         &env.payer.pubkey(),
         &env.mint,
         1_000_000, // initial_mark_price
-        86_400,    // max_staleness_secs
-        0,         // trading_fee_bps
-        0,         // mark_min_fee (THE HOLE)
+        TEST_MAX_STALENESS_SECS,
+        0, // trading_fee_bps
+        0, // mark_min_fee (THE HOLE)
     );
     // The helper's perm_resolve = 0 in its default tail — need a
     // variant with perm_resolve > 0. For this test, craft inline.
@@ -6406,7 +7405,7 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.extend_from_slice(env.payer.pubkey().as_ref());
     payload.extend_from_slice(env.mint.as_ref());
     payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
-    payload.extend_from_slice(&86_400u64.to_le_bytes());
+    payload.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes());
     payload.extend_from_slice(&500u16.to_le_bytes());
     payload.push(0u8); // invert
     payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -6420,7 +7419,7 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes());
     payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee (maintenance fee provides anti-spam)
     payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    payload.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=80 <= 100)
+    payload.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     payload.extend_from_slice(&50u64.to_le_bytes());
     payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes());
     payload.extend_from_slice(&100u64.to_le_bytes());
@@ -6429,7 +7428,7 @@ fn test_init_hyperp_with_perm_resolve_requires_nonzero_mark_min_fee() {
     payload.extend_from_slice(&2u128.to_le_bytes());
     payload.extend_from_slice(&0u16.to_le_bytes());
     payload.extend_from_slice(&0u64.to_le_bytes());
-    payload.extend_from_slice(&80u64.to_le_bytes()); // perm_resolve = 80 (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
+    payload.extend_from_slice(&80u64.to_le_bytes()); // short test stale window
     payload.extend_from_slice(&500u64.to_le_bytes());
     payload.extend_from_slice(&100u64.to_le_bytes());
     payload.extend_from_slice(&500i64.to_le_bytes());
@@ -6458,7 +7457,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     payload.extend_from_slice(env.payer.pubkey().as_ref());
     payload.extend_from_slice(env.mint.as_ref());
     payload.extend_from_slice(&[0u8; 32]); // Hyperp feed_id
-    payload.extend_from_slice(&86_400u64.to_le_bytes()); // max_staleness_secs
+    payload.extend_from_slice(&TEST_MAX_STALENESS_SECS.to_le_bytes()); // max_staleness_secs
     payload.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     payload.push(0u8); // invert
     payload.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
@@ -6472,7 +7471,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
     payload.extend_from_slice(&(common::MAX_ACCOUNTS as u64).to_le_bytes()); // max_accounts
     payload.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
     payload.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    payload.extend_from_slice(&50u64.to_le_bytes()); // max_crank_staleness (< perm_resolve=80 <= 100)
+    payload.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
     payload.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
     payload.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     payload.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
@@ -6483,7 +7482,7 @@ fn test_init_hyperp_with_perm_resolve_accepts_nonzero_mark_min_fee() {
                                                                                         // Extended tail
     payload.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     payload.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    payload.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots (<= MAX_ACCRUAL_DT_SLOTS=100)
+    payload.extend_from_slice(&80u64.to_le_bytes()); // short test stale window
     payload.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     payload.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     payload.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps

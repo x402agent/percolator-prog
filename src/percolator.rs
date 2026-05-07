@@ -39,8 +39,11 @@ pub mod constants {
     pub const GEN_TABLE_LEN: usize = percolator::MAX_ACCOUNTS * 8; // u64 per slot
     pub const SLAB_LEN: usize = GEN_TABLE_OFF + GEN_TABLE_LEN;
 
-    /// Progressive scan window per crank.
-    pub const RISK_SCAN_WINDOW: usize = 32;
+    /// Progressive risk-buffer discovery window per crank. Kept small because
+    /// this runs after the engine's liquidation cascade; dense worst-case
+    /// cranks must still fit under the SVM CU cap. Honest keepers can always
+    /// refill urgent accounts immediately through the candidate tail.
+    pub const RISK_SCAN_WINDOW: usize = 8;
     /// Crank reward: fraction of the maintenance-fee sweep that is paid to
     /// a non-permissionless caller. 5_000 bps = 50 %. The remaining 50 %
     /// stays in the insurance fund. Only bounded by insurance balance post-
@@ -57,14 +60,34 @@ pub mod constants {
     /// it pays for its full elapsed interval in one charge.
     pub const FEE_SWEEP_BUDGET: usize = 128;
 
-    /// Phase 1 revalidation/liquidation budget per KeeperCrank (wrapper-owned
-    /// since v12.19, which dropped the engine-level `LIQ_BUDGET_PER_CRANK`).
-    pub const LIQ_BUDGET_PER_CRANK: u16 = 64;
-    /// Phase 2 mandatory engine round-robin sweep window. The engine requires
-    /// `max_revalidations + rr_window_size <= MAX_TOUCHED_PER_INSTRUCTION`
-    /// and currently exposes a 256-account touched set, so 64 + 64 leaves
-    /// headroom while guaranteeing structural progress every crank.
-    pub const RR_WINDOW_PER_CRANK: u64 = 64;
+    /// Maximum caller-supplied liquidation candidates decoded for one crank.
+    /// This is intentionally larger than the per-crank execution budget so
+    /// honest keepers can submit one bounded cascade segment while keeping
+    /// decode + wrapper simulation + engine execution below the SVM compute
+    /// cap in dense max-risk markets.
+    pub const MAX_KEEPER_CANDIDATES: usize = 8;
+    /// Phase 1 revalidation/liquidation execution budget per KeeperCrank
+    /// (wrapper-owned since v12.19, which dropped the engine-level
+    /// `LIQ_BUDGET_PER_CRANK`). Kept at 8 so dense liquidation cascades plus
+    /// wrapper coverage checks fit the SVM compute envelope.
+    pub const LIQ_BUDGET_PER_CRANK: u16 = 8;
+    /// Maximum candidate entries the wrapper/engine may inspect before Phase 2.
+    /// This is deliberately independent from the liquidation execution budget:
+    /// malformed or non-actionable candidate padding still consumes bounded
+    /// inspection work, while honest keepers can over-specify a small tail.
+    pub const CANDIDATE_INSPECTION_BUDGET_PER_CRANK: u16 = 8;
+    /// Phase 2 mandatory engine round-robin touch window. Kept at 32 so dense
+    /// no-candidate cranks remain below the SVM CU cap after the engine's
+    /// liquidation pass and wrapper risk-buffer maintenance.
+    pub const RR_WINDOW_PER_CRANK: u64 = 32;
+    /// Candidate-bearing cranks have extra wrapper coverage checks and engine
+    /// liquidation work. Keep their structural RR window small; empty cranks
+    /// own the wider cursor walk.
+    pub const RR_WINDOW_WITH_CANDIDATES_PER_CRANK: u64 = 4;
+    /// Engine Phase 2 inspected-slot cap. This is intentionally explicit even
+    /// when the deployment wants full-slab greedy progress: avoid delegating
+    /// unbounded `u64::MAX` scan policy to the engine API.
+    pub const RR_SCAN_LIMIT_PER_CRANK: u64 = percolator::MAX_ACCOUNTS as u64;
 
     // Compile-time invariant: the crank's total fee-sync budget
     // (FEE_SWEEP_BUDGET) must accommodate the wrapper's per-crank
@@ -81,6 +104,11 @@ pub mod constants {
         (LIQ_BUDGET_PER_CRANK as u64) + RR_WINDOW_PER_CRANK
             <= percolator::MAX_TOUCHED_PER_INSTRUCTION as u64,
         "KeeperCrank Phase 1 + Phase 2 must fit engine touched-account capacity"
+    );
+    const _: () = assert!(
+        (LIQ_BUDGET_PER_CRANK as u64) + RR_WINDOW_WITH_CANDIDATES_PER_CRANK
+            <= percolator::MAX_TOUCHED_PER_INSTRUCTION as u64,
+        "KeeperCrank candidate Phase 1 + Phase 2 must fit engine touched-account capacity"
     );
 
     // ── Engine envelope constants (wrapper-owned, immutable per deployment) ──
@@ -112,14 +140,17 @@ pub mod constants {
     ///     + liquidation_fee_bps
     ///     <= maintenance_margin_bps
     ///
-    /// For a deployment with maintenance=500, liq=50, max_price_move=2
+    /// For a deployment with maintenance=500, liq=5, max_price_move=49
     /// bps/slot, max_abs_funding_e9_per_slot=10_000 the envelope
-    /// collapses to max_accrual_dt_slots <= ~216 (= (500 - 50) / 2.09
-    /// ignoring floor). The wrapper picks 100 so both idle and price-
-    /// moving / funding-active markets have an ~40 sec per-crank window
-    /// at 400 ms slots. Catchup loops up to `CATCHUP_CHUNKS_MAX × 100`
-    /// = 2000 slots in one instruction before `CatchupRequired`.
-    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 100;
+    /// admits a 10-slot max accrual window:
+    ///
+    ///   49 * 10 + floor(10_000 * 10 * 10_000 / FUNDING_DEN) + 5 <= 500
+    ///
+    /// This keeps the maximum price move over one max-dt crank window close
+    /// to 1 / leverage for a 20x market. Catchup loops up to
+    /// `CATCHUP_CHUNKS_MAX × 10` = 200 slots in one instruction before
+    /// `CatchupRequired`.
+    pub const MAX_ACCRUAL_DT_SLOTS: u64 = 10;
     /// Max |funding_rate_e9_per_slot| the engine will accrue (spec §1.4).
     /// Matches the engine-crate GLOBAL ceiling. Realistic perp funding is
     /// 3-5 orders of magnitude below this (see compute_current_funding_rate_e9
@@ -185,6 +216,10 @@ pub mod constants {
     pub const MIN_FUNDING_LIFETIME_SLOTS: u64 = 10_000_000;
     pub const MATCHER_ABI_VERSION: u32 = 2;
     pub const MATCHER_CONTEXT_LEN: usize = 320;
+    /// Maximum variadic accounts forwarded by TradeCpi to the matcher.
+    /// Transaction account limits are an outer bound; this protocol cap keeps
+    /// wrapper heap/CU and matcher ABI expectations explicit.
+    pub const MAX_MATCHER_TAIL_ACCOUNTS: usize = 32;
     pub const MATCHER_CALL_TAG: u8 = 0;
     pub const MATCHER_CALL_LEN: usize = 67;
 
@@ -195,6 +230,17 @@ pub mod constants {
     /// unit_scale=0 disables scaling (1:1 base tokens to units, dust=0 always).
     /// unit_scale=1..=1_000_000_000 enables scaling with dust tracking.
     pub const MAX_UNIT_SCALE: u32 = 1_000_000_000;
+    /// InitMarket confidence-filter range for external oracle markets.
+    /// Zero used to mean "disabled"; new deployments must carry an explicit
+    /// nonzero confidence bound so a stale/misconfigured wide-conf feed cannot
+    /// silently become the market's accepted oracle.
+    pub const MIN_CONF_FILTER_BPS: u16 = 50;
+    pub const MAX_CONF_FILTER_BPS: u16 = 1_000;
+    /// InitMarket upper bound on oracle staleness. Kept intentionally short:
+    /// a market that tolerates hours/days of stale oracle data lets the admin
+    /// or deployer choose a liveness footgun that users cannot distinguish at
+    /// runtime from an intentionally permissive market.
+    pub const MAX_ORACLE_STALENESS_SECS: u64 = 600;
 
     // Default funding parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
@@ -209,14 +255,11 @@ pub mod constants {
     pub const DEFAULT_FUNDING_MAX_E9_PER_SLOT: i64 = 1_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 100; // ~40 sec @ 2.5 slots/sec
     /// Default slot-based oracle staleness window before anyone may resolve.
-    /// Disabled by default (0 == opt-out): v12.19.6 restores the invariant
-    /// `permissionless_resolve_stale_slots <= max_accrual_dt_slots`, and the
-    /// engine's `MAX_ACCRUAL_DT_SLOTS = 100` is far too tight for any
-    /// meaningful public staleness window. Markets that need permissionless
-    /// resolution MUST set this explicitly on the extended InitMarket tail
-    /// to a value in `1..=max_accrual_dt_slots`. The non-Hyperp resolvability
-    /// guard (see InitMarket) still requires a non-zero value OR Hyperp mode,
-    /// so an admin-free non-Hyperp market can't be shipped with this at 0.
+    /// Disabled by default (0 == opt-out). Markets that need permissionless
+    /// resolution MUST set this explicitly on the extended InitMarket tail.
+    /// The non-Hyperp resolvability guard (see InitMarket) still requires a
+    /// non-zero value OR Hyperp mode, so an admin-free non-Hyperp market can't
+    /// be shipped with this at 0.
     pub const DEFAULT_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 0;
     /// Upper bound on `force_close_delay_slots` (Finding 6). Without a bound, an
     /// init-time config of `u64::MAX` passes the "nonzero" liveness guard but
@@ -225,6 +268,45 @@ pub mod constants {
     /// admin was burned. 10_000_000 slots is ~50 days at 2 slots/s, far beyond
     /// any reasonable grace period but well short of the saturation regime.
     pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
+    /// Maximum profit-maturity horizon (`RiskParams.h_max`) accepted by the
+    /// wrapper. This is a product safety bound, not an arithmetic envelope:
+    /// h_max is independent from `max_accrual_dt_slots` and oracle staleness.
+    /// 6_480_000 slots is ~30 days at 400 ms/slot.
+    pub const MAX_PROFIT_MATURITY_SLOTS: u64 = 6_480_000;
+    /// Maximum hard oracle-staleness horizon for permissionless market
+    /// resolution.
+    ///
+    /// This is a product liveness bound, NOT an accrual envelope and NOT
+    /// coupled to `MAX_ACCRUAL_DT_SLOTS`. The two paths are deliberately
+    /// separate:
+    ///
+    /// - live market progress uses KeeperCrank and is chunked by
+    ///   `MAX_ACCRUAL_DT_SLOTS`;
+    /// - dead-oracle exit uses ResolvePermissionless, which calls the
+    ///   engine's Degenerate resolve arm at P_last with rate=0 and does not
+    ///   call `accrue_market_to`.
+    ///
+    /// Proof/test anchors for reviewers:
+    /// - `kani_permissionless_resolve_horizon_policy_independent_from_accrual_window`
+    ///   proves the wrapper init policy accepts horizons by this cap only,
+    ///   including horizons greater than `MAX_ACCRUAL_DT_SLOTS`.
+    /// - `test_attack_permissionless_resolve_cap_independent_from_accrual_window`
+    ///   checks the 30-day value is accepted and cap+1 is rejected.
+    /// - `test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt`
+    ///   executes the degenerate resolve path after a gap far beyond the
+    ///   accrual envelope, proving the market is not stuck by max_dt.
+    ///
+    /// Engine postconditions and conservation remain engine-owned; the
+    /// wrapper test above proves the wrapper routes to the engine resolve API
+    /// instead of trying to accrue a dead interval.
+    ///
+    /// 6_480_000 slots is ~30 days at 400 ms/slot.
+    pub const MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 6_480_000;
+    /// InitMarket wire flag packed into insurance_withdraw_max_bps. When set,
+    /// WithdrawInsuranceLimited can withdraw only explicit TopUpInsurance
+    /// principal; insurance growth from fees/liquidations remains behind.
+    pub const INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG: u16 = 0x8000;
+    pub const INSURANCE_WITHDRAW_MAX_BPS_MASK: u16 = 0x7FFF;
 }
 
 // =============================================================================
@@ -447,6 +529,31 @@ pub mod policy {
         is_writable
     }
 
+    /// Pre-touch recurring fee safety. A wrapper may charge recurring
+    /// maintenance fees before an engine local touch only when the account is
+    /// already flat/current and fee collection cannot outrank same-account
+    /// mark/funding losses or already-materialized negative PnL.
+    #[inline]
+    pub fn recurring_fee_pre_touch_safe_shape(
+        used: bool,
+        position_basis_q: i128,
+        effective_pos_q: i128,
+        pnl: i128,
+        reserved_pnl: u128,
+        sched_present: u8,
+        pending_present: u8,
+        fee_credits: i128,
+    ) -> bool {
+        used && position_basis_q == 0
+            && effective_pos_q == 0
+            && pnl >= 0
+            && reserved_pnl == 0
+            && sched_present == 0
+            && pending_present == 0
+            && fee_credits <= 0
+            && fee_credits != i128::MIN
+    }
+
     /// Account count requirement: must have at least `need` accounts.
     #[inline]
     /// Strict equality check for instruction account-count ABIs.
@@ -479,6 +586,311 @@ pub mod policy {
     #[inline]
     pub fn slab_shape_ok(s: SlabShape) -> bool {
         s.owned_by_program && s.correct_len
+    }
+
+    /// Account-free catchup cannot safely perform equity-active accrual on an
+    /// exposed market. Without a candidate list or account touch set, there is
+    /// no liquidation/revalidation turn between cumulative price/funding moves.
+    #[inline]
+    pub fn account_free_catchup_allows_accrual(
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        fund_px_last: u64,
+    ) -> bool {
+        let exposed = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        if !exposed {
+            return true;
+        }
+
+        let price_move_active = last_oracle_price > 0 && fresh_price != last_oracle_price;
+        let funding_active =
+            funding_rate_e9 != 0 && oi_eff_long_q != 0 && oi_eff_short_q != 0 && fund_px_last > 0;
+
+        !price_move_active && !funding_active
+    }
+
+    /// Account-limited instructions must not be a hidden market progress path
+    /// when exposed OI exists. They only touch a bounded caller-supplied set;
+    /// unrelated liquidatable accounts need KeeperCrank's cascade before the
+    /// market clock/price/funding can advance.
+    #[inline]
+    pub fn account_limited_op_allows_accrual(
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        fund_px_last: u64,
+        dt_slots: u64,
+    ) -> bool {
+        let exposed = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        if !exposed {
+            return true;
+        }
+
+        let price_move_active = last_oracle_price > 0 && fresh_price != last_oracle_price;
+        let funding_active = dt_slots != 0
+            && funding_rate_e9 != 0
+            && oi_eff_long_q != 0
+            && oi_eff_short_q != 0
+            && fund_px_last > 0;
+
+        !price_move_active && !funding_active
+    }
+
+    /// Pure funding-rate policy from mark/index premium.
+    ///
+    /// Returns `None` for corrupt negative caps. Otherwise returns the e9
+    /// per-slot funding rate after premium clamp, k scaling, horizon division,
+    /// and final per-slot rate clamp.
+    #[inline]
+    pub fn funding_rate_e9_from_mark_index(
+        mark_ewma_e6: u64,
+        last_effective_price_e6: u64,
+        funding_horizon_slots: u64,
+        funding_k_bps: u64,
+        funding_max_premium_bps: i64,
+        funding_max_e9_per_slot: i64,
+    ) -> Option<i128> {
+        if funding_max_premium_bps < 0 || funding_max_e9_per_slot < 0 {
+            return None;
+        }
+
+        let mark = mark_ewma_e6;
+        let index = last_effective_price_e6;
+        if mark == 0 || index == 0 || funding_horizon_slots == 0 {
+            return Some(0);
+        }
+
+        let diff = mark as i128 - index as i128;
+        let mut premium_e9 = diff.saturating_mul(1_000_000_000) / (index as i128);
+
+        let max_prem_e9 = (funding_max_premium_bps as i128) * 100_000;
+        premium_e9 = premium_e9.clamp(-max_prem_e9, max_prem_e9);
+
+        let scaled = premium_e9.saturating_mul(funding_k_bps as i128) / 100;
+        let per_slot = scaled / (funding_horizon_slots as i128);
+
+        let max_rate_e9 = funding_max_e9_per_slot as i128;
+        Some(per_slot.clamp(-max_rate_e9, max_rate_e9))
+    }
+
+    /// KeeperCrank partial-catchup decision. When the market clock is too far
+    /// behind for one inline accrual, the crank may commit one bounded
+    /// equity-active segment while keeping the authenticated wall-clock slot
+    /// as the public time anchor.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CrankCatchupTarget {
+        None,
+        Target(u64),
+    }
+
+    #[inline]
+    pub fn oversized_crank_catchup_target(
+        max_accrual_dt_slots: u64,
+        chunks_per_instruction: u64,
+        last_market_slot: u64,
+        now_slot: u64,
+        last_oracle_price: u64,
+        fresh_price: u64,
+        funding_rate_e9: i128,
+        oi_eff_long_q: u128,
+        oi_eff_short_q: u128,
+        fund_px_last: u64,
+    ) -> CrankCatchupTarget {
+        if max_accrual_dt_slots == 0
+            || chunks_per_instruction == 0
+            || now_slot <= last_market_slot
+            || last_oracle_price == 0
+        {
+            return CrankCatchupTarget::None;
+        }
+
+        let _ = chunks_per_instruction;
+        let gap = now_slot - last_market_slot;
+        if gap <= max_accrual_dt_slots {
+            return CrankCatchupTarget::None;
+        }
+
+        let oi_any = oi_eff_long_q != 0 || oi_eff_short_q != 0;
+        let funding_active =
+            funding_rate_e9 != 0 && oi_eff_long_q != 0 && oi_eff_short_q != 0 && fund_px_last > 0;
+        let price_move_active = fresh_price != last_oracle_price && oi_any;
+        if !funding_active && !price_move_active {
+            return CrankCatchupTarget::None;
+        }
+
+        // Since gap > max_accrual_dt_slots and gap = now - last,
+        // last + max_accrual_dt_slots is strictly before now and cannot
+        // overflow.
+        CrankCatchupTarget::Target(last_market_slot + max_accrual_dt_slots)
+    }
+
+    /// The subset of MarketConfig fields that a partial crank catchup is
+    /// allowed to choose between "before read" and "after read/sweep" values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PartialCrankConfigFields {
+        pub last_effective_price_e6: u64,
+        pub last_hyperp_index_slot: u64,
+        pub last_good_oracle_slot: u64,
+        pub last_oracle_publish_time: i64,
+        pub oracle_target_price_e6: u64,
+        pub oracle_target_publish_time: i64,
+        pub fee_sweep_cursor_word: u64,
+        pub fee_sweep_cursor_bit: u64,
+    }
+
+    /// Partial crank catchup preserves fresh target/liveness data, the
+    /// bounded effective/index step actually fed to the engine, and the
+    /// fee-sweep cursor. The raw target may remain ahead of the effective
+    /// engine price; user value-moving paths handle that lag separately.
+    #[inline]
+    pub fn partial_crank_config_fields_to_write(
+        _before_read: PartialCrankConfigFields,
+        after_read_and_sweep: PartialCrankConfigFields,
+    ) -> PartialCrankConfigFields {
+        PartialCrankConfigFields {
+            last_effective_price_e6: after_read_and_sweep.last_effective_price_e6,
+            last_hyperp_index_slot: after_read_and_sweep.last_hyperp_index_slot,
+            last_good_oracle_slot: after_read_and_sweep.last_good_oracle_slot,
+            last_oracle_publish_time: after_read_and_sweep.last_oracle_publish_time,
+            oracle_target_price_e6: after_read_and_sweep.oracle_target_price_e6,
+            oracle_target_publish_time: after_read_and_sweep.oracle_target_publish_time,
+            fee_sweep_cursor_word: after_read_and_sweep.fee_sweep_cursor_word,
+            fee_sweep_cursor_bit: after_read_and_sweep.fee_sweep_cursor_bit,
+        }
+    }
+
+    /// True when the wrapper knows the raw oracle/Hyperp target still differs
+    /// from the engine's last effective accrued price.
+    #[inline]
+    pub fn target_lag_pending(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        engine_last_oracle_price: u64,
+    ) -> bool {
+        let target = if is_hyperp {
+            hyperp_target_price_e6
+        } else {
+            external_oracle_target_price_e6
+        };
+        target != 0 && target != engine_last_oracle_price
+    }
+
+    /// True when the latest oracle read produced an effective engine price that
+    /// still has not caught up to the raw target. TradeCpi uses this before CPI
+    /// so a matcher is not invoked for a trade the wrapper must reject anyway.
+    #[inline]
+    pub fn target_lag_after_read(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        effective_price_e6: u64,
+    ) -> bool {
+        let target = if is_hyperp {
+            hyperp_target_price_e6
+        } else {
+            external_oracle_target_price_e6
+        };
+        target != 0 && target != effective_price_e6
+    }
+
+    /// Public extraction-sensitive/risk-increasing user operations are allowed
+    /// only after the raw target has caught up to the engine's effective price.
+    #[inline]
+    pub fn user_value_op_allowed_after_accrual(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        engine_last_oracle_price: u64,
+    ) -> bool {
+        !target_lag_pending(
+            is_hyperp,
+            external_oracle_target_price_e6,
+            hyperp_target_price_e6,
+            engine_last_oracle_price,
+        )
+    }
+
+    /// Pre-CPI TradeCpi admission under raw-target/effective-price lag policy.
+    #[inline]
+    pub fn trade_cpi_allowed_after_oracle_read(
+        is_hyperp: bool,
+        external_oracle_target_price_e6: u64,
+        hyperp_target_price_e6: u64,
+        effective_price_e6: u64,
+    ) -> bool {
+        !target_lag_after_read(
+            is_hyperp,
+            external_oracle_target_price_e6,
+            hyperp_target_price_e6,
+            effective_price_e6,
+        )
+    }
+
+    /// Account index must be inside both the compiled hard cap and the
+    /// market's configured account capacity.
+    #[inline]
+    pub fn market_idx_within_capacity(idx: usize, market_max_accounts: u64) -> bool {
+        idx < percolator::MAX_ACCOUNTS && (idx as u64) < market_max_accounts
+    }
+
+    /// Fee sync must never advance beyond the market boundary that has already
+    /// been economically accrued. Live markets use last_market_slot; resolved
+    /// markets use the immutable resolved_slot.
+    #[inline]
+    pub fn fee_sync_anchor_within_accrued_boundary(
+        is_resolved: bool,
+        anchor_slot: u64,
+        last_market_slot: u64,
+        resolved_slot: u64,
+    ) -> bool {
+        if is_resolved {
+            anchor_slot <= resolved_slot
+        } else {
+            anchor_slot <= last_market_slot
+        }
+    }
+
+    /// No-oracle instructions cannot accrue market price/funding state, so they
+    /// may only sync fees up to the already-accrued market boundary. Returning
+    /// None means there is no safe forward fee interval for this instruction.
+    #[inline]
+    pub fn no_oracle_fee_sync_anchor(
+        wallclock_slot: u64,
+        last_market_slot: u64,
+        current_slot: u64,
+        account_last_fee_slot: u64,
+    ) -> Option<u64> {
+        let anchor = if wallclock_slot < last_market_slot {
+            wallclock_slot
+        } else {
+            last_market_slot
+        };
+        if anchor < current_slot || anchor < account_last_fee_slot {
+            None
+        } else {
+            Some(anchor)
+        }
+    }
+
+    /// Permissionless resolved-market force close is live iff the configured
+    /// delay is nonzero and the elapsed slot distance from resolution meets it.
+    /// Uses saturating_sub rather than `resolved_slot + delay`, so large slot
+    /// values cannot make the close path unreachable through addition
+    /// saturation.
+    #[inline]
+    pub fn force_close_delay_elapsed(
+        clock_slot: u64,
+        resolved_slot: u64,
+        force_close_delay_slots: u64,
+    ) -> bool {
+        force_close_delay_slots != 0
+            && clock_slot.saturating_sub(resolved_slot) >= force_close_delay_slots
     }
 
     // =========================================================================
@@ -842,6 +1254,51 @@ pub mod policy {
         unit_scale <= crate::constants::MAX_UNIT_SCALE
     }
 
+    /// Validate the InitMarket permissionless-resolution horizon.
+    ///
+    /// This is intentionally independent from `MAX_ACCRUAL_DT_SLOTS`.
+    /// The accrual dt envelope bounds live KeeperCrank progress; this
+    /// predicate bounds the product's dead-oracle wait time before
+    /// ResolvePermissionless becomes available.
+    #[inline]
+    pub fn permissionless_resolve_horizon_ok(stale_slots: u64) -> bool {
+        stale_slots == 0 || stale_slots <= crate::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
+    }
+
+    /// Live insurance withdrawal health gate.
+    ///
+    /// Bounded operator withdrawals are only allowed while the senior residual
+    /// is non-negative:
+    ///
+    /// ```text
+    /// residual = vault - c_tot - insurance >= 0
+    /// ```
+    ///
+    /// A withdrawal subtracts the same amount from `vault` and `insurance`, so
+    /// it preserves this residual. The wrapper still requires the residual to
+    /// be non-negative up front so operators cannot extract from an already
+    /// deficit live market.
+    #[inline]
+    pub fn live_insurance_withdraw_residual_ok(vault: u128, c_tot: u128, insurance: u128) -> bool {
+        match c_tot.checked_add(insurance) {
+            Some(senior) => vault >= senior,
+            None => false,
+        }
+    }
+
+    /// Live limited insurance withdrawal is allowed only in a healthy live
+    /// market: no active stress/h-max reconciliation envelope and non-negative
+    /// senior residual.
+    #[inline]
+    pub fn live_insurance_withdraw_market_healthy(
+        vault: u128,
+        c_tot: u128,
+        insurance: u128,
+        stress_envelope_active: bool,
+    ) -> bool {
+        !stress_envelope_active && live_insurance_withdraw_residual_ok(vault, c_tot, insurance)
+    }
+
     // =========================================================================
     // Mark EWMA (trade-derived mark price)
     // =========================================================================
@@ -853,6 +1310,16 @@ pub mod policy {
     #[inline]
     pub fn mark_ewma_clamp_base(last_effective_price_e6: u64) -> u64 {
         last_effective_price_e6.max(1)
+    }
+
+    /// Apply fee weighting to an already-computed EWMA alpha.
+    #[inline]
+    pub fn ewma_effective_alpha_bps(alpha_bps: u128, fee_paid: u64, mark_min_fee: u64) -> u128 {
+        if mark_min_fee == 0 || fee_paid >= mark_min_fee {
+            alpha_bps
+        } else {
+            alpha_bps * (fee_paid as u128) / (mark_min_fee as u128)
+        }
     }
 
     /// EWMA update for mark price tracking.
@@ -898,11 +1365,7 @@ pub mod policy {
         // Trades below the fee threshold get proportionally reduced mark influence.
         // This makes wash trading cost-proportional: to move the mark like a
         // legitimate trade, the attacker must burn the same fee into insurance.
-        let effective_alpha_bps = if mark_min_fee == 0 || fee_paid >= mark_min_fee {
-            alpha_bps
-        } else {
-            alpha_bps * (fee_paid as u128) / (mark_min_fee as u128)
-        };
+        let effective_alpha_bps = ewma_effective_alpha_bps(alpha_bps, fee_paid, mark_min_fee);
 
         let old128 = old as u128;
         let price128 = price as u128;
@@ -934,7 +1397,9 @@ pub mod zc {
     const SM_SHORT_OFF: usize = offset_of!(RiskEngine, side_mode_short);
     /// Offset of market_mode within RiskEngine (repr(u8) enum)
     const MM_OFF: usize = offset_of!(RiskEngine, market_mode);
-
+    /// Offset of bankruptcy_hmax_lock_active within RiskEngine (bool)
+    const BANKRUPTCY_HMAX_LOCK_ACTIVE_OFF: usize =
+        offset_of!(RiskEngine, bankruptcy_hmax_lock_active);
     // Runtime tripwire: a unit test in tests/unit.rs
     // (`test_zc_cast_safety_invariant`) asserts that no slab-persisted
     // field has an invalid bit pattern beyond the enums validated
@@ -952,26 +1417,22 @@ pub mod zc {
     /// struct containing an invalid bit pattern is UB on first field
     /// access, irrespective of whether we read the field.
     ///
-    /// The only field types in the RiskEngine slab with invalid bit
-    /// patterns today are the two `#[repr(u8)]` enums:
+    /// With the currently pinned engine, the field types in the RiskEngine
+    /// slab with invalid bit patterns are:
     ///   - SideMode (2 instances at side_mode_long / side_mode_short):
     ///     valid tag bytes 0 (Normal), 1 (DrainOnly), 2 (ResetPending).
     ///   - MarketMode (at market_mode): valid tag bytes 0 (Live),
     ///     1 (Resolved).
+    ///   - bankruptcy_hmax_lock_active: valid bool bytes 0 or 1.
     /// No other field type in either RiskEngine or Account has invalid
     /// bit patterns: every other field is u64/u128/i64/i128/[u8; N]/
     /// wrapper-Pod (U128/I128) or fixed u8 — all-bits-valid types.
-    /// The two bool fields in the engine crate (InstructionContext,
-    /// CrankOutcome) are transient runtime structs, not slab-persisted,
-    /// so they are never materialized through this cast.
     ///
-    /// If a future revision adds any new enum or bool field to the
-    /// slab, the validation below must be extended before the cast
-    /// can be considered sound. A compile-time invariant check
-    /// (`assert!(size_of::<RiskEngine>() == EXPECTED)`) elsewhere in
-    /// this module forces deliberate attention on layout changes.
+    /// If a future revision adds any new enum or bool field to the slab, the
+    /// validation below must be extended before the cast can be considered
+    /// sound.
     #[inline]
-    fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
+    fn validate_raw_engine_state_shape(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
         // SideMode: valid 0 (Normal), 1 (DrainOnly), 2 (ResetPending)
         let sm_long = data[base + SM_LONG_OFF];
@@ -984,7 +1445,16 @@ pub mod zc {
         if mm > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
+        let hmax = data[base + BANKRUPTCY_HMAX_LOCK_ACTIVE_OFF];
+        if hmax > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn validate_raw_engine_bytes_for_test(data: &[u8]) -> Result<(), ProgramError> {
+        validate_raw_engine_state_shape(data)
     }
 
     pub fn engine_ref<'a>(data: &'a [u8]) -> Result<&'a RiskEngine, ProgramError> {
@@ -996,8 +1466,8 @@ pub mod zc {
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
-        // Validate enum discriminants from raw bytes before creating reference
-        validate_raw_discriminants(data)?;
+        // Validate invalid-bit-pattern fields before creating a reference.
+        validate_raw_engine_state_shape(data)?;
         Ok(unsafe { &*(ptr as *const RiskEngine) })
     }
 
@@ -1010,7 +1480,7 @@ pub mod zc {
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
-        validate_raw_discriminants(data)?;
+        validate_raw_engine_state_shape(data)?;
         Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
     }
 
@@ -1220,10 +1690,9 @@ pub mod error {
         InvalidConfigParam,
         HyperpTradeNoCpiDisabled,
         EngineCorruptState,
-        /// Wrapper-level: the gap between `engine.current_slot` and
-        /// `clock.slot` exceeds `CATCHUP_CHUNKS_MAX × max_accrual_dt_slots`.
-        /// Caller must run the dedicated `CatchupAccrue` instruction one
-        /// or more times to commit incremental progress, then retry.
+        /// Wrapper-level: the requested operation cannot safely advance market
+        /// time. Caller must run KeeperCrank to commit account-touching market
+        /// progress, then retry the original operation.
         CatchupRequired,
         /// Deposit rejected: post-deposit `c_tot` would exceed
         /// `tvl_insurance_cap_mult * insurance_fund.balance`.
@@ -1237,6 +1706,9 @@ pub mod error {
         /// (with a minimum floor of 10 units to avoid Zeno's-paradox lockout
         /// at small bps × small insurance).
         InsuranceWithdrawCapExceeded,
+        /// Engine reported that bounded public progress cannot continue
+        /// without an explicit terminal-recovery path.
+        EngineRecoveryRequired,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1255,6 +1727,7 @@ pub mod error {
             RiskError::AccountNotFound => PercolatorError::EngineAccountNotFound,
             RiskError::SideBlocked => PercolatorError::EngineRiskReductionOnlyMode,
             RiskError::CorruptState => PercolatorError::EngineCorruptState,
+            RiskError::RecoveryRequired => PercolatorError::EngineRecoveryRequired,
         };
         ProgramError::Custom(err as u32)
     }
@@ -1285,6 +1758,8 @@ pub mod ix {
             /// Periodic maintenance fee per slot per account (engine units). 0 = disabled.
             maintenance_fee_per_slot: u128,
             /// Insurance withdrawal: max bps per withdrawal (0 = no live withdrawals)
+            /// High bit enables deposits-only mode for WithdrawInsuranceLimited;
+            /// low 15 bits store the bps value.
             insurance_withdraw_max_bps: u16,
             /// Insurance withdrawal: cooldown slots between withdrawals
             insurance_withdraw_cooldown_slots: u64,
@@ -1330,9 +1805,6 @@ pub mod ix {
             lp_idx: u16,
             user_idx: u16,
             size: i128,
-        },
-        LiquidateAtOracle {
-            target_idx: u16,
         },
         CloseAccount {
             user_idx: u16,
@@ -1397,14 +1869,6 @@ pub mod ix {
         WithdrawInsuranceLimited {
             amount: u64,
         },
-        /// Permissionless reclamation of empty/dust accounts (§2.6, §10.7).
-        ReclaimEmptyAccount {
-            user_idx: u16,
-        },
-        /// Standalone account settlement (§10.2). Permissionless.
-        SettleAccount {
-            user_idx: u16,
-        },
         /// Direct fee-debt repayment (§10.3.1). Owner only.
         DepositFeeCredits {
             user_idx: u16,
@@ -1432,24 +1896,6 @@ pub mod ix {
         ForceCloseResolved {
             user_idx: u16,
         },
-        /// Permissionless market-clock catchup (tag 31). When a live market
-        /// has been idle for longer than
-        /// `CATCHUP_CHUNKS_MAX × max_accrual_dt_slots`, every accrue-bearing
-        /// instruction would fail with `CatchupRequired` — no progress can
-        /// be committed in a single failing transaction. This instruction
-        /// does pure catchup (up to CATCHUP_CHUNKS_MAX chunks) and commits
-        /// unconditionally, letting callers incrementally close the gap.
-        ///
-        /// Anyone can call. Takes slab + clock + oracle (3 accounts).
-        /// The oracle is REQUIRED — a successful read proves the market
-        /// is live before any accrual is applied, routing dead-oracle
-        /// markets exclusively through ResolvePermissionless (whose
-        /// Degenerate arm settles at rate = 0). Calls that CAN reach
-        /// clock.slot persist the fresh observation; calls that can
-        /// only partially advance use the read as a liveness proof
-        /// but discard the observed price/index to avoid applying
-        /// post-observation state to earlier engine slots.
-        CatchupAccrue,
         /// Scoped-authority update (tag 32).
         ///
         /// kind:
@@ -1632,12 +2078,11 @@ pub mod ix {
                     // VALID existing entries against its per-crank
                     // budget. A keeper could otherwise submit thousands
                     // of invalid indices to burn CU before any useful
-                    // work. We accept up to 2 × LIQ_BUDGET_PER_CRANK
-                    // candidates — enough room for over-specification
-                    // of deduplication / expired entries while keeping
-                    // the total scan bounded.
-                    const MAX_CANDIDATES: usize =
-                        (crate::constants::LIQ_BUDGET_PER_CRANK as usize) * 2;
+                    // work. We accept a fixed candidate cap that is larger
+                    // than the execution budget so keepers can include the
+                    // next cascade tail for wrapper coverage checks without
+                    // asking the engine to process it in the same call.
+                    const MAX_CANDIDATES: usize = crate::constants::MAX_KEEPER_CANDIDATES;
                     if format_version == 1 {
                         // Extended: u16 idx + u8 policy tag per candidate
                         while rest.len() >= 3 {
@@ -1656,6 +2101,9 @@ pub mod ix {
                                 _ => return Err(ProgramError::InvalidInstructionData),
                             };
                             candidates.push((idx, policy));
+                        }
+                        if !rest.is_empty() {
+                            return Err(ProgramError::InvalidInstructionData);
                         }
                     } else {
                         return Err(ProgramError::InvalidInstructionData);
@@ -1676,11 +2124,11 @@ pub mod ix {
                         size,
                     })
                 }
-                7 => {
-                    // LiquidateAtOracle
-                    let target_idx = read_u16(&mut rest)?;
-                    Ok(Instruction::LiquidateAtOracle { target_idx })
-                }
+                // Tag 7 (LiquidateAtOracle) retired. Liquidation is routed
+                // through KeeperCrank candidates so every public liquidation
+                // shares the same catchup, fee-sync, risk-buffer, and
+                // round-robin account-touch path.
+                7 => return Err(ProgramError::InvalidInstructionData),
                 8 => {
                     // CloseAccount
                     let user_idx = read_u16(&mut rest)?;
@@ -1764,15 +2212,13 @@ pub mod ix {
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::WithdrawInsuranceLimited { amount })
                 }
-                25 => {
-                    let user_idx = read_u16(&mut rest)?;
-                    Ok(Instruction::ReclaimEmptyAccount { user_idx })
-                }
-                26 => {
-                    // SettleAccount (§10.2)
-                    let user_idx = read_u16(&mut rest)?;
-                    Ok(Instruction::SettleAccount { user_idx })
-                }
+                // Tag 25 (ReclaimEmptyAccount) retired. Empty/dust account
+                // reclamation is now a KeeperCrank candidate-GC concern.
+                25 => return Err(ProgramError::InvalidInstructionData),
+                // Tag 26 (SettleAccount) retired. Account settlement is now
+                // performed by KeeperCrank touch-only candidates or the
+                // mandatory greedy round-robin sweep.
+                26 => return Err(ProgramError::InvalidInstructionData),
                 27 => {
                     // DepositFeeCredits (§10.3.1)
                     let user_idx = read_u16(&mut rest)?;
@@ -1790,7 +2236,10 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
-                31 => Ok(Instruction::CatchupAccrue),
+                // Tag 31 (CatchupAccrue) retired. Public market-clock progress
+                // is routed through KeeperCrank so exposed markets get an
+                // account-touching revalidation/liquidation turn.
+                31 => return Err(ProgramError::InvalidInstructionData),
                 32 => {
                     // UpdateAuthority { kind: u8, new_pubkey: [u8; 32] }
                     let kind = read_u8(&mut rest)?;
@@ -1923,7 +2372,11 @@ pub mod ix {
         // §1.4 requires `cfg_max_price_move_bps_per_slot > 0`. Reject before
         // any engine call so the error surfaces as `InvalidConfigParam`
         // rather than an engine-side panic.
-        if h_min == 0 || h_max < h_min || max_price_move_bps_per_slot == 0 {
+        if h_max == 0
+            || h_max < h_min
+            || h_max > crate::constants::MAX_PROFIT_MATURITY_SLOTS
+            || max_price_move_bps_per_slot == 0
+        {
             return Err(crate::error::PercolatorError::InvalidConfigParam.into());
         }
 
@@ -1956,9 +2409,6 @@ pub mod ix {
             min_funding_lifetime_slots: crate::constants::MIN_FUNDING_LIFETIME_SLOTS,
             max_price_move_bps_per_slot,
         };
-        if percolator::RiskEngine::try_validate_params(&params).is_err() {
-            return Err(crate::error::PercolatorError::InvalidConfigParam.into());
-        }
         Ok((params, new_account_fee))
     }
 }
@@ -2133,9 +2583,14 @@ pub mod state {
         /// Tuned by admin via UpdateConfig; typical production values are
         /// 10–100 (mature perp DEXs run ~20× insurance coverage).
         pub tvl_insurance_cap_mult: u16,
-        /// Padding for alignment (was [u8; 6]; shrunk when
-        /// tvl_insurance_cap_mult claimed 2 bytes of the former slot).
-        pub _iw_padding: [u8; 4],
+        /// Optional bounded-withdrawal mode. 0 = legacy bounded withdrawals
+        /// may withdraw live insurance subject to bps/cooldown. 1 = tag 23
+        /// may withdraw only the remaining amount deposited through
+        /// TopUpInsurance; fee/trading/liquidation growth stays behind.
+        pub insurance_withdraw_deposits_only: u8,
+        /// Padding for alignment (was [u8; 4]; shrunk when deposit-only mode
+        /// claimed 1 byte of the former slot).
+        pub _iw_padding: [u8; 3],
         /// Minimum slots between insurance withdrawals.
         pub insurance_withdraw_cooldown_slots: u64,
         /// Latest raw external oracle target in engine-space e6. Non-Hyperp
@@ -2148,11 +2603,12 @@ pub mod state {
         /// Last slot when insurance was withdrawn (for live-market cooldown tracking).
         /// Uses a dedicated field to avoid overwriting oracle config fields.
         pub last_insurance_withdraw_slot: u64,
-        /// Padding slot previously occupied by `first_observed_stale_slot`
-        /// (legacy two-phase resolve telemetry). Removed; kept as u64
-        /// padding for u128-alignment of the downstream `maintenance_fee_
-        /// per_slot` and `last_mark_push_slot` fields.
-        pub _pad_obsolete_stale_slot: u64,
+        /// Remaining TopUpInsurance principal withdrawable through tag 23
+        /// when `insurance_withdraw_deposits_only == 1`. This tracks only
+        /// explicit top-ups: it increases on TopUpInsurance and decreases on
+        /// WithdrawInsuranceLimited. Insurance growth from fees/liquidations
+        /// never increments this budget.
+        pub insurance_withdraw_deposit_remaining: u64,
 
         // ========================================
         // Mark EWMA (trade-derived mark price for funding)
@@ -2503,6 +2959,9 @@ pub mod oracle {
     /// discriminator. The wrapper rejects Partial upstream; offset 41
     /// is correct for every price-message the wrapper ever deserializes.
     const OFF_PRICE_FEED_MESSAGE: usize = 41;
+    /// Anchor discriminator for `PriceUpdateV2`: sha256("account:PriceUpdateV2")[0..8].
+    const PYTH_PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] =
+        [0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd];
     /// Pyth VerificationLevel::Full — enum tag value the Anchor
     /// serializer emits for the Full variant. Anchor writes the
     /// variant discriminant as one u8 followed by the variant payload
@@ -2561,6 +3020,9 @@ pub mod oracle {
         let data = price_ai.try_borrow_data()?;
         if data.len() < PRICE_UPDATE_V2_MIN_LEN {
             return Err(ProgramError::InvalidAccountData);
+        }
+        if data[..8] != PYTH_PRICE_UPDATE_V2_DISCRIMINATOR {
+            return Err(PercolatorError::OracleInvalid.into());
         }
 
         // Reject partially verified Pyth updates (only Full is safe).
@@ -2875,11 +3337,13 @@ pub mod oracle {
         } else {
             target
         };
-        let effective = if oi_any {
-            clamp_toward_engine_dt(anchor, target, max_change_bps, price_move_dt_slots)
-        } else {
-            target
-        };
+        let effective = effective_price_from_target(
+            anchor,
+            target,
+            max_change_bps,
+            price_move_dt_slots,
+            oi_any,
+        );
         config.last_effective_price_e6 = effective;
         Ok(effective)
     }
@@ -2993,6 +3457,26 @@ pub mod oracle {
         }
     }
 
+    /// Spec §3 target/effective price law used by both external-oracle and
+    /// Hyperp ingress. With exposed OI, the engine receives a capped staircase
+    /// price from its current effective price toward the raw target. With no
+    /// OI, the wrapper may adopt the raw target directly because no live
+    /// position can lose equity from the jump.
+    #[inline]
+    pub fn effective_price_from_target(
+        anchor: u64,
+        target: u64,
+        max_change_bps: u64,
+        price_move_dt_slots: u64,
+        oi_any: bool,
+    ) -> u64 {
+        if oi_any {
+            clamp_toward_engine_dt(anchor, target, max_change_bps, price_move_dt_slots)
+        } else {
+            target
+        }
+    }
+
     /// Move `index` toward `mark`, but clamp movement by cap_bps * dt_slots.
     /// cap_bps units: standard bps (10_000 = 100%).
     /// Returns the new index value.
@@ -3088,11 +3572,13 @@ pub mod oracle {
             } else {
                 mark
             };
-            let new_index = if oi_any {
-                clamp_toward_engine_dt(anchor, mark, max_change_bps, price_move_dt_slots)
-            } else {
-                mark
-            };
+            let new_index = effective_price_from_target(
+                anchor,
+                mark,
+                max_change_bps,
+                price_move_dt_slots,
+                oi_any,
+            );
 
             config.last_effective_price_e6 = new_index;
             if new_index != anchor || new_index == mark {
@@ -3189,7 +3675,7 @@ pub mod processor {
         constants::{
             DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_E9_PER_SLOT,
             DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_MARK_EWMA_HALFLIFE_SLOTS, MAGIC,
-            MATCHER_CALL_LEN, MATCHER_CALL_TAG, SLAB_LEN,
+            MATCHER_CALL_LEN, MATCHER_CALL_TAG, MAX_MATCHER_TAIL_ACCOUNTS, SLAB_LEN,
         },
         error::{map_risk_error, PercolatorError},
         ix::Instruction,
@@ -3197,10 +3683,11 @@ pub mod processor {
         state::{self, MarketConfig, SlabHeader},
         zc,
     };
-    use percolator::{RiskEngine, RiskError, MAX_ACCOUNTS};
+    use percolator::{RiskEngine, RiskError};
 
-    // settle_and_close_resolved removed — replaced by engine.force_close_resolved_not_atomic()
-    // which handles K-pair PnL, checked arithmetic, and all settlement internally.
+    // settle_and_close_resolved removed — replaced by engine
+    // force_close_resolved_with_fee_not_atomic(), which handles K-pair PnL,
+    // checked arithmetic, fee-after-loss ordering, and settlement internally.
 
     /// Read oracle price for non-Hyperp markets and stamp
     /// `last_good_oracle_slot`. Any Pyth/Chainlink parse error propagates
@@ -3333,33 +3820,42 @@ pub mod processor {
     /// Compute funding rate in e9-per-slot (ppb) directly.
     /// Avoids bps quantization: sub-bps rates are preserved as nonzero ppb values.
     /// Realize due maintenance fees for a single account up to `now_slot`.
-    /// Idempotent: the engine's per-account `last_fee_slot` cursor prevents
-    /// double-charging over the same interval, and a call at the same anchor
-    /// as the cursor is a no-op (engine v12.18.4 §4.6.1).
-    ///
-    /// Wrappers MUST call this before any health-sensitive engine operation
-    /// on the acting account when `maintenance_fee_per_slot > 0`, so that
-    /// the margin / withdrawal / close check sees post-fee capital. Between
-    /// cranks, each acting account self-realizes its share via this call;
-    /// KeeperCrank sweeps the rest.
-    ///
-    /// No-op when `maintenance_fee_per_slot == 0`.
-    ///
-    /// Invariant: capital-sensitive operations MUST fully accrue the
-    /// market (advance `last_market_slot` to `now_slot`) before syncing
-    /// per-account fees. Oracle-backed paths satisfy this via
-    /// `ensure_market_accrued_to_now` upstream. No-oracle paths (Deposit,
-    /// DepositFeeCredits, InitUser, InitLP, TopUpInsurance,
-    /// ReclaimEmptyAccount) cannot advance `last_market_slot` (no price /
-    /// rate available), so they MUST pass an anchor that is already
-    /// accrued — use `sync_account_fee_bounded_to_market` below rather
-    /// than calling this helper with a wall-clock slot.
-    ///
-    /// Calling this with `now_slot > engine.last_market_slot` creates a
-    /// `current_slot > last_market_slot` split that later breaks the
-    /// accrual envelope: the next oracle-backed instruction will see an
-    /// inflated `clock.slot - last_market_slot` dt and fail Overflow.
-    fn sync_account_fee(
+    /// Pre-touch recurring maintenance fees are loss-senior only for accounts
+    /// that are already flat/current. Nonflat or stale accounts must first be
+    /// touched by an engine path that settles lazy A/K/F and side effects.
+    fn recurring_fee_pre_touch_safe(engine: &RiskEngine, idx: usize) -> Result<bool, ProgramError> {
+        if !idx_used_in_market(engine, idx) {
+            return Ok(false);
+        }
+        let acc = &engine.accounts[idx];
+        let fc = acc.fee_credits.get();
+        if acc.position_basis_q == i128::MIN || acc.pnl == i128::MIN || fc == i128::MIN || fc > 0 {
+            return Err(PercolatorError::EngineCorruptState.into());
+        }
+        let effective_pos_q = if acc.position_basis_q == 0 {
+            effective_pos_q_checked(engine, idx)?
+        } else {
+            1
+        };
+        Ok(crate::policy::recurring_fee_pre_touch_safe_shape(
+            true,
+            acc.position_basis_q,
+            effective_pos_q,
+            acc.pnl,
+            acc.reserved_pnl,
+            acc.sched_present,
+            acc.pending_present,
+            fc,
+        ))
+    }
+
+    /// Recurring fee sync for accounts that have already gone through an
+    /// authoritative engine local touch in this instruction. Unlike
+    /// pre-touch fee sweeping, this intentionally does not require the account
+    /// to be flat: the loss-senior precondition was satisfied by the preceding
+    /// `settle_account_not_atomic` / keeper touch, so nonflat current accounts
+    /// must become fee-current before health-sensitive actions.
+    fn sync_account_fee_after_authoritative_touch(
         engine: &mut RiskEngine,
         config: &MarketConfig,
         idx: u16,
@@ -3368,9 +3864,86 @@ pub mod processor {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
+        check_idx(engine, idx)?;
+        let is_resolved = engine_is_resolved(engine);
+        let resolved_slot = if is_resolved {
+            engine_resolved_context(engine).1
+        } else {
+            0
+        };
+        if !crate::policy::fee_sync_anchor_within_accrued_boundary(
+            is_resolved,
+            now_slot,
+            engine.last_market_slot,
+            resolved_slot,
+        ) {
+            return Err(PercolatorError::CatchupRequired.into());
+        }
         engine
             .sync_account_fee_to_slot_not_atomic(idx, now_slot, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
+    }
+
+    fn settle_account_then_sync_fee_current(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        idx: u16,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        admit_h_min: u64,
+        admit_h_max: u64,
+        admit_threshold: Option<u128>,
+    ) -> Result<(), ProgramError> {
+        engine
+            .settle_account_not_atomic(
+                idx,
+                price,
+                now_slot,
+                funding_rate_e9,
+                admit_h_min,
+                admit_h_max,
+                admit_threshold,
+            )
+            .map_err(map_risk_error)?;
+        sync_account_fee_after_authoritative_touch(engine, config, idx, now_slot)
+    }
+
+    fn settle_pair_then_sync_fee_current(
+        engine: &mut RiskEngine,
+        config: &MarketConfig,
+        a: u16,
+        b: u16,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+        admit_h_min: u64,
+        admit_h_max: u64,
+        admit_threshold: Option<u128>,
+    ) -> Result<(), ProgramError> {
+        let (first, second) = if a <= b { (a, b) } else { (b, a) };
+        settle_account_then_sync_fee_current(
+            engine,
+            config,
+            first,
+            now_slot,
+            price,
+            funding_rate_e9,
+            admit_h_min,
+            admit_h_max,
+            admit_threshold,
+        )?;
+        settle_account_then_sync_fee_current(
+            engine,
+            config,
+            second,
+            now_slot,
+            price,
+            funding_rate_e9,
+            admit_h_min,
+            admit_h_max,
+            admit_threshold,
+        )
     }
 
     /// Fee-sync variant for no-oracle instructions. Caps the fee anchor
@@ -3394,19 +3967,18 @@ pub mod processor {
         if config.maintenance_fee_per_slot == 0 {
             return Ok(());
         }
-        // Anchor: upper-bound by last_market_slot (no accrue in this
-        // path) but floor at current_slot so sync_account_fee_to_slot_
-        // not_atomic's monotonicity guard (now_slot >= current_slot)
-        // holds even in the transient state where a no-oracle path
-        // (InitUser/deposit) has advanced current_slot past last_market
-        // _slot. In that state the account's last_fee_slot was seeded at
-        // current_slot, so the anchor == current_slot case is a harmless
-        // dt=0 no-op; the real fee realization happens on the next
-        // oracle-backed op via ensure_market_accrued_to_now.
-        let anchor = core::cmp::max(
-            core::cmp::min(wallclock_slot, engine.last_market_slot),
+        check_idx(engine, idx)?;
+        if !recurring_fee_pre_touch_safe(engine, idx as usize)? {
+            return Ok(());
+        }
+        let Some(anchor) = crate::policy::no_oracle_fee_sync_anchor(
+            wallclock_slot,
+            engine.last_market_slot,
             engine.current_slot,
-        );
+            engine.accounts[idx as usize].last_fee_slot,
+        ) else {
+            return Ok(());
+        };
         engine
             .sync_account_fee_to_slot_not_atomic(idx, anchor, config.maintenance_fee_per_slot)
             .map_err(map_risk_error)
@@ -3452,12 +4024,6 @@ pub mod processor {
         Ok(if rem == 0 { max_dt } else { rem })
     }
 
-    fn external_oracle_target_pending(config: &MarketConfig, engine: &RiskEngine) -> bool {
-        !oracle::is_hyperp_mode(config)
-            && config.oracle_target_price_e6 != 0
-            && config.oracle_target_price_e6 != engine.last_oracle_price
-    }
-
     fn hyperp_target_price(config: &MarketConfig) -> u64 {
         if config.mark_ewma_e6 > 0 {
             config.mark_ewma_e6
@@ -3467,18 +4033,21 @@ pub mod processor {
     }
 
     fn oracle_target_pending(config: &MarketConfig, engine: &RiskEngine) -> bool {
-        if oracle::is_hyperp_mode(config) {
-            let target = hyperp_target_price(config);
-            target != 0 && target != engine.last_oracle_price
-        } else {
-            external_oracle_target_pending(config, engine)
-        }
+        !crate::policy::user_value_op_allowed_after_accrual(
+            oracle::is_hyperp_mode(config),
+            config.oracle_target_price_e6,
+            hyperp_target_price(config),
+            engine.last_oracle_price,
+        )
     }
 
     fn reject_any_target_lag(
         config: &MarketConfig,
         engine: &RiskEngine,
     ) -> Result<(), ProgramError> {
+        if engine.oi_eff_long_q == 0 && engine.oi_eff_short_q == 0 {
+            return Ok(());
+        }
         if oracle_target_pending(config, engine) {
             return Err(PercolatorError::CatchupRequired.into());
         }
@@ -3486,18 +4055,92 @@ pub mod processor {
     }
 
     fn target_lag_after_read(config: &MarketConfig, effective_price: u64) -> bool {
-        if oracle::is_hyperp_mode(config) {
-            let target = hyperp_target_price(config);
-            target != 0 && target != effective_price
-        } else {
-            config.oracle_target_price_e6 != 0 && config.oracle_target_price_e6 != effective_price
+        !crate::policy::trade_cpi_allowed_after_oracle_read(
+            oracle::is_hyperp_mode(config),
+            config.oracle_target_price_e6,
+            hyperp_target_price(config),
+            effective_price,
+        )
+    }
+
+    #[inline]
+    fn engine_is_resolved(engine: &RiskEngine) -> bool {
+        engine.market_mode == percolator::MarketMode::Resolved
+    }
+
+    #[inline]
+    fn engine_resolved_context(engine: &RiskEngine) -> (u64, u64) {
+        (engine.resolved_price, engine.resolved_slot)
+    }
+
+    #[inline]
+    fn engine_is_used(engine: &RiskEngine, idx: usize) -> bool {
+        if idx >= percolator::MAX_ACCOUNTS {
+            return false;
         }
+        ((engine.used[idx >> 6] >> (idx & 63)) & 1) == 1
     }
 
     fn effective_pos_q_checked(engine: &RiskEngine, idx: usize) -> Result<i128, ProgramError> {
-        engine
-            .try_effective_pos_q(idx)
-            .map_err(|_| PercolatorError::EngineCorruptState.into())
+        if idx >= percolator::MAX_ACCOUNTS || (idx as u64) >= engine.params.max_accounts {
+            return Err(PercolatorError::EngineAccountNotFound.into());
+        }
+        if !engine_is_used(engine, idx) {
+            return Err(PercolatorError::EngineAccountNotFound.into());
+        }
+
+        let account = &engine.accounts[idx];
+        let basis = account.position_basis_q;
+        if basis == 0 {
+            return Ok(0);
+        }
+
+        let (epoch_side, side_mode, a_side) = if basis > 0 {
+            (
+                engine.adl_epoch_long,
+                engine.side_mode_long,
+                engine.adl_mult_long,
+            )
+        } else if basis < 0 {
+            (
+                engine.adl_epoch_short,
+                engine.side_mode_short,
+                engine.adl_mult_short,
+            )
+        } else {
+            return Ok(0);
+        };
+
+        if account.adl_epoch_snap != epoch_side {
+            if side_mode != percolator::SideMode::ResetPending
+                || account.adl_epoch_snap.checked_add(1) != Some(epoch_side)
+            {
+                return Err(PercolatorError::EngineCorruptState.into());
+            }
+            return Ok(0);
+        }
+
+        if account.adl_a_basis == 0 {
+            return Err(PercolatorError::EngineCorruptState.into());
+        }
+
+        let effective_abs = percolator::wide_math::mul_div_floor_u128(
+            basis.unsigned_abs(),
+            a_side,
+            account.adl_a_basis,
+        );
+        if effective_abs > i128::MAX as u128 {
+            return Err(PercolatorError::EngineCorruptState.into());
+        }
+        if basis < 0 {
+            if effective_abs == 0 {
+                Ok(0)
+            } else {
+                Ok(-(effective_abs as i128))
+            }
+        } else {
+            Ok(effective_abs as i128)
+        }
     }
 
     fn risk_notional_ceil(eff: i128, price: u64) -> u128 {
@@ -3506,6 +4149,55 @@ pub mod processor {
             price as u128,
             percolator::POS_SCALE,
         )
+    }
+
+    fn current_trade_fee_paid_cap(
+        size: i128,
+        exec_price: u64,
+        trading_fee_bps: u64,
+    ) -> Result<u128, ProgramError> {
+        if trading_fee_bps == 0 || size == 0 {
+            return Ok(0);
+        }
+        let notional = safe_mul_div_floor_u128(
+            size.unsigned_abs(),
+            exec_price as u128,
+            percolator::POS_SCALE,
+        )?;
+        if notional == 0 {
+            return Ok(0);
+        }
+        let one_side_fee = safe_mul_div_ceil_u128(notional, trading_fee_bps as u128, 10_000)?;
+        one_side_fee
+            .checked_mul(2)
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
+
+    fn safe_mul_div_floor_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+        if d == 0 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+        let q = percolator::wide_math::mul_div_floor_u256(
+            percolator::wide_math::U256::from_u128(a),
+            percolator::wide_math::U256::from_u128(b),
+            percolator::wide_math::U256::from_u128(d),
+        );
+        q.try_into_u128()
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
+
+    fn safe_mul_div_ceil_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
+        if d == 0 {
+            return Err(PercolatorError::EngineOverflow.into());
+        }
+        let q = percolator::wide_math::checked_mul_div_ceil_u256(
+            percolator::wide_math::U256::from_u128(a),
+            percolator::wide_math::U256::from_u128(b),
+            percolator::wide_math::U256::from_u128(d),
+        )
+        .ok_or(PercolatorError::EngineOverflow)?;
+        q.try_into_u128()
+            .ok_or_else(|| PercolatorError::EngineOverflow.into())
     }
 
     fn reject_stuck_target_accrual(
@@ -3534,7 +4226,8 @@ pub mod processor {
             percolator::MAX_ACCOUNTS,
         );
         let idx = engine.free_head;
-        if idx == u16::MAX || (idx as usize) >= max_accounts || engine.is_used(idx as usize) {
+        if idx == u16::MAX || (idx as usize) >= max_accounts || engine_is_used(engine, idx as usize)
+        {
             return Err(PercolatorError::EngineOverflow.into());
         }
 
@@ -3542,7 +4235,7 @@ pub mod processor {
         let valid_head = engine.prev_free[i] == u16::MAX
             && (engine.next_free[i] == u16::MAX
                 || ((engine.next_free[i] as usize) < max_accounts
-                    && !engine.is_used(engine.next_free[i] as usize)
+                    && !engine_is_used(engine, engine.next_free[i] as usize)
                     && engine.prev_free[engine.next_free[i] as usize] == idx));
         if !valid_head {
             if idx as u64 != engine.num_used_accounts as u64 {
@@ -3565,12 +4258,11 @@ pub mod processor {
 
     /// Maximum number of max_dt chunks the in-line catchup can advance per
     /// instruction. Bounded by CU budget — each `accrue_market_to` is cheap
-    /// but not free. For gaps beyond this, callers must use the dedicated
-    /// `CatchupAccrue` instruction which commits progress atomically
-    /// without attempting a main operation afterwards.
+    /// but not free. For gaps beyond this, callers must use KeeperCrank to
+    /// commit account-touching progress before attempting a main operation.
     ///
-    /// 20 × max_dt = 20 × 100 = 2_000 slots per single instruction. Larger
-    /// gaps require multiple CatchupAccrue calls — that's the design
+    /// 20 × max_dt = 20 × 10 = 200 slots per single instruction. Larger
+    /// gaps require multiple KeeperCrank calls — that's the design
     /// contract, not a misconfig.
     const CATCHUP_CHUNKS_MAX: u32 = 20;
 
@@ -3600,10 +4292,9 @@ pub mod processor {
     /// idle interval "should have" been (which is unknowable).
     ///
     /// If the gap exceeds `CATCHUP_CHUNKS_MAX × max_dt`, returns `Err`
-    /// with `CatchupRequired` so the caller can surface "call CatchupAccrue
-    /// first" instead of silently returning Ok and letting the subsequent
-    /// main engine call Overflow-and-rollback (which would discard the
-    /// catchup progress too, making the market unrecoverable in-line).
+    /// with `CatchupRequired` for user/admin operations. KeeperCrank uses a
+    /// separate partial-progress wrapper so the crank itself can commit a
+    /// bounded chunk instead of rolling back.
     ///
     /// No-op when the gap is already within the envelope, or when
     /// `max_dt == 0` (misconfiguration guard), or when the engine has never
@@ -3664,9 +4355,8 @@ pub mod processor {
                 // Silently returning Ok here would let the caller's
                 // main accrue hit Overflow on the residual, rolling
                 // back ALL catchup progress. Surface CatchupRequired
-                // so the caller routes to the dedicated CatchupAccrue
-                // instruction which commits progress without attempting
-                // the main op.
+                // so the caller routes to KeeperCrank, which commits
+                // account-touching progress before the main op is retried.
                 return Err(PercolatorError::CatchupRequired.into());
             }
             let chunk_dt = max_dt;
@@ -3701,6 +4391,71 @@ pub mod processor {
         Ok(())
     }
 
+    fn oversized_catchup_target(
+        engine: &RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<Option<u64>, ProgramError> {
+        match crate::policy::oversized_crank_catchup_target(
+            engine.params.max_accrual_dt_slots,
+            1,
+            engine.last_market_slot,
+            now_slot,
+            engine.last_oracle_price,
+            price,
+            funding_rate_e9,
+            engine.oi_eff_long_q,
+            engine.oi_eff_short_q,
+            engine.fund_px_last,
+        ) {
+            crate::policy::CrankCatchupTarget::None => Ok(None),
+            crate::policy::CrankCatchupTarget::Target(target) => Ok(Some(target)),
+        }
+    }
+
+    fn partial_crank_config_fields(
+        config: MarketConfig,
+    ) -> crate::policy::PartialCrankConfigFields {
+        crate::policy::PartialCrankConfigFields {
+            last_effective_price_e6: config.last_effective_price_e6,
+            last_hyperp_index_slot: config.last_hyperp_index_slot,
+            last_good_oracle_slot: config.last_good_oracle_slot,
+            last_oracle_publish_time: config.last_oracle_publish_time,
+            oracle_target_price_e6: config.oracle_target_price_e6,
+            oracle_target_publish_time: config.oracle_target_publish_time,
+            fee_sweep_cursor_word: config.fee_sweep_cursor_word,
+            fee_sweep_cursor_bit: config.fee_sweep_cursor_bit,
+        }
+    }
+
+    fn apply_partial_crank_config_fields(
+        config: &mut MarketConfig,
+        fields: crate::policy::PartialCrankConfigFields,
+    ) {
+        config.last_effective_price_e6 = fields.last_effective_price_e6;
+        config.last_hyperp_index_slot = fields.last_hyperp_index_slot;
+        config.last_good_oracle_slot = fields.last_good_oracle_slot;
+        config.last_oracle_publish_time = fields.last_oracle_publish_time;
+        config.oracle_target_price_e6 = fields.oracle_target_price_e6;
+        config.oracle_target_publish_time = fields.oracle_target_publish_time;
+        config.fee_sweep_cursor_word = fields.fee_sweep_cursor_word;
+        config.fee_sweep_cursor_bit = fields.fee_sweep_cursor_bit;
+    }
+
+    fn partial_crank_config_to_write(
+        before_read: MarketConfig,
+        after_read_and_sweep: MarketConfig,
+    ) -> MarketConfig {
+        let fields = crate::policy::partial_crank_config_fields_to_write(
+            partial_crank_config_fields(before_read),
+            partial_crank_config_fields(after_read_and_sweep),
+        );
+        let mut restored = before_read;
+        apply_partial_crank_config_fields(&mut restored, fields);
+        restored
+    }
+
     /// Fully advance the engine's market clock to `now_slot` before any
     /// per-account fee sync. This is an explicit-ordering helper:
     /// `catchup_accrue` brings the gap within the envelope, then a final
@@ -3715,7 +4470,7 @@ pub mod processor {
     /// `test_fee_sync_does_not_erase_market_accrual_interval`) — making
     /// the ordering explicit in the wrapper removes all ambiguity and
     /// aligns with the auditor-requested pattern:
-    /// `ensure_market_accrued_to_now; sync_account_fee; engine.<op>_not_atomic`.
+    /// `ensure_market_accrued_to_now; touch/settle; sync fee; engine.<op>_not_atomic`.
     ///
     /// The main op's internal `accrue_market_to(now_slot, price, rate)`
     /// then hits the same-slot + same-price no-op branch (engine §5.4
@@ -3745,7 +4500,28 @@ pub mod processor {
         Ok(())
     }
 
-    fn ensure_market_accrued_to_now_with_policy(
+    fn reject_account_limited_market_progress(
+        engine: &RiskEngine,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(), ProgramError> {
+        let dt_slots = now_slot.saturating_sub(engine.last_market_slot);
+        if !crate::policy::account_limited_op_allows_accrual(
+            engine.oi_eff_long_q,
+            engine.oi_eff_short_q,
+            engine.last_oracle_price,
+            price,
+            funding_rate_e9,
+            engine.fund_px_last,
+            dt_slots,
+        ) {
+            return Err(PercolatorError::CatchupRequired.into());
+        }
+        Ok(())
+    }
+
+    fn ensure_market_accrued_to_now_for_account_limited_op(
         engine: &mut RiskEngine,
         config: &MarketConfig,
         now_slot: u64,
@@ -3753,7 +4529,72 @@ pub mod processor {
         funding_rate_e9: i128,
     ) -> Result<(), ProgramError> {
         reject_stuck_target_accrual(config, engine, now_slot, price)?;
+        reject_account_limited_market_progress(engine, now_slot, price, funding_rate_e9)?;
         ensure_market_accrued_to_now(engine, now_slot, price, funding_rate_e9)
+    }
+
+    fn keeper_candidate_inspection_cap() -> u16 {
+        core::cmp::min(
+            percolator::MAX_TOUCHED_PER_INSTRUCTION as u16,
+            crate::constants::CANDIDATE_INSPECTION_BUDGET_PER_CRANK,
+        )
+    }
+
+    fn sync_keeper_candidate_fees_after_crank(
+        engine: &mut RiskEngine,
+        combined: &[(u16, Option<percolator::LiquidationPolicy>)],
+        now_slot: u64,
+        maintenance_fee_per_slot: u128,
+    ) -> Result<usize, ProgramError> {
+        if maintenance_fee_per_slot == 0 {
+            return Ok(0);
+        }
+        let cap = core::cmp::min(
+            crate::constants::LIQ_BUDGET_PER_CRANK as usize,
+            crate::constants::FEE_SWEEP_BUDGET,
+        );
+        let mut synced: [u16; crate::constants::LIQ_BUDGET_PER_CRANK as usize] =
+            [u16::MAX; crate::constants::LIQ_BUDGET_PER_CRANK as usize];
+        let mut synced_count = 0usize;
+        let mut attempts = 0usize;
+        let mut candidate_syncs = 0usize;
+        for &(idx, _policy) in combined.iter() {
+            if attempts >= cap || candidate_syncs >= crate::constants::FEE_SWEEP_BUDGET {
+                break;
+            }
+            let i = idx as usize;
+            if !idx_used_in_market(engine, i) {
+                continue;
+            }
+            attempts += 1;
+            let mut already = false;
+            for j in 0..synced_count {
+                if synced[j] == idx {
+                    already = true;
+                    break;
+                }
+            }
+            if already {
+                continue;
+            }
+            // Candidate fees run only after the engine's authoritative
+            // candidate pass, and only when the account is now flat/current.
+            // That keeps recurring fees junior to lazy mark/funding losses
+            // realized by the touch.
+            if engine.accounts[i].last_fee_slot >= now_slot {
+                continue;
+            }
+            if !recurring_fee_pre_touch_safe(engine, i)? {
+                continue;
+            }
+            engine
+                .sync_account_fee_to_slot_not_atomic(idx, now_slot, maintenance_fee_per_slot)
+                .map_err(map_risk_error)?;
+            synced[synced_count] = idx;
+            synced_count += 1;
+            candidate_syncs += 1;
+        }
+        Ok(candidate_syncs)
     }
 
     /// Incrementally sweep maintenance fees from the current cursor position.
@@ -3767,9 +4608,9 @@ pub mod processor {
     /// truth. When the cursor reaches an account, that account's sync call
     /// realizes fees for the *entire* elapsed interval
     /// `[account.last_fee_slot, now_slot]` in one charge — no fees are lost
-    /// between cursor visits. Self-acting accounts realize their own fees
-    /// inline on every capital-sensitive instruction (see `sync_account_fee`);
-    /// the sweep handles everything that hasn't self-acted.
+    /// between cursor visits. Self-acting accounts realize their own fees inline
+    /// on every capital-sensitive instruction after the engine local touch; the
+    /// sweep handles flat/current accounts that have not self-acted.
     ///
     /// CU bound: at most `FEE_SWEEP_BUDGET` sync calls per crank (strictly,
     /// thanks to the bit cursor), plus O(BITMAP_WORDS) word reads. Constant
@@ -3818,7 +4659,15 @@ pub mod processor {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let idx = word_cursor * 64 + bit;
-                if idx >= percolator::MAX_ACCOUNTS {
+                if !idx_within_market_capacity(engine, idx) {
+                    continue;
+                }
+                // Keeper fee sweeping is loss-senior: do not charge recurring
+                // fees from exposed, stale-epoch, reserved, or negative-PnL
+                // accounts before their local losses and side effects have
+                // been settled by an engine touch. The bitmap sweep is for
+                // flat/current accounts only.
+                if !recurring_fee_pre_touch_safe(engine, idx)? {
                     continue;
                 }
                 engine
@@ -3836,8 +4685,8 @@ pub mod processor {
                 // pending, no positive fee_credits), free the slot now.
                 // Without this, an attacker could fill `max_accounts`
                 // with dust and brick onboarding even when fees drain
-                // capital, because slot reclamation would still require
-                // an explicit per-account `ReclaimEmptyAccount` call.
+                // capital, because slot reclamation would otherwise
+                // require a targeted crank candidate.
                 //
                 // All six flat-clean predicates the engine's reclaim
                 // checks are mirrored here so the call CANNOT hit an
@@ -3853,23 +4702,7 @@ pub mod processor {
                 // practice the `?` is unreachable — but if a future
                 // engine change introduces a new precondition, we get
                 // a transaction rollback instead of silent corruption.
-                let acc = &engine.accounts[idx];
-                let fee_credits = acc.fee_credits.get();
-                if acc.capital.is_zero()
-                    && acc.position_basis_q == 0
-                    && acc.pnl == 0
-                    && acc.reserved_pnl == 0
-                    && acc.sched_present == 0
-                    && acc.pending_present == 0
-                    && fee_credits <= 0
-                {
-                    if fee_credits == i128::MIN {
-                        return Err(PercolatorError::EngineCorruptState.into());
-                    }
-                    engine
-                        .reclaim_empty_account_not_atomic(idx as u16, now_slot)
-                        .map_err(map_risk_error)?;
-                }
+                reclaim_flat_zero_account_if_eligible(engine, idx as u16, now_slot)?;
             }
             // Word fully drained — advance to next word, reset bit cursor.
             word_cursor = (word_cursor + 1) % BITMAP_WORDS;
@@ -3886,34 +4719,45 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn reclaim_flat_zero_account_if_eligible(
+        engine: &mut RiskEngine,
+        idx: u16,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if !idx_used_in_market(engine, idx as usize) {
+            return Ok(());
+        }
+        let acc = &engine.accounts[idx as usize];
+        let fee_credits = acc.fee_credits.get();
+        if acc.capital.is_zero()
+            && acc.position_basis_q == 0
+            && acc.pnl == 0
+            && acc.reserved_pnl == 0
+            && acc.sched_present == 0
+            && acc.pending_present == 0
+            && fee_credits <= 0
+        {
+            if fee_credits == i128::MIN {
+                return Err(PercolatorError::EngineCorruptState.into());
+            }
+            engine
+                .reclaim_empty_account_not_atomic(idx, now_slot)
+                .map_err(map_risk_error)?;
+        }
+        Ok(())
+    }
+
     fn compute_current_funding_rate_e9(config: &MarketConfig) -> Result<i128, ProgramError> {
-        if config.funding_max_premium_bps < 0 || config.funding_max_e9_per_slot < 0 {
-            return Err(PercolatorError::InvalidConfigParam.into());
-        }
-
-        let mark = config.mark_ewma_e6;
-        let index = config.last_effective_price_e6;
-        if mark == 0 || index == 0 || config.funding_horizon_slots == 0 {
-            return Ok(0);
-        }
-
-        let diff = mark as i128 - index as i128;
-        // premium in e9: diff * 1_000_000_000 / index
-        let mut premium_e9 = diff.saturating_mul(1_000_000_000) / (index as i128);
-
-        // Clamp premium: max_premium_bps * 100_000 converts bps to e9
-        let max_prem_e9 = (config.funding_max_premium_bps as i128) * 100_000;
-        premium_e9 = premium_e9.clamp(-max_prem_e9, max_prem_e9);
-
-        // Apply k multiplier (100 = 1.00x)
-        let scaled = premium_e9.saturating_mul(config.funding_k_bps as i128) / 100;
-
-        // Per-slot: divide by horizon
-        let per_slot = scaled / (config.funding_horizon_slots as i128);
-
-        // Clamp: funding_max_e9_per_slot is already in engine-native e9 units.
-        let max_rate_e9 = config.funding_max_e9_per_slot as i128;
-        Ok(per_slot.clamp(-max_rate_e9, max_rate_e9))
+        crate::policy::funding_rate_e9_from_mark_index(
+            config.mark_ewma_e6,
+            config.last_effective_price_e6,
+            config.funding_horizon_slots,
+            config.funding_k_bps,
+            config.funding_max_premium_bps,
+            config.funding_max_e9_per_slot,
+        )
+        .ok_or(PercolatorError::InvalidConfigParam.into())
     }
 
     fn execute_trade_with_matcher<M: MatchingEngine>(
@@ -3926,7 +4770,7 @@ pub mod processor {
         size: i128,
         funding_rate_e9: i128,
         lp_account_id: u64,
-        maintenance_fee_per_slot: u128,
+        _maintenance_fee_per_slot: u128,
     ) -> Result<(), RiskError> {
         let lp = &engine.accounts[lp_idx as usize];
         let exec = matcher.execute_match(
@@ -3953,12 +4797,6 @@ pub mod processor {
         };
         let admit_h_min = engine.params.h_min;
         let admit_h_max = engine.params.h_max;
-        // Realize due maintenance fees on both counterparties BEFORE the trade
-        // so margin checks see post-fee capital. No-op when fee rate is 0.
-        if maintenance_fee_per_slot > 0 {
-            engine.sync_account_fee_to_slot_not_atomic(a, now_slot, maintenance_fee_per_slot)?;
-            engine.sync_account_fee_to_slot_not_atomic(b, now_slot, maintenance_fee_per_slot)?;
-        }
         let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
         engine.execute_trade_not_atomic(
             a,
@@ -4041,11 +4879,43 @@ pub mod processor {
         Ok(())
     }
 
+    #[inline]
+    fn idx_within_market_capacity(engine: &RiskEngine, idx: usize) -> bool {
+        crate::policy::market_idx_within_capacity(idx, engine.params.max_accounts)
+    }
+
+    #[inline]
+    fn idx_used_in_market(engine: &RiskEngine, idx: usize) -> bool {
+        idx_within_market_capacity(engine, idx) && engine_is_used(engine, idx)
+    }
+
     fn check_idx(engine: &RiskEngine, idx: u16) -> Result<(), ProgramError> {
-        if (idx as usize) >= MAX_ACCOUNTS || !engine.is_used(idx as usize) {
+        if !idx_used_in_market(engine, idx as usize) {
             return Err(PercolatorError::EngineAccountNotFound.into());
         }
         Ok(())
+    }
+
+    fn set_wrapper_owner(
+        engine: &mut RiskEngine,
+        idx: u16,
+        owner: [u8; 32],
+    ) -> Result<(), ProgramError> {
+        check_idx(engine, idx)?;
+        if owner == [0u8; 32] || engine.accounts[idx as usize].owner != [0u8; 32] {
+            return Err(PercolatorError::EngineUnauthorized.into());
+        }
+        engine.accounts[idx as usize].owner = owner;
+        Ok(())
+    }
+
+    #[inline]
+    fn insurance_withdraw_deposits_only(config: &MarketConfig) -> Result<bool, ProgramError> {
+        match config.insurance_withdraw_deposits_only {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(PercolatorError::InvalidConfigParam.into()),
+        }
     }
 
     fn verify_vault(
@@ -4244,7 +5114,10 @@ pub mod processor {
                     // legitimate rug-proofing configuration).
                     let (resolved, has_accounts) = {
                         let engine = zc::engine_ref(&data)?;
-                        (engine.is_resolved(), engine.num_used_accounts > 0)
+                        (
+                            engine.market_mode == percolator::MarketMode::Resolved,
+                            engine.num_used_accounts > 0,
+                        )
                     };
                     if !resolved {
                         if config.permissionless_resolve_stale_slots == 0
@@ -4388,8 +5261,13 @@ pub mod processor {
                 if invert > 1 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // conf_filter_bps: 0..=10_000 (0 = disabled, 10_000 = 100%)
-                if conf_filter_bps > 10_000 {
+                // Confidence filter: require a nonzero, operationally sane
+                // range. Disabling confidence checks is too sharp for public
+                // deployments; wide confidence bands are equivalent to
+                // accepting a low-quality oracle.
+                if conf_filter_bps < crate::constants::MIN_CONF_FILTER_BPS
+                    || conf_filter_bps > crate::constants::MAX_CONF_FILTER_BPS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Validate unit_scale: reject huge values that make most deposits credit 0 units
@@ -4406,13 +5284,19 @@ pub mod processor {
                 if risk_params.initial_margin_bps < risk_params.maintenance_margin_bps {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                // Public live markets must have a nonzero warmup floor.
-                // A stress threshold is additive; it is not a substitute
-                // for h_min on untrusted oracle/execution PnL.
-                if risk_params.h_min == 0 || risk_params.h_max < risk_params.h_min {
+                if risk_params.h_max == 0
+                    || risk_params.h_max < risk_params.h_min
+                    || risk_params.h_max > crate::constants::MAX_PROFIT_MATURITY_SLOTS
+                {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
-                // insurance_withdraw_max_bps is a percentage (0..=10_000)
+                let insurance_withdraw_deposits_only = (insurance_withdraw_max_bps
+                    & crate::constants::INSURANCE_WITHDRAW_DEPOSITS_ONLY_FLAG)
+                    != 0;
+                let insurance_withdraw_max_bps =
+                    insurance_withdraw_max_bps & crate::constants::INSURANCE_WITHDRAW_MAX_BPS_MASK;
+                // insurance_withdraw_max_bps is a percentage (0..=10_000);
+                // the top wire bit is reserved for deposit-only mode.
                 if insurance_withdraw_max_bps > 10_000 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -4422,11 +5306,12 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // max_staleness_secs: reject 0 (would brick oracle reads —
-                // any non-zero age > 0 fails the staleness check).
-                // max_staleness_secs: reject 0 and unreasonable values.
-                // 0 would brick oracle reads. >7 days is clearly misconfigured.
-                if max_staleness_secs == 0 || max_staleness_secs > 7 * 86400 {
+                // max_staleness_secs: reject 0 (would brick oracle reads) and
+                // reject long stale windows that make oracle liveness a
+                // deployer-controlled footgun.
+                if max_staleness_secs == 0
+                    || max_staleness_secs > crate::constants::MAX_ORACLE_STALENESS_SECS
+                {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
@@ -4469,10 +5354,9 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
-                // Per-slot price-move cap and exact solvency envelope are
-                // decoded and prevalidated by read_risk_params. InitMarket
-                // returns a ProgramError on bad config; it must not rely on
-                // an engine-side panic for public input validation.
+                // Cheap wrapper policy checks happen here; exact RiskParams
+                // validation is left to engine.init_in_place so InitMarket
+                // does not run the heavy envelope verifier twice.
                 // Liveness: if permissionless resolution is enabled, force_close must
                 // also be enabled. Otherwise abandoned accounts on resolved markets
                 // with burned admin have no cleanup path.
@@ -4496,24 +5380,24 @@ pub mod processor {
                 // no account can act on stale capital. New accounts are never
                 // back-charged (engine Goal 47: last_fee_slot seeded at
                 // materialization).
-                // §14.1: H_max must not exceed permissionless resolve delay.
-                // Otherwise warmup cohorts could mature after the market is already
-                // permissionlessly resolved, creating inconsistent terminal state.
-                if permissionless_resolve_stale_slots > 0
-                    && risk_params.h_max > permissionless_resolve_stale_slots
-                {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // §12.19.6: permissionless resolution must fire within a
-                // single accrue envelope, else the last accrue on the
-                // market would exceed `max_accrual_dt_slots` and starve
-                // permissionless resolve (callers would have to run
-                // CatchupAccrue first, which is an admin/keeper path).
-                // This invariant is the opt-in gate: markets that don't
-                // enable permissionless resolve pass trivially (perm==0).
-                if permissionless_resolve_stale_slots > 0
-                    && permissionless_resolve_stale_slots > risk_params.max_accrual_dt_slots
-                {
+                // Permissionless resolution has an independent product
+                // horizon. It is intentionally NOT capped by
+                // max_accrual_dt_slots: dead-oracle settlement uses the
+                // engine's Degenerate path at P_last/rate=0, while live
+                // markets use KeeperCrank for explicit bounded progress.
+                //
+                // See:
+                //   - constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS
+                //   - policy::permissionless_resolve_horizon_ok
+                //   - kani_permissionless_resolve_horizon_policy_independent_from_accrual_window
+                //   - test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt
+                //
+                // These explicitly cover the reviewer question "why not
+                // <= MAX_ACCRUAL_DT_SLOTS?" The answer is that Resolve
+                // Permissionless does not accrue the dead interval.
+                if !crate::policy::permissionless_resolve_horizon_ok(
+                    permissionless_resolve_stale_slots,
+                ) {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
 
@@ -4682,7 +5566,10 @@ pub mod processor {
                     {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    if p.h_min == 0 || p.h_max < p.h_min {
+                    if p.h_max == 0
+                        || p.h_max < p.h_min
+                        || p.h_max > crate::constants::MAX_PROFIT_MATURITY_SLOTS
+                    {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     // Settlement deviation band: 0 <= bps <= MAX per spec
@@ -4742,7 +5629,8 @@ pub mod processor {
                     // Insurance withdrawal limits (immutable after init)
                     insurance_withdraw_max_bps,
                     tvl_insurance_cap_mult: 0, // disabled at init; admin opts in via UpdateConfig
-                    _iw_padding: [0u8; 4],
+                    insurance_withdraw_deposits_only: insurance_withdraw_deposits_only as u8,
+                    _iw_padding: [0u8; 3],
                     insurance_withdraw_cooldown_slots,
                     oracle_target_price_e6: init_price,
                     oracle_target_publish_time: init_publish_time,
@@ -4751,7 +5639,7 @@ pub mod processor {
                     // Non-Hyperp: 0 (no mark push concept).
                     last_mark_push_slot: if is_hyperp { clock.slot as u128 } else { 0 },
                     last_insurance_withdraw_slot: 0,
-                    _pad_obsolete_stale_slot: 0,
+                    insurance_withdraw_deposit_remaining: 0,
                     // Mark EWMA: Hyperp bootstraps from initial mark, non-Hyperp from first trade
                     mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                     mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
@@ -4830,7 +5718,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block new users when market is resolved
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 let config = state::read_config(&data);
@@ -4927,9 +5815,7 @@ pub mod processor {
                 engine
                     .deposit_not_atomic(idx, capital_units as u128, clock.slot)
                     .map_err(map_risk_error)?;
-                engine
-                    .set_owner(idx, a_user.key.to_bytes())
-                    .map_err(map_risk_error)?;
+                set_wrapper_owner(engine, idx, a_user.key.to_bytes())?;
                 if fee_units > 0 {
                     engine
                         .top_up_insurance_fund(fee_units as u128, clock.slot)
@@ -4959,13 +5845,16 @@ pub mod processor {
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
+                if matcher_program == Pubkey::default() || matcher_context == Pubkey::default() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
                 // Block new LPs when market is resolved
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5049,9 +5938,7 @@ pub mod processor {
                 engine
                     .deposit_not_atomic(idx, capital_units as u128, clock.slot)
                     .map_err(map_risk_error)?;
-                engine
-                    .set_owner(idx, a_user.key.to_bytes())
-                    .map_err(map_risk_error)?;
+                set_wrapper_owner(engine, idx, a_user.key.to_bytes())?;
                 engine.accounts[idx as usize].kind = percolator::Account::KIND_LP;
                 engine.accounts[idx as usize].matcher_program = matcher_program.to_bytes();
                 engine.accounts[idx as usize].matcher_context = matcher_context.to_bytes();
@@ -5085,7 +5972,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block deposits when market is resolved
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5224,7 +6111,7 @@ pub mod processor {
                 // Block withdrawals on resolved markets.
                 // The engine's withdraw_not_atomic requires MarketMode::Live.
                 // After resolution, users exit via CloseAccount / ForceCloseResolved.
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5280,15 +6167,14 @@ pub mod processor {
                 let withdraw_slot = clock.slot;
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Fully accrue the market to clock.slot BEFORE syncing fees.
-                // Explicit ordering — the engine already handles this via
-                // withdraw_not_atomic's internal accrue (which uses
-                // last_market_slot, not current_slot, for dt), but making
-                // the accrue→sync→op order explicit in the wrapper removes
-                // all ambiguity and aligns with the auditor-requested
-                // pattern. The main op's internal accrue then no-ops
-                // (same slot + same price, engine §5.4 early return).
-                ensure_market_accrued_to_now_with_policy(
+                // Withdraw is account-limited: it only touches this user, so
+                // it must not become a hidden market-progress path while
+                // unrelated OI is exposed. If price/funding progress is
+                // equity-active, KeeperCrank must do the account-touching
+                // cascade first. When the strict gate allows progress, accrue
+                // first, then make this account authoritative and fee-current
+                // before the withdrawal health check.
+                ensure_market_accrued_to_now_for_account_limited_op(
                     engine,
                     &config,
                     clock.slot,
@@ -5296,9 +6182,17 @@ pub mod processor {
                     funding_rate_e9,
                 )?;
                 reject_any_target_lag(&config, engine)?;
-                // Realize due maintenance fees BEFORE the withdrawal margin
-                // check, so the account can't withdraw against pre-fee capital.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                settle_account_then_sync_fee_current(
+                    engine,
+                    &config,
+                    user_idx,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                    admit_h_min,
+                    admit_h_max,
+                    Some(engine.params.maintenance_margin_bps as u128),
+                )?;
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
                 engine
                     .withdraw_not_atomic(
@@ -5368,16 +6262,16 @@ pub mod processor {
                 // This is intentional: settlement is idempotent and no funds move.
                 // All resolved operations use engine.current_slot (frozen at
                 // last pre-resolution crank) instead of clock.slot.
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     let engine = zc::engine_mut(&mut data)?;
-                    let (resolved_price, _) = engine.resolved_context();
+                    let (resolved_price, _) = engine_resolved_context(engine);
                     if resolved_price == 0 {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
                     // Resolved crank: no per-account settlement here.
                     // Accounts are settled by ForceCloseResolved / CloseAccount
-                    // which call force_close_resolved_not_atomic atomically.
+                    // through the fee-aware resolved close API.
                     // The resolved crank only handles lifecycle.
 
                     // Resolved markets are frozen: no K/F mutation, no per-account
@@ -5389,7 +6283,8 @@ pub mod processor {
                     return Ok(());
                 }
 
-                let mut config = state::read_config(&data);
+                let config_pre_read = state::read_config(&data);
+                let mut config = config_pre_read;
 
                 let clock = Clock::from_account_info(a_clock)?;
 
@@ -5433,9 +6328,6 @@ pub mod processor {
                     )?
                 };
 
-                state::write_config(&mut data, &config);
-                // FLAG_ORACLE_INITIALIZED now set inside read_price_and_stamp/get_engine_oracle_price_e6
-
                 // Read risk buffer BEFORE engine borrow (disjoint regions,
                 // but borrow checker can't see that).
                 let buf = state::read_risk_buffer(&data);
@@ -5460,20 +6352,53 @@ pub mod processor {
                 let mut combined =
                     alloc::vec::Vec::with_capacity(buf.count as usize + candidates.len());
                 for i in 0..buf.count as usize {
-                    combined.push((
-                        buf.entries[i].idx,
-                        Some(percolator::LiquidationPolicy::FullClose),
-                    ));
+                    let risk_idx = buf.entries[i].idx;
+                    let risk_eff_abs = if idx_used_in_market(engine, risk_idx as usize) {
+                        effective_pos_q_checked(engine, risk_idx as usize)?.unsigned_abs()
+                    } else {
+                        0
+                    };
+                    for &(cidx, policy) in candidates.iter() {
+                        let q_close_q = match policy {
+                            Some(percolator::LiquidationPolicy::ExactPartial(q)) => q,
+                            _ => continue,
+                        };
+                        if cidx != risk_idx || q_close_q == 0 || q_close_q >= risk_eff_abs {
+                            continue;
+                        }
+                        // Preserve one keeper-supplied partial-liquidation
+                        // opportunity for cached high-risk accounts, but keep
+                        // the risk-buffer FullClose immediately behind it as
+                        // a fallback. Invalid local bounds are skipped here so
+                        // repeated malformed hints cannot consume the engine's
+                        // phase-1 attempt budget before the fallback.
+                        combined.push((cidx, policy));
+                        break;
+                    }
+                    combined.push((risk_idx, Some(percolator::LiquidationPolicy::FullClose)));
                 }
-                combined.extend_from_slice(&candidates);
+                for &(cidx, policy) in candidates.iter() {
+                    let mut already_promoted = false;
+                    if matches!(policy, Some(percolator::LiquidationPolicy::ExactPartial(_))) {
+                        for i in 0..buf.count as usize {
+                            if buf.entries[i].idx == cidx {
+                                already_promoted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !already_promoted {
+                        combined.push((cidx, policy));
+                    }
+                }
                 // Defense-in-depth cap: the decode-time check already
                 // bounds candidates, but truncating `combined` here as
                 // well ensures the engine's scan is bounded even if the
                 // decode cap is loosened in the future or an insider
                 // path ever constructs `combined` differently. Cap:
-                // 4 (risk buffer max) + 2 × LIQ_BUDGET_PER_CRANK.
+                // risk buffer max + the decoded candidate cap.
                 const COMBINED_CAP: usize =
-                    4 + (crate::constants::LIQ_BUDGET_PER_CRANK as usize) * 2;
+                    crate::constants::RISK_BUF_CAP + crate::constants::MAX_KEEPER_CANDIDATES;
                 if combined.len() > COMBINED_CAP {
                     combined.truncate(COMBINED_CAP);
                 }
@@ -5487,14 +6412,16 @@ pub mod processor {
                 //   - New accounts joining mid-interval — seeded at the
                 //     materialization slot, so no back-charge (Goal 47).
                 //   - Self-acting accounts — realize fees in their own
-                //     instruction (via sync_account_fee below); KeeperCrank
-                //     re-visiting them is a no-op at the same anchor.
+                //     instruction after engine local touch; KeeperCrank
+                //     re-visiting flat/current accounts is a no-op at the
+                //     same anchor.
                 //   - Shortfalls — routed through charge_fee_to_insurance as
                 //     fee-credits debt; never fails with InsufficientBalance.
                 //
-                // Ordering: sweep BEFORE keeper_crank_not_atomic so the crank's
-                // lifecycle (side-mode drain detection / resets / health
-                // reconciliation) observes fee-induced state.
+                // Ordering: keeper_crank_not_atomic first, then candidate fee
+                // syncs and the bitmap sweep. That keeps recurring fees junior
+                // to lazy mark/funding losses discovered by the authoritative
+                // touch while retaining a bounded post-crank fee pass.
                 //
                 // Crank reward: pay CRANK_REWARD_BPS (50 %) of the maintenance-
                 // fee sweep delta back to the non-permissionless caller as
@@ -5503,8 +6430,8 @@ pub mod processor {
                 // FEE_SWEEP_BUDGET accounts per crank, and each contribution
                 // is `fee_per_slot × dt_that_account_owed`). Trading,
                 // liquidation, and resolution fees are NOT shared with the
-                // cranker — sweep_delta is captured BEFORE keeper_crank_not_atomic
-                // so those fees don't inflate the reward.
+                // cranker — sweep_delta is measured only around the post-crank
+                // bitmap sweep, not around liquidation or candidate fees.
                 //
                 // Reward is paid AFTER keeper_crank_not_atomic. Paying it
                 // before would let a borderline caller self-rescue: the capital
@@ -5513,163 +6440,146 @@ pub mod processor {
                 // after leaves the crank's risk decisions on pre-reward state,
                 // and a caller who got liquidated inside the crank (slot no
                 // longer used) simply doesn't collect the reward.
-                // Fully accrue market to clock.slot BEFORE sweeping fees.
-                // Explicit ordering so sweep_maintenance_fees + keeper_crank
-                // run on a fully-accrued market. keeper_crank_not_atomic's
-                // internal accrue then no-ops on dt=0+same-price.
-                ensure_market_accrued_to_now_with_policy(
-                    engine,
-                    &config,
-                    clock.slot,
-                    price,
-                    funding_rate_e9_pre,
-                )?;
-
-                // Shared per-instruction fee-sync budget (audit #2).
-                // Candidate syncs run FIRST so the engine's crank sees
-                // post-fee equity for health checks. The sweep then
-                // runs with the REMAINING budget, so the worst-case
-                // total syncs per instruction is capped at
-                // FEE_SWEEP_BUDGET (not FEE_SWEEP_BUDGET +
-                // LIQ_BUDGET_PER_CRANK as it was previously). This
-                // keeps the crank's CU usage bounded by the stated
-                // envelope even when a full candidate list is paired
-                // with a full sweep.
-                //
-                // Ordering: candidates first, then sweep with
-                // remaining budget, then crank. Sweep-delta (keeper
-                // reward) is computed from balance BEFORE the sweep
-                // only, so candidate syncs don't inflate the reward.
-                //
-                // Budget accounting MUST MIRROR keeper_crank_not_atomic's:
-                // invalid / out-of-range / unused entries are SKIPPED
-                // without consuming the attempts budget (engine §10.6).
-                // If we instead capped by array position (min(cap)), an
-                // attacker could pad the front of `combined` with 64
-                // invalid indices so the real target at position 65 is
-                // never fee-synced — but the engine's crank would still
-                // skip the invalid entries and reach the target, running
-                // its health check on stale fee debt. The loop below
-                // counts `attempts` exactly like the engine: valid
-                // existing candidates consume budget; others don't.
-                //
-                // Dedup is also mirrored: the engine treats duplicates as
-                // separate attempts (it re-processes the same idx twice
-                // on consecutive entries, which is idempotent at the same
-                // anchor). The wrapper skips duplicate SYNC calls purely
-                // to save CU — dedup is within the loop, not the budget.
-                // Capture the pre-fee-collection insurance balance so the
-                // reward base reflects EVERY fee this crank swept in —
-                // candidate-directed syncs AND the bitmap sweep. Earlier
-                // revisions captured `ins_before` between the two phases,
-                // which silently dropped the reward to zero whenever the
-                // risk buffer auto-populated `combined` (i.e. on every
-                // crank after the first live crank). Including both
-                // phases is safe: `sync_account_fee_to_slot_not_atomic`
-                // is idempotent at same-slot and the shared FEE_SWEEP
-                // _BUDGET still caps total syncs, so a caller cannot
-                // inflate the reward by stuffing candidates — duplicates
-                // are dedup'd, already-synced accounts are no-ops, and
-                // unused slots are skipped before consuming budget.
-                let ins_before = engine.insurance_fund.balance.get();
-                let mut candidate_syncs = 0usize;
-                if config.maintenance_fee_per_slot > 0 {
-                    // Candidate syncs share the FEE_SWEEP_BUDGET with
-                    // the maintenance sweep below. Hard-cap at
-                    // min(LIQ_BUDGET_PER_CRANK, FEE_SWEEP_BUDGET) so
-                    // that (a) the engine's per-crank liquidation
-                    // attempts cap is respected, and (b) candidate
-                    // syncs ALONE can never exceed the total fee-sync
-                    // budget — no matter how the two engine constants
-                    // relate, the total syncs per instruction is
-                    // bounded by FEE_SWEEP_BUDGET.
-                    let cap = core::cmp::min(
-                        crate::constants::LIQ_BUDGET_PER_CRANK as usize,
-                        crate::constants::FEE_SWEEP_BUDGET,
-                    );
-                    let mut synced: [u16; crate::constants::LIQ_BUDGET_PER_CRANK as usize] =
-                        [u16::MAX; crate::constants::LIQ_BUDGET_PER_CRANK as usize];
-                    let mut synced_count = 0usize;
-                    let mut attempts = 0usize;
-                    for &(idx, _policy) in combined.iter() {
-                        if attempts >= cap {
-                            break;
-                        }
-                        // Defense-in-depth: also bail if we're already
-                        // at the shared budget. The attempts cap above
-                        // subsumes this under today's constants, but
-                        // keeps the bound mechanical if either
-                        // constant changes.
-                        if candidate_syncs >= crate::constants::FEE_SWEEP_BUDGET {
-                            break;
-                        }
-                        let i = idx as usize;
-                        if i >= percolator::MAX_ACCOUNTS {
-                            continue;
-                        }
-                        if !engine.is_used(i) {
-                            continue;
-                        }
-                        attempts += 1;
-                        let mut already = false;
-                        for j in 0..synced_count {
-                            if synced[j] == idx {
-                                already = true;
-                                break;
-                            }
-                        }
-                        if already {
-                            continue;
-                        }
-                        engine
-                            .sync_account_fee_to_slot_not_atomic(
-                                idx,
-                                clock.slot,
-                                config.maintenance_fee_per_slot,
-                            )
-                            .map_err(map_risk_error)?;
-                        synced[synced_count] = idx;
-                        synced_count += 1;
-                        candidate_syncs += 1;
-                    }
-                }
-
-                let remaining_budget =
-                    crate::constants::FEE_SWEEP_BUDGET.saturating_sub(candidate_syncs);
-                sweep_maintenance_fees(engine, &mut config, clock.slot, remaining_budget)?;
-                let sweep_delta = engine
-                    .insurance_fund
-                    .balance
-                    .get()
-                    .saturating_sub(ins_before);
+                // Fully accrue market to clock.slot when the full gap fits.
+                // If the market is farther behind, the latest engine advances
+                // exactly one bounded segment toward the raw target while
+                // retaining clock.slot as the authenticated public time.
+                let raw_target = if oracle::is_hyperp_mode(&config) {
+                    hyperp_target_price(&config)
+                } else {
+                    config.oracle_target_price_e6
+                };
+                let partial_target =
+                    oversized_catchup_target(engine, clock.slot, raw_target, funding_rate_e9_pre)?;
+                let (crank_slot, crank_price, partial_catchup, rr_window_size, rr_scan_limit) =
+                    if partial_target.is_some() {
+                        let rr_window_size = if candidates.is_empty() {
+                            crate::constants::RR_WINDOW_PER_CRANK
+                        } else {
+                            crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK
+                        };
+                        let rr_scan_limit = core::cmp::min(
+                            crate::constants::RR_SCAN_LIMIT_PER_CRANK,
+                            engine.params.max_accounts,
+                        );
+                        (clock.slot, price, true, rr_window_size, rr_scan_limit)
+                    } else {
+                        let rr_window_size = if candidates.is_empty() {
+                            crate::constants::RR_WINDOW_PER_CRANK
+                        } else {
+                            crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK
+                        };
+                        let rr_scan_limit = core::cmp::min(
+                            crate::constants::RR_SCAN_LIMIT_PER_CRANK,
+                            engine.params.max_accounts,
+                        );
+                        (clock.slot, price, false, rr_window_size, rr_scan_limit)
+                    };
 
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
-                let _outcome = engine
-                    .keeper_crank_not_atomic(
-                        clock.slot,
-                        price,
-                        &combined,
-                        crate::constants::LIQ_BUDGET_PER_CRANK,
-                        funding_rate_e9_pre,
+                let bounded_engine_candidates;
+                let engine_candidates: &[(u16, Option<percolator::LiquidationPolicy>)] =
+                    if partial_catchup {
+                        bounded_engine_candidates = combined
+                            .iter()
+                            .map(|&(idx, _policy)| (idx, None))
+                            .collect::<alloc::vec::Vec<_>>();
+                        &bounded_engine_candidates
+                    } else {
+                        bounded_engine_candidates = combined
+                            .iter()
+                            .map(|&(idx, policy)| (idx, policy))
+                            .collect::<alloc::vec::Vec<_>>();
+                        &bounded_engine_candidates
+                    };
+                let progress_outcome = engine
+                    .permissionless_progress_not_atomic(percolator::PermissionlessProgressRequest {
+                        now_slot: crank_slot,
+                        oracle_price: crank_price,
+                        authenticated_raw_target_price: raw_target,
+                        ordered_candidates: engine_candidates,
+                        // Account-B recovery is explicitly caller-directed:
+                        // the engine validates the hint before resolving, so
+                        // prefer the caller's first candidate over risk-buffer
+                        // entries prepended by the wrapper. Otherwise a stale
+                        // risk-buffer head could starve an honest cranker from
+                        // routing the true blocking account into the
+                        // account-specific recovery branch.
+                        account_hint: candidates
+                            .first()
+                            .map(|(idx, _)| *idx)
+                            .or_else(|| combined.first().map(|(idx, _)| *idx)),
+                        max_revalidations: crate::constants::LIQ_BUDGET_PER_CRANK,
+                        max_candidate_inspections: keeper_candidate_inspection_cap(),
+                        funding_rate_e9: funding_rate_e9_pre,
                         admit_h_min,
                         admit_h_max,
-                        admit_threshold,
-                        crate::constants::RR_WINDOW_PER_CRANK,
-                    )
+                        admit_h_max_consumption_threshold_bps_opt: admit_threshold,
+                        rr_touch_limit: rr_window_size,
+                        rr_scan_limit,
+                        // KeeperCrank keeps the legacy resolved no-op branch
+                        // above because the wrapper cannot transfer resolved
+                        // payouts from this account list. These fields are
+                        // therefore unused in normal wrapper dispatch, but are
+                        // populated defensively for the engine request shape.
+                        resolved_scan_limit: 1,
+                        resolved_fee_rate_per_slot: config.maintenance_fee_per_slot,
+                    })
                     .map_err(map_risk_error)?;
+                let progress_was_crank = matches!(
+                    progress_outcome,
+                    percolator::PermissionlessProgressOutcome::Cranked(_)
+                );
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_end");
                     sol_log_compute_units();
                 }
 
+                // Fee realization runs after authoritative keeper touch/loss
+                // settlement so recurring fees cannot become senior to lazy
+                // mark/funding losses. Candidate syncs are bounded and not
+                // rewardable; the reward delta is measured only over the
+                // bitmap sweep that follows them.
+                let sweep_delta = if !progress_was_crank || partial_catchup {
+                    // The market remains loss-stale. Do not charge recurring
+                    // fees until a later crank makes the market loss-current;
+                    // fee sync would otherwise be senior to the remaining
+                    // unapplied historical loss segment.
+                    0
+                } else {
+                    let candidate_syncs = sync_keeper_candidate_fees_after_crank(
+                        engine,
+                        &combined,
+                        crank_slot,
+                        config.maintenance_fee_per_slot,
+                    )?;
+                    let ins_before_reward_sweep = engine.insurance_fund.balance.get();
+                    let remaining_budget = if candidates.is_empty() {
+                        crate::constants::FEE_SWEEP_BUDGET.saturating_sub(candidate_syncs)
+                    } else {
+                        // Candidate-bearing cranks already spend their fixed
+                        // CU envelope on Phase 1 settlement/liquidation and
+                        // post-touch candidate fee sync. Empty cranks own the
+                        // bitmap fee sweep so candidate padding cannot push a
+                        // max-risk liquidation progress unit over the SVM cap.
+                        0
+                    };
+                    sweep_maintenance_fees(engine, &mut config, crank_slot, remaining_budget)?;
+                    engine
+                        .insurance_fund
+                        .balance
+                        .get()
+                        .saturating_sub(ins_before_reward_sweep)
+                };
+
                 // Pay the crank reward AFTER keeper_crank_not_atomic has run
-                // all liquidation / lifecycle logic. The sweep_delta was
-                // captured pre-crank, so the reward is bounded only by the
-                // maintenance-fee collection on this call, not by incidental
-                // insurance growth from liquidation fees.
+                // all liquidation / lifecycle logic. The sweep_delta is
+                // captured around the post-crank sweep, so the reward is
+                // bounded only by the maintenance-fee collection on this call,
+                // not by incidental insurance growth from liquidation fees.
                 //
                 // Skip conditions:
                 //   - permissionless caller (no account to credit)
@@ -5680,7 +6590,7 @@ pub mod processor {
                 if !permissionless
                     && config.maintenance_fee_per_slot > 0
                     && sweep_delta > 0
-                    && engine.is_used(caller_idx as usize)
+                    && idx_used_in_market(engine, caller_idx as usize)
                 {
                     // 50 / 50 split: half to caller, half stays in insurance.
                     let mut reward =
@@ -5693,7 +6603,7 @@ pub mod processor {
                     if reward > 0 {
                         engine
                             .credit_account_from_insurance_not_atomic(
-                                caller_idx, reward, clock.slot,
+                                caller_idx, reward, crank_slot,
                             )
                             .map_err(map_risk_error)?;
                     }
@@ -5713,13 +6623,32 @@ pub mod processor {
                     }
                 }
 
+                // Public ReclaimEmptyAccount is retired. Keepers that want
+                // targeted empty-account cleanup submit the account as a
+                // touch-only candidate; after the engine's account-touching
+                // crank has settled local state, reclaim flat zero-capital
+                // candidates here. Ineligible candidates are ignored, matching
+                // the crank's untrusted-shortlist semantics.
+                if progress_was_crank {
+                    for &(idx, _) in combined.iter() {
+                        reclaim_flat_zero_account_if_eligible(engine, idx, crank_slot)?;
+                    }
+                }
+
                 // Copy stats and drop engine mutable borrow.
                 // Use the actual crank outcome so observability/telemetry
                 // reflects real liquidations, not a hard-coded zero.
                 #[cfg(feature = "cu-audit")]
-                let liqs = _outcome.num_liquidations as u64;
+                let liqs = match progress_outcome {
+                    percolator::PermissionlessProgressOutcome::Cranked(outcome) => {
+                        outcome.num_liquidations as u64
+                    }
+                    _ => 0,
+                };
                 #[cfg(feature = "cu-audit")]
                 let ins_low = engine.insurance_fund.balance.get() as u64;
+                let engine_resolved_after_progress =
+                    engine.market_mode == percolator::MarketMode::Resolved;
 
                 // Engine has now processed a real oracle price via accrue_market_to.
                 // engine.last_oracle_price is no longer the init sentinel.
@@ -5727,13 +6656,24 @@ pub mod processor {
                     state::set_oracle_initialized(&mut data);
                 }
 
-                // Write updated config (fee charge slot may have changed)
-                state::write_config(&mut data, &config);
+                // Write updated config. On partial catchup, preserve the
+                // oracle target/liveness and fee cursor, but roll back
+                // effective/index fields that correspond to the wall-clock
+                // observation the engine has not reached yet.
+                let config_to_write = if partial_catchup && !engine_resolved_after_progress {
+                    partial_crank_config_to_write(config_pre_read, config)
+                } else {
+                    config
+                };
+                state::write_config(&mut data, &config_to_write);
 
                 // ── RiskBuffer maintenance (engine borrow dropped) ──
                 {
                     let mut buf = state::read_risk_buffer(&data);
                     let engine = zc::engine_ref(&data)?;
+                    if engine.market_mode == percolator::MarketMode::Resolved {
+                        return Ok(());
+                    }
 
                     // Phase A: scrub dead entries
                     for i in (0..4usize).rev() {
@@ -5741,27 +6681,37 @@ pub mod processor {
                             continue;
                         }
                         let eidx = buf.entries[i].idx as usize;
-                        if !engine.is_used(eidx) || effective_pos_q_checked(engine, eidx)? == 0 {
+                        if !idx_used_in_market(engine, eidx)
+                            || effective_pos_q_checked(engine, eidx)? == 0
+                        {
                             buf.remove(buf.entries[i].idx);
                         }
+                    }
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: risk_buffer_phase_a_end");
+                        sol_log_compute_units();
                     }
 
                     // Phase B: refresh surviving entries
                     for i in 0..buf.count as usize {
                         let eidx = buf.entries[i].idx as usize;
                         let eff = effective_pos_q_checked(engine, eidx)?;
-                        let notional = risk_notional_ceil(eff, price);
+                        let notional = risk_notional_ceil(eff, crank_price);
                         buf.entries[i].notional = notional;
                     }
                     buf.recompute_min();
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: risk_buffer_phase_b_end");
+                        sol_log_compute_units();
+                    }
 
-                    // Phase C: progressive discovery scan.
-                    // Wrap on the MARKET's configured capacity (params.max_accounts),
-                    // not the compile-time MAX_ACCOUNTS. Otherwise a small market
-                    // (e.g. max_accounts=64) wastes cranks walking slots 64..4095
-                    // that by construction can never be in use — the risk buffer
-                    // would take thousands of cranks to rediscover a newly-risky
-                    // low-indexed account after the cursor passed it.
+                    // Phase C: progressive discovery scan over the used-account
+                    // bitmap. The budget is spent on live slots, not empty
+                    // storage indices; sparse markets can therefore refill the
+                    // risk buffer in one crank instead of waiting for a dense
+                    // cursor window to walk across empty slots.
                     let scan_mod = engine.params.max_accounts as usize;
                     let scan_mod = if scan_mod == 0 || scan_mod > percolator::MAX_ACCOUNTS {
                         percolator::MAX_ACCOUNTS
@@ -5769,43 +6719,117 @@ pub mod processor {
                         scan_mod
                     };
                     let scan_start = (buf.scan_cursor as usize) % scan_mod;
-                    for offset in 0..crate::constants::RISK_SCAN_WINDOW {
-                        let idx = (scan_start + offset) % scan_mod;
-                        if !engine.is_used(idx) {
+                    let mut used_seen = 0usize;
+                    let mut next_cursor = scan_start;
+                    let mut completed_cycle = true;
+
+                    'scan: for pass in 0..2usize {
+                        let (range_start, range_end) = if pass == 0 {
+                            (scan_start, scan_mod)
+                        } else {
+                            (0usize, scan_start)
+                        };
+                        if range_start >= range_end {
                             continue;
                         }
-                        let eff = effective_pos_q_checked(engine, idx)?;
-                        if eff == 0 {
-                            continue;
+
+                        let first_word = range_start >> 6;
+                        let last_word = (range_end - 1) >> 6;
+                        let mut word_cursor = first_word;
+                        while word_cursor <= last_word {
+                            let word_base = word_cursor * 64;
+                            let lower_bit = if word_cursor == first_word {
+                                range_start & 63
+                            } else {
+                                0
+                            };
+                            let upper_bit_exclusive = if word_cursor == last_word {
+                                ((range_end - 1) & 63) + 1
+                            } else {
+                                64
+                            };
+                            let lower_mask = if lower_bit == 0 {
+                                u64::MAX
+                            } else {
+                                !((1u64 << lower_bit).wrapping_sub(1))
+                            };
+                            let upper_mask = if upper_bit_exclusive == 64 {
+                                u64::MAX
+                            } else {
+                                (1u64 << upper_bit_exclusive) - 1
+                            };
+                            let mut bits = engine.used[word_cursor] & lower_mask & upper_mask;
+
+                            while bits != 0 {
+                                let bit = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                let idx = word_base + bit;
+                                if !idx_used_in_market(engine, idx) {
+                                    continue;
+                                }
+                                used_seen += 1;
+                                let eff = effective_pos_q_checked(engine, idx)?;
+                                if eff == 0 {
+                                    buf.remove(idx as u16);
+                                } else {
+                                    let notional = risk_notional_ceil(eff, crank_price);
+                                    buf.upsert(idx as u16, notional);
+                                }
+                                next_cursor = (idx + 1) % scan_mod;
+                                if used_seen >= crate::constants::RISK_SCAN_WINDOW {
+                                    completed_cycle = false;
+                                    break 'scan;
+                                }
+                            }
+
+                            word_cursor += 1;
                         }
-                        let notional = risk_notional_ceil(eff, price);
-                        buf.upsert(idx as u16, notional);
                     }
-                    buf.scan_cursor =
-                        ((scan_start + crate::constants::RISK_SCAN_WINDOW) % scan_mod) as u16;
+                    if completed_cycle {
+                        // Completed a full bitmap cycle before spending the
+                        // used-account budget. Restart from the same point on
+                        // the next crank; every used slot has just been seen.
+                        next_cursor = scan_start;
+                    }
+                    buf.scan_cursor = next_cursor as u16;
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: risk_buffer_phase_c_end");
+                        sol_log_compute_units();
+                    }
 
                     // Phase D: ingest caller-supplied candidates
+                    let mut candidate_ingests = 0usize;
                     for &(cidx, _) in candidates.iter() {
+                        if candidate_ingests >= crate::constants::RISK_SCAN_WINDOW {
+                            break;
+                        }
                         let ci = cidx as usize;
-                        if ci >= percolator::MAX_ACCOUNTS || !engine.is_used(ci) {
+                        if !idx_used_in_market(engine, ci) {
                             continue;
                         }
                         let eff = effective_pos_q_checked(engine, ci)?;
                         if eff == 0 {
                             buf.remove(cidx);
                         } else {
-                            let notional = risk_notional_ceil(eff, price);
+                            let notional = risk_notional_ceil(eff, crank_price);
                             buf.upsert(cidx, notional);
                         }
+                        candidate_ingests += 1;
                     }
 
                     state::write_risk_buffer(&mut data, &buf);
+                    #[cfg(feature = "cu-audit")]
+                    {
+                        msg!("CU_CHECKPOINT: risk_buffer_phase_d_end");
+                        sol_log_compute_units();
+                    }
                 }
 
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CRANK_STATS");
-                    sol_log_64(0xC8A4C, liqs, MAX_ACCOUNTS as u64, ins_low, 0);
+                    sol_log_64(0xC8A4C, liqs, percolator::MAX_ACCOUNTS as u64, ins_low, 0);
                 }
             }
             Instruction::TradeNoCpi {
@@ -5824,13 +6848,16 @@ pub mod processor {
                 if size == 0 || size == i128::MIN {
                     return Err(ProgramError::InvalidInstructionData);
                 }
+                if size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
                 // Block trading when market is resolved
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -5879,10 +6906,10 @@ pub mod processor {
 
                 // Side-mode gating is handled inside engine.execute_trade_not_atomic()
 
-                // Fully accrue market to clock.slot BEFORE execute_trade_with
-                // _matcher, which internally syncs both counterparties' fees
-                // before the trade. Explicit accrue→sync→trade ordering.
-                ensure_market_accrued_to_now_with_policy(
+                // Exposed market progress belongs to KeeperCrank. If this
+                // account-limited trade is allowed to proceed, accrue to
+                // clock.slot before the engine trade touch.
+                ensure_market_accrued_to_now_for_account_limited_op(
                     engine,
                     &config,
                     clock.slot,
@@ -5891,39 +6918,32 @@ pub mod processor {
                 )?;
                 reject_any_target_lag(&config, engine)?;
 
-                // Pre-sync maintenance fees for both counterparties BEFORE
-                // capturing ins_before for the mark-EWMA fee-weight
-                // snapshot. Without this, the `delta = ins_after -
-                // ins_before` used as `fee_paid` would include
-                // maintenance fees collected by execute_trade_with
-                // _matcher's own internal sync — inflating EWMA weight
-                // on a small trade after large maintenance accrual, a
-                // mark-manipulation vector. The internal sync at the
-                // same anchor becomes a no-op on `last_fee_slot`.
-                if config.maintenance_fee_per_slot > 0 {
-                    engine
-                        .sync_account_fee_to_slot_not_atomic(
-                            user_idx,
-                            clock.slot,
-                            config.maintenance_fee_per_slot,
-                        )
-                        .map_err(map_risk_error)?;
-                    engine
-                        .sync_account_fee_to_slot_not_atomic(
-                            lp_idx,
-                            clock.slot,
-                            config.maintenance_fee_per_slot,
-                        )
-                        .map_err(map_risk_error)?;
-                }
+                // Make both counterparties authoritative, then sync recurring
+                // fees before the trade's fee-current margin checks. This
+                // preserves loss-senior ordering while still charging nonflat
+                // current accounts.
+                settle_pair_then_sync_fee_current(
+                    engine,
+                    &config,
+                    user_idx,
+                    lp_idx,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                    engine.params.h_min,
+                    engine.params.h_max,
+                    Some(engine.params.maintenance_margin_bps as u128),
+                )?;
 
-                // Snapshot insurance fund balance for fee-weighted EWMA.
-                // The delta after execute_trade = trading_fees -
-                // losses_absorbed (maintenance fees already synced above).
+                // Snapshot insurance fund balance for fee-weighted EWMA after
+                // recurring fees. The delta after execute_trade is bounded to
+                // trade-fee impact below.
                 // NOTE: If loss absorption occurs during the same trade (spec §5.4),
                 // delta undercounts the actual fee. This is the conservative direction:
                 // mark is stickier during volatile loss-absorption events, never
                 // more manipulable. A future engine API could expose fee_paid directly.
+                let current_fee_paid_cap =
+                    current_trade_fee_paid_cap(size, price, engine.params.trading_fee_bps)?;
                 let ins_before = engine.insurance_fund.balance.get();
 
                 #[cfg(feature = "cu-audit")]
@@ -5931,9 +6951,6 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
                     sol_log_compute_units();
                 }
-                // Pass maintenance_fee_per_slot = 0 so the helper's
-                // internal sync is a no-op — we already pre-synced both
-                // sides just above. Halves fee-sync CU on the hot path.
                 execute_trade_with_matcher(
                     engine,
                     &NoOpMatcher,
@@ -5965,7 +6982,9 @@ pub mod processor {
                     // This is exact: no overestimate from pre-trade capital snapshot.
                     let fee_paid_nocpi = if config.mark_min_fee > 0 {
                         let ins_after = engine.insurance_fund.balance.get();
-                        let delta = ins_after.saturating_sub(ins_before);
+                        let delta = ins_after
+                            .saturating_sub(ins_before)
+                            .min(current_fee_paid_cap);
                         core::cmp::min(delta, u64::MAX as u128) as u64
                     } else {
                         0u64
@@ -6090,6 +7109,9 @@ pub mod processor {
                 let a_matcher_ctx = &accounts[6];
                 let a_lp_pda = &accounts[7];
                 let a_tail = &accounts[8..];
+                if a_tail.len() > MAX_MATCHER_TAIL_ACCOUNTS {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 accounts::expect_signer(a_user)?;
                 // Reject zero-size requests at entry — zero-fill path should only
@@ -6097,6 +7119,12 @@ pub mod processor {
                 // Also reject i128::MIN before oracle/CPI work; it has no positive
                 // counterpart and the engine would reject it later.
                 if size == 0 || size == i128::MIN {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                if size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                if lp_idx == user_idx {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 // Note: a_lp_owner does NOT need to be a signer for TradeCpi.
@@ -6153,7 +7181,7 @@ pub mod processor {
                     require_initialized(&*data)?;
 
                     // Block trading when market is resolved
-                    if zc::engine_ref(&*data)?.is_resolved() {
+                    if zc::engine_ref(&*data)?.market_mode == percolator::MarketMode::Resolved {
                         return Err(ProgramError::InvalidAccountData);
                     }
                     // Reentrancy guard: reject if another CPI is in progress.
@@ -6270,6 +7298,17 @@ pub mod processor {
 
                 if target_lag_after_read(&config, price) {
                     return Err(PercolatorError::CatchupRequired.into());
+                }
+                // Reject before matcher CPI if this trade would be the hidden
+                // progress path for unrelated exposed accounts.
+                {
+                    let data = a_slab.try_borrow_data()?;
+                    reject_account_limited_market_progress(
+                        zc::engine_ref(&*data)?,
+                        clock.slot,
+                        price,
+                        funding_rate_e9_pre,
+                    )?;
                 }
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -6426,6 +7465,12 @@ pub mod processor {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
                     reject_stuck_target_accrual(&config, engine, clock.slot, price)?;
+                    reject_account_limited_market_progress(
+                        engine,
+                        clock.slot,
+                        price,
+                        funding_rate_e9_pre,
+                    )?;
                     // Pre-chunk catch-up so the single accrue_market_to below
                     // sees dt ≤ max_accrual_dt_slots (Finding 3). Use the
                     // pre-read funding rate for catchup chunks (Finding 2).
@@ -6497,10 +7542,10 @@ pub mod processor {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Fully accrue market to clock.slot BEFORE execute_trade
-                    // _with_matcher, which internally syncs both sides' fees
-                    // before the trade. Explicit accrue→sync→trade ordering.
-                    ensure_market_accrued_to_now_with_policy(
+                    // Exposed market progress belongs to KeeperCrank. If this
+                    // account-limited trade is allowed to proceed, accrue to
+                    // clock.slot before the engine trade touch.
+                    ensure_market_accrued_to_now_for_account_limited_op(
                         engine,
                         &config,
                         clock.slot,
@@ -6508,31 +7553,35 @@ pub mod processor {
                         funding_rate_e9_pre,
                     )?;
 
-                    // Pre-sync fees BEFORE the ins_before snapshot to
-                    // prevent maintenance-fee-inflated EWMA weight on
-                    // small trades (see TradeNoCpi for rationale).
-                    if config.maintenance_fee_per_slot > 0 {
-                        engine
-                            .sync_account_fee_to_slot_not_atomic(
-                                user_idx,
-                                clock.slot,
-                                config.maintenance_fee_per_slot,
-                            )
-                            .map_err(map_risk_error)?;
-                        engine
-                            .sync_account_fee_to_slot_not_atomic(
-                                lp_idx,
-                                clock.slot,
-                                config.maintenance_fee_per_slot,
-                            )
-                            .map_err(map_risk_error)?;
-                    }
+                    // Same loss-senior fee-current policy as TradeNoCpi:
+                    // touch/settle both counterparties first, then charge
+                    // recurring fees before the trade's margin checks.
+                    settle_pair_then_sync_fee_current(
+                        engine,
+                        &config,
+                        user_idx,
+                        lp_idx,
+                        clock.slot,
+                        price,
+                        funding_rate_e9_pre,
+                        engine.params.h_min,
+                        engine.params.h_max,
+                        Some(engine.params.maintenance_margin_bps as u128),
+                    )?;
 
                     let trade_size = crate::policy::cpi_trade_size(ret.exec_size, size);
+                    if trade_size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let current_fee_paid_cap = current_trade_fee_paid_cap(
+                        trade_size,
+                        exec_price,
+                        engine.params.trading_fee_bps,
+                    )?;
 
                     // Snapshot insurance for fee-weighted EWMA (delta approach).
-                    // delta now captures ONLY trading_fees - losses_absorbed
-                    // (maintenance fees already synced above).
+                    // Recurring fees were synced before this snapshot; the
+                    // delta below is bounded to trade-fee impact.
                     // NOTE: Conservative undercount during volatile
                     // loss-absorption events (see TradeNoCpi comment).
                     let ins_before_cpi = engine.insurance_fund.balance.get();
@@ -6547,10 +7596,6 @@ pub mod processor {
                         exec_size: trade_size,
                     };
                     // Use pre-oracle-read funding rate (anti-retroactivity §5.5).
-                    // Pass maintenance_fee_per_slot = 0 so the helper's
-                    // internal sync is a no-op — we already pre-synced
-                    // both sides just above (pre-ins_before-snapshot).
-                    // Halves fee-sync CU on the hot path.
                     execute_trade_with_matcher(
                         engine,
                         &matcher,
@@ -6586,7 +7631,9 @@ pub mod processor {
                         // fee_paid = actual fee collected into insurance (post - pre).
                         let fee_paid_cpi = if config.mark_min_fee > 0 {
                             let ins_after_cpi = engine.insurance_fund.balance.get();
-                            let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                            let delta = ins_after_cpi
+                                .saturating_sub(ins_before_cpi)
+                                .min(current_fee_paid_cap);
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else {
                             0u64
@@ -6649,7 +7696,9 @@ pub mod processor {
                         // binding is in the cap>0 branch's scope.
                         let fee_paid_hyperp = if config.mark_min_fee > 0 {
                             let ins_after_cpi = engine.insurance_fund.balance.get();
-                            let delta = ins_after_cpi.saturating_sub(ins_before_cpi);
+                            let delta = ins_after_cpi
+                                .saturating_sub(ins_before_cpi)
+                                .min(current_fee_paid_cap);
                             core::cmp::min(delta, u64::MAX as u128) as u64
                         } else {
                             0u64
@@ -6694,128 +7743,6 @@ pub mod processor {
                     state::write_risk_buffer(&mut data, &buf);
                 }
             }
-            Instruction::LiquidateAtOracle { target_idx } => {
-                accounts::expect_len(accounts, 3)?;
-                let a_slab = &accounts[0];
-                let a_oracle = &accounts[2];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block liquidations after market resolution — resolved markets
-                // are in withdraw-only settlement phase.
-                if zc::engine_ref(&data)?.is_resolved() {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-
-                let clock = Clock::from_account_info(&accounts[1])?;
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
-                let price = if is_hyperp {
-                    let eng = zc::engine_ref(&data)?;
-                    let p_last = eng.last_oracle_price;
-                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
-                    let cap_bps = eng.params.max_price_move_bps_per_slot;
-                    let oi_any = eng.oi_eff_long_q != 0 || eng.oi_eff_short_q != 0;
-                    oracle::get_engine_oracle_price_e6(
-                        p_last,
-                        price_move_dt,
-                        clock.slot,
-                        clock.unix_timestamp,
-                        &mut config,
-                        a_oracle,
-                        cap_bps,
-                        oi_any,
-                    )?
-                } else {
-                    read_price_and_stamp(
-                        &mut config,
-                        a_oracle,
-                        clock.unix_timestamp,
-                        clock.slot,
-                        &mut data,
-                    )?
-                };
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                check_idx(engine, target_idx)?;
-
-                #[cfg(feature = "cu-audit")]
-                {
-                    sol_log_64(target_idx as u64, price, 0, 0, 0);
-                    let acc = &engine.accounts[target_idx as usize];
-                    sol_log_64(acc.capital.get() as u64, 0, 0, 0, 1);
-                    let eff = effective_pos_q_checked(engine, target_idx as usize)?;
-                    let notional = risk_notional_ceil(eff, price);
-                    sol_log_64(notional as u64, (eff == 0) as u64, 0, 0, 2);
-                }
-
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: liquidate_start");
-                    sol_log_compute_units();
-                }
-                let admit_h_min = engine.params.h_min;
-                let admit_h_max = engine.params.h_max;
-                // Fully accrue market to clock.slot BEFORE fee sync +
-                // liquidate_at_oracle_not_atomic. Explicit accrue→sync→op.
-                ensure_market_accrued_to_now_with_policy(
-                    engine,
-                    &config,
-                    clock.slot,
-                    price,
-                    funding_rate_e9,
-                )?;
-                // Realize due maintenance fees on the target BEFORE liquidation
-                // so the maintenance-margin check sees post-fee equity.
-                sync_account_fee(engine, &config, target_idx, clock.slot)?;
-                let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
-                let _res = engine
-                    .liquidate_at_oracle_not_atomic(
-                        target_idx,
-                        clock.slot,
-                        price,
-                        percolator::LiquidationPolicy::FullClose,
-                        funding_rate_e9,
-                        admit_h_min,
-                        admit_h_max,
-                        admit_threshold,
-                    )
-                    .map_err(map_risk_error)?;
-                #[cfg(feature = "cu-audit")]
-                sol_log_64(_res as u64, 0, 0, 0, 4);
-
-                // Collect post-liquidation position for risk buffer
-                let liq_eff = effective_pos_q_checked(engine, target_idx as usize)?;
-                if !state::is_oracle_initialized(&data) {
-                    state::set_oracle_initialized(&mut data);
-                }
-
-                // Update risk buffer (engine borrow dropped)
-                {
-                    let mut buf = state::read_risk_buffer(&data);
-                    if liq_eff == 0 {
-                        buf.remove(target_idx);
-                    } else {
-                        let notional = risk_notional_ceil(liq_eff, price);
-                        buf.upsert(target_idx, notional);
-                    }
-                    state::write_risk_buffer(&mut data, &buf);
-                }
-
-                #[cfg(feature = "cu-audit")]
-                {
-                    msg!("CU_CHECKPOINT: liquidate_end");
-                    sol_log_compute_units();
-                }
-            }
             Instruction::CloseAccount { user_idx } => {
                 accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
@@ -6849,12 +7776,12 @@ pub mod processor {
                 )?;
                 accounts::expect_key(a_pda, &auth)?;
 
-                let resolved = zc::engine_ref(&data)?.is_resolved();
+                let resolved = engine_is_resolved(zc::engine_ref(&data)?);
                 let clock = Clock::from_account_info(&accounts[6])?;
                 let mut funding_rate_e9 = 0i128;
                 let price = if resolved {
                     let eng = zc::engine_ref(&data)?;
-                    let (settlement, _) = eng.resolved_context();
+                    let (settlement, _) = engine_resolved_context(eng);
                     if settlement == 0 {
                         return Err(ProgramError::InvalidAccountData);
                     }
@@ -6908,26 +7835,15 @@ pub mod processor {
                     sol_log_compute_units();
                 }
                 let amt_units = if resolved {
-                    // Realize recurring maintenance fees to the resolved
-                    // anchor BEFORE force_close_resolved. Engine's
-                    // force_close_resolved_not_atomic does NOT itself sync
-                    // the fee cursor; without this call an account could
-                    // reach terminal close with unpaid fees accrued over
-                    // [last_fee_slot, resolved_slot]. On Resolved mode
-                    // sync_account_fee_to_slot_not_atomic anchors at
-                    // resolved_slot automatically, but we pass resolved
-                    // _slot explicitly for consistency with the other
-                    // resolved paths (AdminForceCloseAccount,
-                    // ForceCloseResolved). No-op when
-                    // maintenance_fee_per_slot == 0.
-                    let (_settle_px, resolved_slot_anchor) = engine.resolved_context();
-                    sync_account_fee(engine, &config, user_idx, resolved_slot_anchor)?;
-                    // force_close_resolved handles K-pair PnL,
-                    // loss settlement, and account close internally. Engine
-                    // v12.18.6+: signature is (idx,) — the engine pulls the
-                    // resolved_slot from its own state (§9.9).
+                    // Engine fee-aware resolved close reconciles terminal
+                    // K/F loss first, then syncs recurring fees to the
+                    // resolved slot. Do not pre-sync here or fees become
+                    // senior to same-account terminal losses.
                     match engine
-                        .force_close_resolved_not_atomic(user_idx)
+                        .force_close_resolved_with_fee_not_atomic(
+                            user_idx,
+                            config.maintenance_fee_per_slot,
+                        )
                         .map_err(map_risk_error)?
                     {
                         percolator::ResolvedCloseResult::ProgressOnly => {
@@ -6940,9 +7856,9 @@ pub mod processor {
                 } else {
                     let admit_h_min = engine.params.h_min;
                     let admit_h_max = engine.params.h_max;
-                    // Fully accrue market to clock.slot BEFORE fee sync +
-                    // close_account_not_atomic. Explicit accrue→sync→op.
-                    ensure_market_accrued_to_now_with_policy(
+                    // Fully accrue market to clock.slot, then make the account
+                    // authoritative and fee-current before close preconditions.
+                    ensure_market_accrued_to_now_for_account_limited_op(
                         engine,
                         &config,
                         clock.slot,
@@ -6950,9 +7866,17 @@ pub mod processor {
                         funding_rate_e9,
                     )?;
                     reject_any_target_lag(&config, engine)?;
-                    // Realize due maintenance fees BEFORE close so the account
-                    // cannot escape the unpaid interval by closing between cranks.
-                    sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                    settle_account_then_sync_fee_current(
+                        engine,
+                        &config,
+                        user_idx,
+                        clock.slot,
+                        price,
+                        funding_rate_e9,
+                        admit_h_min,
+                        admit_h_max,
+                        Some(engine.params.maintenance_margin_bps as u128),
+                    )?;
                     engine
                         .close_account_not_atomic(
                             user_idx,
@@ -7032,11 +7956,12 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Block insurance top-up when market is resolved
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
-                let config = state::read_config(&data);
+                let mut config = state::read_config(&data);
+                insurance_withdraw_deposits_only(&config)?;
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let auth = accounts::derive_vault_authority_with_bump(
@@ -7067,15 +7992,22 @@ pub mod processor {
                     return Err(ProgramError::InvalidArgument);
                 }
 
+                // Convert base tokens to units for engine
+                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
+                let new_deposit_remaining = config
+                    .insurance_withdraw_deposit_remaining
+                    .checked_add(units)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
 
-                // Convert base tokens to units for engine
-                let (units, _dust) = crate::units::base_to_units(amount, config.unit_scale);
                 let engine = zc::engine_mut(&mut data)?;
                 engine
                     .top_up_insurance_fund(units as u128, clock.slot)
                     .map_err(map_risk_error)?;
+                config.insurance_withdraw_deposit_remaining = new_deposit_remaining;
+                state::write_config(&mut data, &config);
             }
 
             Instruction::CloseSlab => {
@@ -7088,6 +8020,7 @@ pub mod processor {
                 let a_token = &accounts[5];
 
                 accounts::expect_signer(a_dest)?;
+                accounts::expect_writable(a_dest)?;
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
@@ -7097,7 +8030,7 @@ pub mod processor {
                     require_initialized(&data)?;
 
                     // Require resolved — enforce lifecycle ordering
-                    if !zc::engine_ref(&data)?.is_resolved() {
+                    if !engine_is_resolved(zc::engine_ref(&data)?) {
                         return Err(ProgramError::InvalidAccountData);
                     }
 
@@ -7121,6 +8054,7 @@ pub mod processor {
                         &mint,
                         &Pubkey::new_from_array(config.vault_pubkey),
                     )?;
+                    accounts::expect_key(a_vault_auth, &auth)?;
 
                     let engine = zc::engine_ref(&data)?;
                     if !engine.vault.is_zero() {
@@ -7144,19 +8078,6 @@ pub mod processor {
                     if stranded > 0 {
                         // Validate admin's token account before drain
                         verify_token_account(a_dest_ata, a_dest.key, &mint)?;
-                        // Verify vault authority PDA
-                        let expected_auth = Pubkey::create_program_address(
-                            &[
-                                b"vault",
-                                a_slab.key.as_ref(),
-                                &[config.vault_authority_bump],
-                            ],
-                            program_id,
-                        )
-                        .map_err(|_| ProgramError::InvalidSeeds)?;
-                        if a_vault_auth.key != &expected_auth {
-                            return Err(ProgramError::InvalidSeeds);
-                        }
 
                         let seed1: &[u8] = b"vault";
                         let seed2: &[u8] = a_slab.key.as_ref();
@@ -7249,7 +8170,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
                 let header = state::read_header(&data);
@@ -7373,6 +8294,12 @@ pub mod processor {
                                 clock.slot,
                                 accrual_price,
                             )?;
+                            reject_account_limited_market_progress(
+                                engine,
+                                clock.slot,
+                                accrual_price,
+                                rate_for_accrual,
+                            )?;
                             // Pre-chunk catch-up so accrue_market_to below sees
                             // dt ≤ max_accrual_dt_slots (Finding 4). Use the
                             // same (price, rate) the final accrue uses so the
@@ -7418,7 +8345,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -7505,6 +8432,12 @@ pub mod processor {
                         push_clock.slot,
                         config.last_effective_price_e6,
                     )?;
+                    reject_account_limited_market_progress(
+                        engine,
+                        push_clock.slot,
+                        config.last_effective_price_e6,
+                        funding_rate_e9,
+                    )?;
                     catchup_accrue(
                         engine,
                         push_clock.slot,
@@ -7566,7 +8499,7 @@ pub mod processor {
                 require_admin(header.admin, a_admin.key)?;
 
                 // Can't re-resolve
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -7580,9 +8513,12 @@ pub mod processor {
                 let clock_gate = Clock::from_account_info(a_clock)?;
 
                 // Explicit Degenerate branch: settle at engine.last_oracle_price
-                // with rate = 0. Used for dead-oracle markets (stale gate
-                // matured, or admin-observed deadness). Mirrors
-                // ResolvePermissionless's terminal settlement.
+                // with rate = 0. For non-Hyperp Pyth Pull markets this is
+                // gated only by the hard stale/restart predicate below: a
+                // caller-selected stale/conf-wide PriceUpdateV2 account proves
+                // only that this account is bad, not that the feed has no
+                // fresh update. Hyperp has no external update account, so its
+                // admin emergency gate is based on stored mark liveness.
                 if mode == 1 {
                     let stale_or_restarted =
                         oracle::permissionless_stale_matured(&config, clock_gate.slot);
@@ -7601,24 +8537,7 @@ pub mod processor {
                                 return Err(PercolatorError::OracleInvalid.into());
                             }
                         } else {
-                            let live = oracle::read_engine_price_e6(
-                                a_oracle,
-                                &config.index_feed_id,
-                                clock_gate.unix_timestamp,
-                                config.max_staleness_secs,
-                                config.conf_filter_bps,
-                                config.invert,
-                                config.unit_scale,
-                            );
-                            match live {
-                                Ok(_) => return Err(PercolatorError::OracleInvalid.into()),
-                                Err(e)
-                                    if e == ProgramError::from(PercolatorError::OracleStale)
-                                        || e == ProgramError::from(
-                                            PercolatorError::OracleConfTooWide,
-                                        ) => {}
-                                Err(e) => return Err(e),
-                            }
+                            return Err(PercolatorError::OracleStale.into());
                         }
                     }
                     let engine = zc::engine_mut(&mut data)?;
@@ -7836,7 +8755,7 @@ pub mod processor {
                 require_admin(header.insurance_authority, a_admin.key)?;
 
                 // Must be resolved
-                if !zc::engine_ref(&data)?.is_resolved() {
+                if !engine_is_resolved(zc::engine_ref(&data)?) {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -7944,7 +8863,7 @@ pub mod processor {
                 require_initialized(&data)?;
 
                 // Live markets only. Resolved markets go through tag 20.
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -7965,12 +8884,24 @@ pub mod processor {
                 if config.insurance_withdraw_max_bps == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
+                let deposits_only = insurance_withdraw_deposits_only(&config)?;
                 {
                     let engine = zc::engine_ref(&data)?;
                     reject_any_target_lag(&config, engine)?;
                     let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
                     if oi_any && engine.last_market_slot != clock.slot {
                         return Err(PercolatorError::CatchupRequired.into());
+                    }
+                    let stress_envelope_active = engine.stress_consumed_bps_e9_since_envelope != 0
+                        || engine.stress_envelope_remaining_indices != 0
+                        || engine.bankruptcy_hmax_lock_active;
+                    if !crate::policy::live_insurance_withdraw_market_healthy(
+                        engine.vault.get(),
+                        engine.c_tot.get(),
+                        engine.insurance_fund.balance.get(),
+                        stress_envelope_active,
+                    ) {
+                        return Err(PercolatorError::EngineInsufficientBalance.into());
                     }
                 }
 
@@ -7997,7 +8928,10 @@ pub mod processor {
                 let bps_cap =
                     ins.saturating_mul(config.insurance_withdraw_max_bps as u128) / 10_000;
                 let cap = core::cmp::max(bps_cap, MIN_WITHDRAW_FLOOR_UNITS);
-                let cap = core::cmp::min(cap, ins);
+                let mut cap = core::cmp::min(cap, ins);
+                if deposits_only {
+                    cap = core::cmp::min(cap, config.insurance_withdraw_deposit_remaining as u128);
+                }
                 if (amount_units as u128) > cap {
                     return Err(PercolatorError::InsuranceWithdrawCapExceeded.into());
                 }
@@ -8029,6 +8963,16 @@ pub mod processor {
                         .map_err(map_risk_error)?;
                 }
                 config.last_insurance_withdraw_slot = clock.slot;
+                if deposits_only {
+                    config.insurance_withdraw_deposit_remaining = config
+                        .insurance_withdraw_deposit_remaining
+                        .checked_sub(amount_units)
+                        .ok_or(PercolatorError::InsuranceWithdrawCapExceeded)?;
+                } else {
+                    config.insurance_withdraw_deposit_remaining = config
+                        .insurance_withdraw_deposit_remaining
+                        .saturating_sub(amount_units);
+                }
                 state::write_config(&mut data, &config);
                 drop(data);
 
@@ -8076,7 +9020,7 @@ pub mod processor {
                 require_admin(header.admin, a_admin.key)?;
 
                 // Must be resolved
-                if !zc::engine_ref(&data)?.is_resolved() {
+                if !engine_is_resolved(zc::engine_ref(&data)?) {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -8098,7 +9042,7 @@ pub mod processor {
 
                 let _clock = Clock::from_account_info(&accounts[6])?;
                 let engine = zc::engine_mut(&mut data)?;
-                let (price, resolved_slot) = engine.resolved_context();
+                let (price, _resolved_slot) = engine_resolved_context(engine);
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -8107,18 +9051,11 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
-                // Realize recurring maintenance fees to the resolved anchor
-                // BEFORE force_close_resolved. Engine's
-                // force_close_resolved_not_atomic does not itself sync the
-                // fee cursor. On Resolved mode sync anchors at resolved_slot
-                // automatically. No-op when maintenance_fee_per_slot == 0.
-                sync_account_fee(engine, &config, user_idx, resolved_slot)?;
-
-                // Engine v12.18.6+: slot argument removed — the engine pulls
-                // resolved_slot from its own state (§9.9).
-                let _ = resolved_slot;
                 let amt_units = match engine
-                    .force_close_resolved_not_atomic(user_idx)
+                    .force_close_resolved_with_fee_not_atomic(
+                        user_idx,
+                        config.maintenance_fee_per_slot,
+                    )
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -8162,136 +9099,6 @@ pub mod processor {
                 )?;
             }
 
-            Instruction::ReclaimEmptyAccount { user_idx } => {
-                // Permissionless account reclamation (spec §2.6, §10.7).
-                // Recycles flat/dust accounts without touching side state.
-                accounts::expect_len(accounts, 2)?;
-                let a_slab = &accounts[0];
-                let _a_clock = &accounts[1];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                // Block on resolved markets — unsettled PnL from resolution
-                // may not yet be reflected in capital. Reclaiming before
-                // touch_account_full would forfeit claimable value.
-                if zc::engine_ref(&data)?.is_resolved() {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let clock = Clock::from_account_info(_a_clock)?;
-                // Hard-timeout gate: "dead means dead" — no live
-                // mutations past the stale horizon. Users exit via
-                // ResolvePermissionless + resolved-market close paths.
-                let config = state::read_config(&data);
-                if oracle::permissionless_stale_matured(&config, clock.slot) {
-                    return Err(PercolatorError::OracleStale.into());
-                }
-
-                let engine = zc::engine_mut(&mut data)?;
-                check_no_oracle_live_envelope(engine, clock.slot)?;
-                // Sync recurring fees before deciding reclaim eligibility.
-                // Spec obligation (§10.7 wrapper rule): when wrapper-owned
-                // recurring fees are enabled, the wrapper MUST sync fees to
-                // the market anchor before consulting reclaim-sensitive
-                // account state. Without this sync, latent maintenance
-                // fees since last_fee_slot_i go unrealized — insurance
-                // under-collects and the "flat" predicate can pass against
-                // stale capital. Bounded-to-market (no accrue): we are in
-                // the no-oracle branch and MUST NOT accrue per §10.7, so
-                // anchor at min(clock.slot, engine.last_market_slot) and
-                // let a subsequent accrue-bearing op close any residual
-                // gap.
-                sync_account_fee_bounded_to_market(engine, &config, user_idx, clock.slot)?;
-                engine
-                    .reclaim_empty_account_not_atomic(user_idx, clock.slot)
-                    .map_err(map_risk_error)?;
-                // Per §10.7: MUST NOT call accrue_market_to, MUST NOT mutate side state.
-            }
-
-            Instruction::SettleAccount { user_idx } => {
-                // Standalone account settlement (§10.2). Permissionless.
-                accounts::expect_len(accounts, 3)?;
-                let a_slab = &accounts[0];
-                let a_clock = &accounts[1];
-                let a_oracle = &accounts[2];
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-                if zc::engine_ref(&data)?.is_resolved() {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let mut config = state::read_config(&data);
-                let clock = Clock::from_account_info(a_clock)?;
-
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                // Anti-retroactivity: capture funding rate before oracle read (§5.5)
-                let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
-                let price = if is_hyperp {
-                    let eng = zc::engine_ref(&data)?;
-                    let p_last = eng.last_oracle_price;
-                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
-                    let cap_bps = eng.params.max_price_move_bps_per_slot;
-                    let oi_any = eng.oi_eff_long_q != 0 || eng.oi_eff_short_q != 0;
-                    oracle::get_engine_oracle_price_e6(
-                        p_last,
-                        price_move_dt,
-                        clock.slot,
-                        clock.unix_timestamp,
-                        &mut config,
-                        a_oracle,
-                        cap_bps,
-                        oi_any,
-                    )?
-                } else {
-                    read_price_and_stamp(
-                        &mut config,
-                        a_oracle,
-                        clock.unix_timestamp,
-                        clock.slot,
-                        &mut data,
-                    )?
-                };
-                state::write_config(&mut data, &config);
-
-                let engine = zc::engine_mut(&mut data)?;
-                let admit_h_min = engine.params.h_min;
-                let admit_h_max = engine.params.h_max;
-                // Fully accrue market to clock.slot BEFORE fee sync +
-                // settle_account_not_atomic. Explicit accrue→sync→op.
-                ensure_market_accrued_to_now_with_policy(
-                    engine,
-                    &config,
-                    clock.slot,
-                    price,
-                    funding_rate_e9,
-                )?;
-                reject_any_target_lag(&config, engine)?;
-                // Realize due maintenance fees BEFORE settle so the settle's
-                // equity computation reflects post-fee capital.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
-                let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
-                engine
-                    .settle_account_not_atomic(
-                        user_idx,
-                        price,
-                        clock.slot,
-                        funding_rate_e9,
-                        admit_h_min,
-                        admit_h_max,
-                        admit_threshold,
-                    )
-                    .map_err(map_risk_error)?;
-                if !state::is_oracle_initialized(&data) {
-                    state::set_oracle_initialized(&mut data);
-                }
-            }
-
             Instruction::DepositFeeCredits { user_idx, amount } => {
                 // Direct fee-debt repayment (§10.3.1). Owner only.
                 // SECURITY: Read fee debt BEFORE the SPL transfer to reject
@@ -8309,17 +9116,15 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 verify_token_program(a_token)?;
 
-                // Phase 1: sync latent maintenance fees and read post-sync
-                // debt. Done under a mutable borrow so sync_account_fee can
-                // realize fees accrued since last_fee_slot BEFORE we compare
-                // `amount` against the outstanding-debt cap. Otherwise a user
-                // with zero realized debt but nonzero latent fees would get
-                // their legitimate repayment rejected as overpayment.
+                // Phase 1: sync latent flat/current maintenance fees and read
+                // post-sync debt. Nonflat/stale accounts are not fee-synced on
+                // this no-oracle path because losses must be settled first by
+                // an oracle-backed touch.
                 let (unit_scale, debt_units) = {
                     let mut data = state::slab_data_mut(a_slab)?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
-                    if zc::engine_ref(&data)?.is_resolved() {
+                    if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                         return Err(ProgramError::InvalidAccountData);
                     }
                     let cfg = state::read_config(&data);
@@ -8350,8 +9155,8 @@ pub mod processor {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
                     check_no_oracle_live_envelope(engine, clock.slot)?;
-                    // No-oracle path: sync fees at an anchor bounded by
-                    // engine.last_market_slot (see sync_account_fee doc).
+                    // No-oracle path: sync flat/current fees at an anchor
+                    // bounded by engine.last_market_slot.
                     sync_account_fee_bounded_to_market(engine, &cfg, user_idx, clock.slot)?;
                     let fc = engine.accounts[user_idx as usize].fee_credits.get();
                     if fc > 0 || fc == i128::MIN {
@@ -8400,7 +9205,7 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -8450,9 +9255,9 @@ pub mod processor {
                 }
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
-                // Fully accrue market to clock.slot BEFORE fee sync +
-                // convert_released_pnl_not_atomic. Explicit accrue→sync→op.
-                ensure_market_accrued_to_now_with_policy(
+                // Fully accrue market to clock.slot, then make the account
+                // authoritative and fee-current before conversion bounds.
+                ensure_market_accrued_to_now_for_account_limited_op(
                     engine,
                     &config,
                     clock.slot,
@@ -8460,9 +9265,17 @@ pub mod processor {
                     funding_rate_e9,
                 )?;
                 reject_any_target_lag(&config, engine)?;
-                // Realize due maintenance fees BEFORE conversion so the
-                // convertible-PnL bound reflects post-fee equity.
-                sync_account_fee(engine, &config, user_idx, clock.slot)?;
+                settle_account_then_sync_fee_current(
+                    engine,
+                    &config,
+                    user_idx,
+                    clock.slot,
+                    price,
+                    funding_rate_e9,
+                    admit_h_min,
+                    admit_h_max,
+                    Some(engine.params.maintenance_margin_bps as u128),
+                )?;
                 engine
                     .convert_released_pnl_not_atomic(
                         user_idx,
@@ -8506,7 +9319,7 @@ pub mod processor {
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
 
-                if zc::engine_ref(&data)?.is_resolved() {
+                if zc::engine_ref(&data)?.market_mode == percolator::MarketMode::Resolved {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -8531,6 +9344,24 @@ pub mod processor {
                 // settlement_price and live_oracle_price use P_last (the
                 // engine's stored last-accrued price) — the engine's
                 // Degenerate arm requires equality between the two.
+                //
+                // This is the reason `permissionless_resolve_stale_slots`
+                // is NOT bounded by `MAX_ACCRUAL_DT_SLOTS`: this path does
+                // not call `accrue_market_to`, and passes rate=0. A market
+                // can therefore wait a product-scale stale horizon (capped
+                // at MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS) and still exit
+                // permissionlessly without violating the live-accrual
+                // envelope. Regression coverage:
+                //
+                //   test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt
+                //
+                // Kani coverage is wrapper-policy only:
+                //
+                //   kani_permissionless_resolve_horizon_policy_independent_from_accrual_window
+                //
+                // Engine conservation/postconditions are enforced inside
+                // resolve_market_not_atomic and covered by engine tests; the
+                // wrapper proof deliberately does not model engine internals.
                 let engine = zc::engine_mut(&mut data)?;
                 let p_last = engine.last_oracle_price;
                 if p_last == 0 {
@@ -8570,10 +9401,10 @@ pub mod processor {
 
                 let resolved_slot = {
                     let eng = zc::engine_ref(&data)?;
-                    if !eng.is_resolved() {
+                    if !engine_is_resolved(eng) {
                         return Err(ProgramError::InvalidAccountData);
                     }
-                    eng.resolved_context().1
+                    engine_resolved_context(eng).1
                 };
 
                 let config = state::read_config(&data);
@@ -8581,7 +9412,11 @@ pub mod processor {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 let clock = Clock::from_account_info(a_clock)?;
-                if clock.slot < resolved_slot.saturating_add(config.force_close_delay_slots) {
+                if !crate::policy::force_close_delay_elapsed(
+                    clock.slot,
+                    resolved_slot,
+                    config.force_close_delay_slots,
+                ) {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
@@ -8600,7 +9435,7 @@ pub mod processor {
                 accounts::expect_key(a_pda, &auth)?;
 
                 let engine = zc::engine_mut(&mut data)?;
-                let (price, resolved_slot) = engine.resolved_context();
+                let (price, _resolved_slot) = engine_resolved_context(engine);
                 if price == 0 {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -8608,16 +9443,11 @@ pub mod processor {
 
                 let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
 
-                // Realize recurring maintenance fees to resolved_slot
-                // BEFORE force_close_resolved (Finding 4). Engine does not
-                // sync the fee cursor inside force_close. No-op when
-                // maintenance_fee_per_slot == 0.
-                sync_account_fee(engine, &config, user_idx, resolved_slot)?;
-
-                // Engine v12.18.6+ (§9.9): slot arg removed; engine uses resolved_slot.
-                let _ = resolved_slot;
                 let amt_units = match engine
-                    .force_close_resolved_not_atomic(user_idx)
+                    .force_close_resolved_with_fee_not_atomic(
+                        user_idx,
+                        config.maintenance_fee_per_slot,
+                    )
                     .map_err(map_risk_error)?
                 {
                     percolator::ResolvedCloseResult::ProgressOnly => return Ok(()),
@@ -8659,214 +9489,6 @@ pub mod processor {
                     base_to_pay,
                     &signer_seeds,
                 )?;
-            }
-
-            Instruction::CatchupAccrue => {
-                // Permissionless market-clock catchup. REQUIRES a live
-                // oracle — proves the market is live before advancing
-                // funding/accrual. Dead oracles must use
-                // ResolvePermissionless (Degenerate arm, rate = 0);
-                // they cannot reach CatchupAccrue. This removes the
-                // prior race where CatchupAccrue (nonzero rate) could
-                // settle the same dead interval that
-                // ResolvePermissionless would settle at rate 0 —
-                // non-deterministic settlement.
-                //
-                // Two modes:
-                //
-                //   COMPLETE — the instruction can advance the engine all
-                //   the way to clock.slot in this single call
-                //   (gap ≤ CATCHUP_CHUNKS_MAX × max_dt). Behaves like any
-                //   ordinary inline accrue-bearing op: oracle read mutates
-                //   config, pre-read rate chunks the historical interval
-                //   at stored P_last, final accrue to clock.slot installs
-                //   the fresh observation. Persist mutated config.
-                //
-                //   PARTIAL  — the gap is too large to finish in one
-                //   call. Oracle is STILL read (liveness proof), but the
-                //   observation is NOT persisted: no fresh price enters
-                //   the engine, no config.last_effective_price_e6 /
-                //   last_hyperp_index_slot / last_good_oracle_slot update
-                //   leaks into later calls whose catchup hasn't reached
-                //   the observation slot yet. The engine mechanically
-                //   advances through `target` using stored P_last +
-                //   pre-read rate only. Subsequent CatchupAccrue calls
-                //   observe freshly, and the LAST call (which reaches
-                //   clock.slot) persists the final observation.
-                //
-                // This splits prevents the time-travel that would occur
-                // if a partial catchup wrote the current observation
-                // immediately: later catchups would compute funding
-                // using the already-advanced config index, retroactively
-                // applying post-observation state to pre-observation
-                // engine slots.
-                //
-                // Takes slab + clock + oracle.
-                accounts::expect_len(accounts, 3)?;
-                let a_slab = &accounts[0];
-                let a_clock = &accounts[1];
-                let a_oracle = &accounts[2];
-
-                accounts::expect_writable(a_slab)?;
-
-                let mut data = state::slab_data_mut(a_slab)?;
-                slab_guard(program_id, a_slab, &data)?;
-                require_initialized(&data)?;
-
-                if zc::engine_ref(&data)?.is_resolved() {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-
-                let clock = Clock::from_account_info(a_clock)?;
-
-                // Snapshot pre-read config (MarketConfig is Pod+Copy, so
-                // this is a byte-copy — cheap). Used to restore in PARTIAL
-                // mode so the oracle observation is not persisted until
-                // the FINAL catchup call that actually reaches clock.slot.
-                let config_pre = state::read_config(&data);
-                let mut config = config_pre;
-
-                // Pre-read funding rate (anti-retroactivity §5.5).
-                let funding_rate_e9_pre = compute_current_funding_rate_e9(&config)?;
-
-                // Oracle read — proves market is live. Mutates `config`
-                // locally (raw/stamp for non-Hyperp, clamp-toward for Hyperp).
-                // Failure routes caller to ResolvePermissionless.
-                let is_hyperp = oracle::is_hyperp_mode(&config);
-                let fresh_price = if is_hyperp {
-                    let eng = zc::engine_ref(&data)?;
-                    let p_last = eng.last_oracle_price;
-                    let price_move_dt = price_move_residual_dt(eng, clock.slot)?;
-                    let cap_bps = eng.params.max_price_move_bps_per_slot;
-                    let oi_any = eng.oi_eff_long_q != 0 || eng.oi_eff_short_q != 0;
-                    oracle::get_engine_oracle_price_e6(
-                        p_last,
-                        price_move_dt,
-                        clock.slot,
-                        clock.unix_timestamp,
-                        &mut config,
-                        a_oracle,
-                        cap_bps,
-                        oi_any,
-                    )?
-                } else {
-                    read_price_and_stamp(
-                        &mut config,
-                        a_oracle,
-                        clock.unix_timestamp,
-                        clock.slot,
-                        &mut data,
-                    )?
-                };
-
-                let engine = zc::engine_mut(&mut data)?;
-
-                // Engine never seeded — nothing to catch up past. The
-                // caller's next ordinary op will seed last_oracle_price.
-                // Persist the fresh observation since there's nothing to
-                // "leak into" historically.
-                if engine.last_oracle_price == 0 {
-                    state::write_config(&mut data, &config);
-                    if !state::is_oracle_initialized(&data) {
-                        state::set_oracle_initialized(&mut data);
-                    }
-                    return Ok(());
-                }
-                reject_stuck_target_accrual(&config, engine, clock.slot, fresh_price)?;
-
-                // Decide COMPLETE vs PARTIAL based on whether one call can
-                // close the full gap. The engine's §5.5 clause-6 predicate
-                // rejects `total_dt > max_dt` whenever EITHER funding OR
-                // price-movement would drain equity:
-                //
-                //   funding_active    = rate != 0, both OI sides, fund_px_last > 0
-                //   price_move_active = P_last > 0, fresh_price != P_last, any OI
-                //
-                // If neither is active we can jump the full gap in one
-                // call. Missing the price_move leg (prior versions) meant
-                // a zero-funding live-OI market with a new oracle price
-                // could be claimed "can_finish" but then fail in the
-                // single-shot accrue after `catchup_accrue` returned
-                // early.
-                let max_dt = engine.params.max_accrual_dt_slots;
-                let max_step_per_call = (CATCHUP_CHUNKS_MAX as u64).saturating_mul(max_dt);
-                let gap = clock.slot.saturating_sub(engine.last_market_slot);
-                let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
-                let funding_active = funding_rate_e9_pre != 0
-                    && engine.oi_eff_long_q != 0
-                    && engine.oi_eff_short_q != 0
-                    && engine.fund_px_last > 0;
-                let price_move_active = engine.last_oracle_price > 0
-                    && fresh_price != engine.last_oracle_price
-                    && oi_any;
-                let accrual_active = funding_active || price_move_active;
-                let can_finish = !accrual_active || gap <= max_step_per_call;
-
-                if can_finish {
-                    // COMPLETE: chunk to clock.slot using stored P_last
-                    // (per catchup_accrue's invariant — keeps fund_px
-                    // _last pinned across chunks). Final residual
-                    // accrue installs fresh_price. Persist the mutated
-                    // config so the observation is recorded.
-                    catchup_accrue(engine, clock.slot, fresh_price, funding_rate_e9_pre)?;
-                    let flat_same_slot_price_update = fresh_price > 0
-                        && clock.slot == engine.last_market_slot
-                        && fresh_price != engine.last_oracle_price
-                        && engine.oi_eff_long_q == 0
-                        && engine.oi_eff_short_q == 0;
-                    if clock.slot > engine.last_market_slot || flat_same_slot_price_update {
-                        engine
-                            .accrue_market_to(clock.slot, fresh_price, funding_rate_e9_pre)
-                            .map_err(map_risk_error)?;
-                    }
-                    state::write_config(&mut data, &config);
-                } else {
-                    // PARTIAL: use stored P_last throughout (NOT the
-                    // fresh price) and DO NOT persist the time-travel
-                    // -sensitive oracle/index fields. Subsequent
-                    // CatchupAccrue calls will observe freshly and the
-                    // last one (which CAN finish) installs the final
-                    // observation.
-                    let stored_p_last = engine.last_oracle_price;
-                    let target = engine.last_market_slot.saturating_add(max_step_per_call);
-                    catchup_accrue(engine, target, stored_p_last, funding_rate_e9_pre)?;
-                    if target > engine.last_market_slot {
-                        engine
-                            .accrue_market_to(target, stored_p_last, funding_rate_e9_pre)
-                            .map_err(map_risk_error)?;
-                    }
-                    // Rollback selectively: revert price/index state that
-                    // would retroactively apply a post-observation index to
-                    // pre-observation engine slots, but PRESERVE the
-                    // liveness stamp and its source-feed timestamp so
-                    // partial catchups can't replay a single observation
-                    // to advance liveness multiple times.
-                    //
-                    // Fields rolled back (price/index — time-travel risk):
-                    //   - last_effective_price_e6     (baseline)
-                    //   - last_hyperp_index_slot      (Hyperp index clock)
-                    //
-                    // Fields preserved from the fresh read (liveness):
-                    //   - last_good_oracle_slot       (stamp proving
-                    //       external oracle was observed live this call)
-                    //   - last_oracle_publish_time    (MUST be preserved
-                    //       atomically with last_good_oracle_slot —
-                    //       otherwise the one-way-clock invariant
-                    //       `clamp_external_price` relies on is broken:
-                    //       the same Pyth observation would be "fresh"
-                    //       again on the next partial catchup and
-                    //       stamp last_good_oracle_slot a second time)
-                    let mut restored = config_pre;
-                    restored.last_good_oracle_slot = config.last_good_oracle_slot;
-                    restored.last_oracle_publish_time = config.last_oracle_publish_time;
-                    restored.oracle_target_price_e6 = config.oracle_target_price_e6;
-                    restored.oracle_target_publish_time = config.oracle_target_publish_time;
-                    state::write_config(&mut data, &restored);
-                }
-
-                if !state::is_oracle_initialized(&data) {
-                    state::set_oracle_initialized(&mut data);
-                }
             }
 
             Instruction::UpdateAuthority { kind, new_pubkey } => {

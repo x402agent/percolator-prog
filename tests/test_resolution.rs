@@ -12,6 +12,36 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
+fn settle_warmup_and_convert_released_pnl(
+    env: &mut TestEnv,
+    owner: &Keypair,
+    idx: u16,
+    price_e6: i64,
+    maturity_slots: u64,
+) {
+    env.try_settle_account(idx)
+        .expect("first settlement should create or advance the profit reserve");
+
+    if env.read_account_reserved_pnl(idx) > 0 {
+        let now = env.svm.get_sysvar::<Clock>().slot;
+        env.set_slot_and_price_raw_no_walk(
+            now.saturating_add(maturity_slots).saturating_add(1),
+            price_e6,
+        );
+        env.try_settle_account(idx)
+            .expect("second settlement should mature the profit reserve");
+    }
+
+    let released = env
+        .read_account_pnl(idx)
+        .max(0)
+        .saturating_sub(env.read_account_reserved_pnl(idx) as i128) as u64;
+    if released > 0 {
+        env.try_convert_released_pnl(owner, idx, released)
+            .expect("released PnL conversion should succeed before close");
+    }
+}
+
 /// Test that resolved markets block new activity
 #[test]
 fn test_resolved_market_blocks_new_activity() {
@@ -283,8 +313,8 @@ fn test_attack_resolve_market_non_admin() {
     );
 }
 
-/// Standard Pyth market: user deposits, trades (long), price goes up, flattens, closes account.
-/// warmup_period_slots=0 so PnL converts instantly.
+/// Standard Pyth market: user deposits, trades (long), price goes up, flattens, waits
+/// for profit maturity, converts released PnL, and closes account.
 #[test]
 fn test_honest_user_standard_market_profitable_close() {
     program_path();
@@ -329,10 +359,11 @@ fn test_honest_user_standard_market_profitable_close() {
     // Crank to settle final state
     env.set_slot_and_price(330, 150_000_000);
     env.crank();
+    settle_warmup_and_convert_released_pnl(&mut env, &user, user_idx, 150_000_000, 1);
 
     let vault_before = env.vault_balance();
 
-    // Close account — warmup_period=0 so PnL converts instantly
+    // Close account after positive PnL has matured and been converted.
     let result = env.try_close_account(&user, user_idx);
     assert!(
         result.is_ok(),
@@ -425,7 +456,9 @@ fn test_honest_user_standard_market_warmup_close() {
     program_path();
 
     let mut env = TestEnv::new();
-    // v12.19.6: warmup (h_max) capped at perm_resolve ≤ 100.
+    // h_max is now capped by the wrapper's product horizon (30 days), not
+    // by the live-accrual dt envelope. This test keeps a short warmup so the
+    // lifecycle completes quickly.
     env.init_market_with_warmup(0, 50);
 
     let ins_payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
@@ -463,6 +496,7 @@ fn test_honest_user_standard_market_warmup_close() {
     // guard while proving the account can exit after the configured warmup.
     env.set_slot_and_price(430, 150_000_000);
     env.crank();
+    settle_warmup_and_convert_released_pnl(&mut env, &user, user_idx, 150_000_000, 50);
 
     let result = env.try_close_account(&user, user_idx);
     assert!(
@@ -585,9 +619,9 @@ fn test_honest_participants_standard_market_full_lifecycle() {
     println!("HONEST PARTICIPANTS STANDARD MARKET FULL LIFECYCLE: PASSED");
 }
 
-/// LiquidateAtOracle must be blocked on resolved markets.
+/// The retired direct LiquidateAtOracle tag must reject.
 #[test]
-fn test_liquidate_blocked_on_resolved_market() {
+fn test_liquidate_at_oracle_tag_retired() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_hyperp(1_000_000);
@@ -608,11 +642,24 @@ fn test_liquidate_blocked_on_resolved_market() {
     let position_before = env.read_account_position(user_idx);
     let capital_before = env.read_account_capital(user_idx);
 
-    // Liquidation must fail on resolved market
-    let result = env.try_liquidate(user_idx);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_liquidate(user_idx),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[&admin],
+        env.svm.latest_blockhash(),
+    );
     assert!(
-        result.is_err(),
-        "LiquidateAtOracle must be blocked on resolved markets"
+        env.svm.send_transaction(tx).is_err(),
+        "retired LiquidateAtOracle tag must reject"
     );
 
     // Position and capital must be unchanged after rejection
@@ -1158,10 +1205,10 @@ fn test_governance_free_full_lifecycle() {
     // horizon=200 (shorter for faster funding), k=200 (2x multiplier), max_premium=1000, max_per_slot=10
     env.init_market_with_funding(
         0, // invert=0 (direct, e.g., BTC/USD)
-        // permissionless_resolve_stale_slots: 80 slots (v12.19.6: must be
-        // <= MAX_ACCRUAL_DT_SLOTS=100). The natural slot advances in this
-        // test (init → 200 → 300 → 600) go well past the live window, so
-        // the final Resolve branch exercises the permissionless path.
+        // permissionless_resolve_stale_slots: short for the test. The
+        // production cap is independent from MAX_ACCRUAL_DT_SLOTS; this
+        // lifecycle intentionally uses a small stale window so the final
+        // Resolve branch exercises the permissionless path quickly.
         80, 200,  // funding_horizon_slots (custom, not default 500)
         200,  // funding_k_bps (2x, not default 1x)
         1000, // funding_max_premium_bps (10%, not default 5%)
@@ -1241,7 +1288,7 @@ fn test_governance_free_full_lifecycle_inverted() {
 
     env.init_market_with_funding(
         1,   // invert=1
-        80,  // permissionless_resolve_stale_slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100)
+        80,  // short test stale window; not coupled to MAX_ACCRUAL_DT_SLOTS
         300, // custom horizon
         150, // 1.5x k
         800, // 8% max premium
@@ -1838,37 +1885,58 @@ fn test_sentinel_invariant_nonzero_oi_implies_oracle_initialized() {
 
 /// ResolvePermissionless must succeed after an oracle outage longer than
 /// `max_accrual_dt_slots`. The engine's Degenerate arm explicitly skips
-/// `accrue_market_to` and just jumps `current_slot`/`last_market_slot` to
-/// now_slot, so there's no dt envelope check on this path — even a years-
-/// long gap resolves.
+/// `accrue_market_to` and resolves at P_last/rate=0, so there is no live dt
+/// envelope check on this path.
 ///
-/// Setup: permissionless_resolve_stale_slots = 50_000, hardcoded
-/// MAX_ACCRUAL_DT_SLOTS = 100_000. Advance clock to 500_000 (5× envelope)
-/// without a crank, kill the oracle, then resolve.
+/// This is the integration counterpart to
+/// `kani_permissionless_resolve_horizon_policy_independent_from_accrual_window`:
+/// the Kani proof covers the wrapper init policy, this test executes the SBF
+/// wrapper -> engine Degenerate resolve call and proves the market gets
+/// unstuck instead of trying to accrue the dead interval.
 #[test]
 fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() {
     program_path();
     let mut env = TestEnv::new();
-    // perm-resolve threshold = 80 slots (v12.19.6: <= MAX_ACCRUAL_DT_SLOTS=100).
-    // The test still drives the clock to 500_000 — far past the threshold —
-    // exercising the permissionless-resolve Degenerate path.
+    // Short test threshold. The production cap is independent from
+    // MAX_ACCRUAL_DT_SLOTS; this test drives the clock far past both the
+    // threshold and the live-accrual envelope to exercise the
+    // permissionless-resolve Degenerate path.
     env.init_market_with_cap(0, 80);
 
     // Tighten oracle staleness so clock advance → oracle death.
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
-        slab.data[232..240].copy_from_slice(&30u64.to_le_bytes());
+        let mut config = percolator_prog::state::read_config(&slab.data);
+        config.max_staleness_secs = 30;
+        percolator_prog::state::write_config(&mut slab.data, &config);
         env.svm.set_account(env.slab, slab).unwrap();
     }
 
+    // Put real user capital in the market before the outage. This keeps the
+    // test from being a vacuous "empty market can flip resolved=true" check:
+    // after permissionless resolution, the user must still be able to exit
+    // through the resolved force-close path.
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+    let used_before = env.read_num_used_accounts();
+    let capital_before = env.read_account_capital(user_idx);
+    assert!(capital_before > 0, "test account must carry capital");
+
     env.crank(); // seed engine.last_oracle_price with the real price
 
-    // Kill oracle, advance clock far past MAX_ACCRUAL_DT_SLOTS = 100_000.
+    // Kill oracle, advance clock far past MAX_ACCRUAL_DT_SLOTS.
     env.svm.set_sysvar(&Clock {
         slot: 500_000,
         unix_timestamp: 500_000,
         ..Clock::default()
     });
+
+    let live_result = env.try_crank();
+    assert!(
+        live_result.is_err(),
+        "live crank must not be the recovery path once the oracle outage is stale"
+    );
 
     // If the audit were right, the engine would reject with Overflow on the
     // dt check and the market would be permanently stuck. The Degenerate
@@ -1881,6 +1949,28 @@ fn test_resolve_permissionless_succeeds_after_outage_exceeding_max_accrual_dt() 
     assert_eq!(
         settlement, 138_000_000,
         "settlement uses engine.last_oracle_price (last known good)"
+    );
+
+    let force_close_delay = {
+        let slab = env.svm.get_account(&env.slab).unwrap();
+        percolator_prog::state::read_config(&slab.data).force_close_delay_slots
+    };
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.slot = clock
+        .slot
+        .saturating_add(force_close_delay)
+        .saturating_add(1);
+    clock.unix_timestamp = clock
+        .unix_timestamp
+        .saturating_add(force_close_delay as i64 + 1);
+    env.svm.set_sysvar(&clock);
+
+    env.try_force_close_resolved(user_idx, &user.pubkey())
+        .expect("resolved account must be permissionlessly force-closable after delay");
+    assert_eq!(
+        env.read_num_used_accounts(),
+        used_before - 1,
+        "resolved force-close must free the funded account"
     );
 }
 
@@ -1936,9 +2026,10 @@ fn test_keeper_crank_rejects_after_hard_timeout_and_resolves_degenerate() {
     assert!(env.is_market_resolved());
 }
 
-/// CatchupAccrue is not a stale-oracle escape hatch. A caller cannot jump a
-/// non-Hyperp permissionless market past its hard timeout, publish a new oracle
-/// account at the jumped slot, and use CatchupAccrue to keep the market live.
+/// The retired CatchupAccrue tag is not a stale-oracle escape hatch. A caller
+/// cannot jump a non-Hyperp permissionless market past its hard timeout, publish
+/// a new oracle account at the jumped slot, and use standalone catchup to keep
+/// the market live.
 #[test]
 fn test_catchup_accrue_rejects_after_hard_timeout() {
     program_path();
@@ -1950,7 +2041,7 @@ fn test_catchup_accrue_rejects_after_hard_timeout() {
     let result = env.try_catchup_accrue();
     assert!(
         result.is_err(),
-        "CatchupAccrue must require a live market and reject after hard timeout"
+        "retired CatchupAccrue tag must reject after hard timeout"
     );
 }
 
@@ -1986,9 +2077,7 @@ fn test_resolve_permissionless_unified_policy_pyth_pull_no_authority() {
     }
 
     // Kill the Pyth feed by advancing the clock far beyond the
-    // fixture's published_time (TestEnv's fixture uses clock slot 0;
-    // max_staleness_secs default is 86_400). Moving unix_timestamp by
-    // 200_000 seconds guarantees a stale observation.
+    // fixture's published_time and the configured staleness cap.
     env.svm.set_sysvar(&Clock {
         slot: 500,
         unix_timestamp: 200_000,
@@ -2118,6 +2207,124 @@ fn test_admin_degenerate_resolve_rejects_live_oracle() {
 
     env.try_resolve_market(&admin, 0)
         .expect("Ordinary resolve should still succeed with the live oracle");
+}
+
+fn try_resolve_market_with_oracle(
+    env: &mut TestEnv,
+    admin: &Keypair,
+    oracle: Pubkey,
+    mode: u8,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(oracle, false),
+        ],
+        data: encode_resolve_market(mode),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+fn prepare_non_hyperp_degenerate_resolve_gate_env() -> (TestEnv, Keypair) {
+    let mut env = TestEnv::new();
+    env.init_market_with_cap(0, 80);
+    env.crank();
+
+    {
+        let mut slab = env.svm.get_account(&env.slab).unwrap();
+        let mut config = percolator_prog::state::read_config(&slab.data);
+        config.max_staleness_secs = 30;
+        config.permissionless_resolve_stale_slots = 1_000;
+        percolator_prog::state::write_config(&mut slab.data, &config);
+        env.svm.set_account(env.slab, slab).unwrap();
+    }
+
+    env.svm.set_sysvar(&Clock {
+        slot: 140,
+        unix_timestamp: 140,
+        ..Clock::default()
+    });
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    (env, admin)
+}
+
+#[test]
+fn test_admin_degenerate_resolve_rejects_caller_chosen_stale_pyth_before_hard_timeout() {
+    program_path();
+
+    let (mut env, admin) = prepare_non_hyperp_degenerate_resolve_gate_env();
+    let stale_update = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            stale_update,
+            Account {
+                lamports: 1_000_000,
+                data: make_pyth_data(&TEST_FEED_ID, 200_000_000, -6, 1, 100),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let err = try_resolve_market_with_oracle(&mut env, &admin, stale_update, 1)
+        .expect_err("caller-chosen stale Pyth update must not prove feed death");
+    assert!(
+        err.contains("0x6"),
+        "Degenerate resolve before hard timeout should reject as not \
+         stale-matured (0x6), got: {}",
+        err,
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "failed Degenerate resolve must not mutate market mode"
+    );
+}
+
+#[test]
+fn test_admin_degenerate_resolve_rejects_caller_chosen_conf_wide_pyth_before_hard_timeout() {
+    program_path();
+
+    let (mut env, admin) = prepare_non_hyperp_degenerate_resolve_gate_env();
+    let conf_wide_update = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            conf_wide_update,
+            Account {
+                lamports: 1_000_000,
+                data: make_pyth_data(&TEST_FEED_ID, 200_000_000, -6, 20_000_000, 140),
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let err = try_resolve_market_with_oracle(&mut env, &admin, conf_wide_update, 1)
+        .expect_err("caller-chosen conf-wide Pyth update must not prove feed death");
+    assert!(
+        err.contains("0x6"),
+        "Degenerate resolve before hard timeout should reject as not \
+         stale-matured (0x6), got: {}",
+        err,
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "failed Degenerate resolve must not mutate market mode"
+    );
 }
 
 /// Strict hard-timeout regression: DepositCollateral must reject once
