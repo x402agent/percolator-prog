@@ -2,7 +2,7 @@ import { mintAndSubmitAgent, fetchAgentIdentity, findAgentIdentityPda } from '@m
 import { fetchAssetV1 } from '@metaplex-foundation/mpl-core';
 import { publicKey, type Umi, type PublicKey } from '@metaplex-foundation/umi';
 import { z } from 'zod';
-import { explorerUrl } from './helius.js';
+import { explorerUrl, networkFor } from './helius.js';
 import type { Config } from './config.js';
 
 export const ServiceSchema = z.object({
@@ -44,7 +44,10 @@ export interface MintResult {
  */
 export async function mintAgent(umi: Umi, cfg: Config, req: MintRequest): Promise<MintResult> {
   const wallet: PublicKey = req.owner ? publicKey(req.owner) : umi.identity.publicKey;
-  const result = await mintAndSubmitAgent(umi, {}, {
+  // The Metaplex hosted mint API defaults to solana-mainnet; pass the network
+  // derived from SOLANA_CLUSTER so devnet/testnet runs go through the matching
+  // backend instead of registering against mainnet while Umi is connected to devnet.
+  const result = await mintAndSubmitAgent(umi, { network: networkFor(cfg.SOLANA_CLUSTER) }, {
     wallet,
     name: req.name,
     uri: req.uri,
