@@ -22,7 +22,7 @@ export function networkFor(cluster: Config['SOLANA_CLUSTER']): MetaplexNetwork {
   }
 }
 
-function decodeSecretKey(raw: string): Uint8Array {
+export function decodeSecretKey(raw: string): Uint8Array {
   const trimmed = raw.trim();
   if (trimmed.startsWith('[')) {
     const arr = JSON.parse(trimmed) as number[];

@@ -16,7 +16,8 @@
     "dev:server": "tsx src/server/index.ts",
     "dev:cli": "tsx src/cli/index.ts",
     "dev:telegram": "tsx src/telegram/bot.ts",
-    "typecheck": "tsc -p . --noEmit"
+    "typecheck": "tsc -p . --noEmit",
+    "test": "tsx --test test/*.test.ts"
   },
   "bin": {
     "percolator-agent": "./dist/cli/index.js"
