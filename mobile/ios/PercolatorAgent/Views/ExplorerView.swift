@@ -23,12 +23,13 @@ struct ExplorerView: View {
                         LabeledContent("Owner", value: agent.owner)
                         LabeledContent("Asset", value: agent.asset)
                         LabeledContent("Identity PDA", value: agent.identity.pda)
+                        LabeledContent("Registered", value: agent.identity.registered ? "yes" : "no")
                         if let u = URL(string: agent.uri) { Link("Metadata", destination: u) }
                         if let u = URL(string: agent.explorer) { Link("Open in explorer", destination: u) }
                     }
-                    if !agent.identity.services.isEmpty {
+                    if let services = agent.metadata?.services, !services.isEmpty {
                         Section("Services") {
-                            ForEach(agent.identity.services, id: \.self) { svc in
+                            ForEach(services, id: \.self) { svc in
                                 VStack(alignment: .leading) {
                                     Text(svc.name).font(.headline)
                                     Text(svc.endpoint).font(.caption).foregroundStyle(.secondary)
@@ -36,9 +37,9 @@ struct ExplorerView: View {
                             }
                         }
                     }
-                    if !agent.identity.supportedTrust.isEmpty {
+                    if let trust = agent.metadata?.supportedTrust, !trust.isEmpty {
                         Section("Trust") {
-                            ForEach(agent.identity.supportedTrust, id: \.self) { Text($0) }
+                            ForEach(trust, id: \.self) { Text($0) }
                         }
                     }
                 }

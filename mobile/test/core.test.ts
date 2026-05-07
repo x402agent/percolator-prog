@@ -57,10 +57,9 @@ test('MintRequestSchema: accepts a valid request', () => {
   assert.equal(r.metadata.type, 'agent');
 });
 
-test('networkFor: cluster names map to Metaplex network ids', () => {
+test('networkFor: cluster names map to Metaplex SvmNetwork ids', () => {
   assert.equal(networkFor('mainnet-beta'), 'solana-mainnet');
   assert.equal(networkFor('devnet'), 'solana-devnet');
-  assert.equal(networkFor('testnet'), 'solana-testnet');
 });
 
 test('decodeSecretKey: accepts JSON byte array (solana-keygen format)', () => {

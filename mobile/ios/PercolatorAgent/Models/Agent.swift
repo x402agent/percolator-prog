@@ -5,12 +5,17 @@ struct AgentService: Codable, Hashable {
     let endpoint: String
 }
 
+struct AgentRegistration: Codable, Hashable {
+    let agentId: String
+    let agentRegistry: String
+}
+
 struct AgentMetadata: Codable {
     let type: String
     let name: String
     let description: String
     let services: [AgentService]
-    let registrations: [String]
+    let registrations: [AgentRegistration]
     let supportedTrust: [String]
 }
 
@@ -31,8 +36,7 @@ struct MintResult: Codable, Identifiable {
 
 struct AgentIdentityView: Codable {
     let pda: String
-    let services: [AgentService]
-    let supportedTrust: [String]
+    let registered: Bool
 }
 
 struct AgentView: Codable, Identifiable {
@@ -41,6 +45,7 @@ struct AgentView: Codable, Identifiable {
     let name: String
     let uri: String
     let identity: AgentIdentityView
+    let metadata: AgentMetadata?
     let explorer: String
     var id: String { asset }
 }

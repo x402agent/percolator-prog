@@ -1,6 +1,7 @@
-import { mintAndSubmitAgent, fetchAgentIdentity, findAgentIdentityPda } from '@metaplex-foundation/mpl-agent-registry';
+import { mintAndSubmitAgent, fetchAgentIdentityV1, findAgentIdentityV1Pda } from '@metaplex-foundation/mpl-agent-registry';
 import { fetchAssetV1 } from '@metaplex-foundation/mpl-core';
 import { publicKey, type Umi, type PublicKey } from '@metaplex-foundation/umi';
+import bs58 from 'bs58';
 import { z } from 'zod';
 import { explorerUrl, networkFor } from './helius.js';
 import type { Config } from './config.js';
@@ -10,13 +11,18 @@ export const ServiceSchema = z.object({
   endpoint: z.string().url(),
 });
 
+export const RegistrationSchema = z.object({
+  agentId: z.string().min(1),
+  agentRegistry: z.string().min(1),
+});
+
 export const AgentMetadataSchema = z.object({
   type: z.literal('agent').default('agent'),
   name: z.string().min(1),
   description: z.string().min(1),
   services: z.array(ServiceSchema).default([]),
-  registrations: z.array(z.string()).default([]),
-  supportedTrust: z.array(z.enum(['tee', 'attestation', 'none'])).default([]),
+  registrations: z.array(RegistrationSchema).default([]),
+  supportedTrust: z.array(z.string()).default([]),
 });
 export type AgentMetadata = z.infer<typeof AgentMetadataSchema>;
 
@@ -45,21 +51,21 @@ export interface MintResult {
 export async function mintAgent(umi: Umi, cfg: Config, req: MintRequest): Promise<MintResult> {
   const wallet: PublicKey = req.owner ? publicKey(req.owner) : umi.identity.publicKey;
   // The Metaplex hosted mint API defaults to solana-mainnet; pass the network
-  // derived from SOLANA_CLUSTER so devnet/testnet runs go through the matching
-  // backend instead of registering against mainnet while Umi is connected to devnet.
-  const result = await mintAndSubmitAgent(umi, { network: networkFor(cfg.SOLANA_CLUSTER) }, {
+  // derived from SOLANA_CLUSTER so devnet runs go through the matching backend
+  // instead of registering against mainnet while Umi is connected to devnet.
+  const result = await mintAndSubmitAgent(umi, null, {
     wallet,
+    network: networkFor(cfg.SOLANA_CLUSTER),
     name: req.name,
     uri: req.uri,
     agentMetadata: req.metadata,
   });
-  const asset = String(result.asset ?? result.assetAddress ?? '');
-  const signature = String(result.signature ?? '');
-  const identityPda = findAgentIdentityPda(umi, { asset: publicKey(asset) })[0];
+  const asset = result.assetAddress;
+  const [identityPda] = findAgentIdentityV1Pda(umi, { asset: publicKey(asset) });
   return {
     asset,
     identityPda: String(identityPda),
-    signature,
+    signature: bs58.encode(result.signature),
     explorer: explorerUrl(cfg.SOLANA_CLUSTER, asset),
   };
 }
@@ -71,29 +77,44 @@ export interface AgentView {
   uri: string;
   identity: {
     pda: string;
-    services: { name: string; endpoint: string }[];
-    supportedTrust: string[];
+    registered: boolean;
   };
+  metadata?: AgentMetadata;
   explorer: string;
 }
 
 /**
- * Reads an agent's MPL Core asset and Agent Identity PDA via Helius RPC.
+ * Reads an agent's MPL Core asset and Agent Identity PDA via Helius RPC, then
+ * pulls the off-chain metadata JSON pointed to by the asset's `uri` (where the
+ * services / trust mechanisms actually live — the on-chain identity PDA only
+ * stores the binding back to the asset).
  */
 export async function getAgent(umi: Umi, cfg: Config, address: string): Promise<AgentView> {
   const asset = await fetchAssetV1(umi, publicKey(address));
-  const [identityPda] = findAgentIdentityPda(umi, { asset: publicKey(address) });
-  const identity = await fetchAgentIdentity(umi, identityPda);
+  const [identityPda] = findAgentIdentityV1Pda(umi, { asset: publicKey(address) });
+  let registered = true;
+  try {
+    await fetchAgentIdentityV1(umi, identityPda);
+  } catch {
+    registered = false;
+  }
+  let metadata: AgentMetadata | undefined;
+  try {
+    const r = await fetch(asset.uri);
+    if (r.ok) {
+      const parsed = AgentMetadataSchema.safeParse(await r.json());
+      if (parsed.success) metadata = parsed.data;
+    }
+  } catch {
+    // off-chain metadata is best-effort
+  }
   return {
     asset: address,
     owner: String(asset.owner),
     name: asset.name,
     uri: asset.uri,
-    identity: {
-      pda: String(identityPda),
-      services: identity.services.map((s) => ({ name: s.name, endpoint: s.endpoint })),
-      supportedTrust: identity.supportedTrust.map((t) => String(t)),
-    },
+    identity: { pda: String(identityPda), registered },
+    metadata,
     explorer: explorerUrl(cfg.SOLANA_CLUSTER, address),
   };
 }

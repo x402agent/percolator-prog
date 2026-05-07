@@ -3,7 +3,10 @@ import { z } from 'zod';
 
 const Schema = z.object({
   HELIUS_RPC_URL: z.string().url(),
-  SOLANA_CLUSTER: z.enum(['mainnet-beta', 'devnet', 'testnet']).default('devnet'),
+  // Solana testnet isn't supported by the Metaplex Agent API (its SvmNetwork
+  // covers solana-mainnet/solana-devnet plus eclipse/sonic/fogo); restrict to
+  // the two clusters the agent flow actually works on.
+  SOLANA_CLUSTER: z.enum(['mainnet-beta', 'devnet']).default('devnet'),
   OPERATOR_SECRET_KEY: z.string().min(1),
   PORT: z.coerce.number().int().positive().default(8787),
   API_KEY: z.string().min(24),
